@@ -381,11 +381,12 @@ describe("createDirectExecutor — connector-unreachable de-masking", () => {
 		expect(run.error).toBeUndefined();
 	});
 
-	test("complete + a non-routing tool error (handled by agent) → stays success", async () => {
+	test("complete + a non-routing tool error → degraded, not failure", async () => {
 		// `invalid_tool_name` is deliberately NOT in the unreachable set: it's
 		// usually the agent probing a wrong name and recovering, not a real
-		// connector gap. A logical tool error with no errorReason likewise must
-		// not flip the run.
+		// connector gap, so it counts for nothing. A logical tool error with no
+		// errorReason is not a connector gap either, so the run is not failed;
+		// the create was never retried, so it is degraded.
 		const run = await runWith([
 			{
 				id: "t1",
@@ -398,8 +399,9 @@ describe("createDirectExecutor — connector-unreachable de-masking", () => {
 			},
 			{ id: "t2", name: "synapse-crm__create", input: {}, output: "validation error", ok: false, ms: 10 },
 		]);
-		expect(run.status).toBe("success");
-		expect(run.error).toBeUndefined();
+		expect(run.status).toBe("degraded");
+		expect(run.error).toMatch(/synapse-crm__create ×1/);
+		expect(run.error).not.toMatch(/nb__search/);
 	});
 });
 
@@ -457,10 +459,11 @@ describe("createDirectExecutor — abandoned-tool de-masking", () => {
 		expect(run.error).toBeUndefined();
 	});
 
-	test("a couple of failures below the threshold stay success", async () => {
-		// Ordinary probing. Two all-failing calls is not yet evidence of abandonment.
+	test("a couple of failures below the threshold are degraded, not failed", async () => {
+		// Two all-failing calls is not yet evidence of abandonment, so the run is
+		// not a failure. It is still work that did not happen.
 		const run = await runWith([tc("people__search", false), tc("people__search", false)]);
-		expect(run.status).toBe("success");
+		expect(run.status).toBe("degraded");
 	});
 
 	test("all-succeeding calls stay success", async () => {
@@ -510,6 +513,95 @@ describe("createDirectExecutor — abandoned-tool de-masking", () => {
 		const executor = createDirectExecutor(taskFn, () => ({}));
 		const { run } = await executor(makeAutomation());
 		expect(run.status).toBe("timeout");
+	});
+});
+
+describe("createDirectExecutor — degraded runs", () => {
+	function call(name: string, input: unknown, ok: boolean, extra: Record<string, unknown> = {}) {
+		return { id: `t${Math.random()}`, name, input, output: ok ? "{}" : "404", ok, ms: 10, ...extra };
+	}
+
+	async function runWith(toolCalls: Array<Record<string, unknown>>): Promise<AutomationRun> {
+		const taskFn: TaskFn = async (): Promise<TaskFnResult> => ({
+			output: "All records created.",
+			runId: "run_test000000",
+			toolCalls,
+			stopReason: "complete",
+			usage: { inputTokens: 10, outputTokens: 5, iterations: 1 },
+		});
+		const executor = createDirectExecutor(taskFn, () => ({}));
+		const { run } = await executor(makeAutomation());
+		return run;
+	}
+
+	test("a single failed send is degraded and names the tool", async () => {
+		const run = await runWith([
+			call("outlook__list_messages", {}, true),
+			call("outlook__send_mail", { to: "a@example.com" }, false),
+		]);
+		expect(run.status).toBe("degraded");
+		expect(run.error).toMatch(/outlook__send_mail ×1/);
+		expect(run.error).not.toMatch(/list_messages/);
+	});
+
+	test("a failed write among successful writes is degraded, whatever the final answer says", async () => {
+		const run = await runWith([
+			call("records__create", { id: "a" }, true),
+			call("records__create", { id: "b" }, false),
+			call("records__create", { id: "c" }, true),
+			call("records__create", { id: "d" }, false),
+			call("records__create", { id: "e" }, true),
+		]);
+		expect(run.status).toBe("degraded");
+		expect(run.error).toMatch(/2 tool call\(s\)/);
+		expect(run.error).toMatch(/records__create ×2/);
+	});
+
+	test("a failed write retried to success on the same input stays success", async () => {
+		const run = await runWith([
+			call("records__create", { id: "a" }, true),
+			call("records__create", { id: "b", n: 1 }, false),
+			call("records__create", { id: "c" }, true),
+			// Same input, keys in another order: the same job.
+			call("records__create", { n: 1, id: "b" }, true),
+		]);
+		expect(run.status).toBe("success");
+		expect(run.error).toBeUndefined();
+	});
+
+	test("rejected arguments corrected on a one-job tool stay success", async () => {
+		const run = await runWith([
+			call("granola__list_meetings", { since: "yesterday" }, false),
+			call("granola__list_meetings", { since: "last week" }, false),
+			call("granola__list_meetings", { since: "2026-09-25" }, true),
+		]);
+		expect(run.status).toBe("success");
+	});
+
+	test("a failure after a one-job tool's only success is degraded", async () => {
+		// The success came first, so it cannot have been the retry of the failure.
+		const run = await runWith([
+			call("crm__update", { id: "a" }, true),
+			call("crm__update", { id: "b" }, false),
+		]);
+		expect(run.status).toBe("degraded");
+	});
+
+	test("a misnamed tool the agent corrected is not counted", async () => {
+		const run = await runWith([
+			call("people_search", {}, false, { errorReason: "invalid_tool_name" }),
+			call("people__search", {}, true),
+		]);
+		expect(run.status).toBe("success");
+	});
+
+	test("the stronger failure signals still win", async () => {
+		const run = await runWith([
+			...Array.from({ length: 3 }, () => call("people__log_interaction", {}, false)),
+			call("outlook__send_mail", {}, false),
+		]);
+		expect(run.status).toBe("failure");
+		expect(run.error).toMatch(/never succeeded/);
 	});
 });
 
