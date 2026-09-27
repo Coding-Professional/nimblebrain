@@ -12,6 +12,7 @@ import { Runtime } from "../../src/runtime/runtime.ts";
 import { McpSource } from "../../src/tools/mcp-source.ts";
 import { createMockModel } from "../helpers/mock-model.ts";
 import { type RemoteMcpFixture, startRemoteMcpServer } from "../helpers/remote-mcp-fixture.ts";
+import { SKILLS_EXTENSION_CAPABILITY, serveSkills } from "../helpers/skills-server.ts";
 import { TEST_WORKSPACE_ID, provisionTestWorkspace } from "../helpers/test-workspace.ts";
 
 const SKILL_NAME = "house-voice";
@@ -27,7 +28,7 @@ function createGuideServer(): Server {
 
   const server = new Server(
     { name: "guide", version: "0.1.0" },
-    { capabilities: { tools: {}, resources: {} } },
+    { capabilities: { tools: {}, resources: {}, ...SKILLS_EXTENSION_CAPABILITY } },
   );
   server.setRequestHandler('tools/list', async () => ({
     tools: [{ name: "go", description: "Go", inputSchema: { type: "object", properties: {} } }],
@@ -38,6 +39,7 @@ function createGuideServer(): Server {
   server.setRequestHandler('resources/list', async () => ({
     resources: [{ uri: "skill://guide/SKILL.md", name: "guide", mimeType: "text/markdown" }],
   }));
+  serveSkills(server, () => ({ "skill://guide/SKILL.md": body }));
   server.setRequestHandler('resources/read', async (req) => ({
     contents: [{ uri: req.params.uri, mimeType: "text/markdown", text: body }],
   }));

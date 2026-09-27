@@ -44,6 +44,12 @@ import {
 } from "../host-resources/index.ts";
 import { requestIdentityAttrs, withSpan } from "../observability/index.ts";
 import { log } from "../observability/log.ts";
+import {
+  SKILLS_EXTENSION_ID,
+  SKILLS_LIST_METHOD,
+  SkillsListResultSchema,
+  skillsClientExtension,
+} from "../skills/skills-extension.ts";
 import { coerceInputForSchema } from "./coerce-input.ts";
 import {
   TASKS_EXTENSION_ID,
@@ -1084,12 +1090,17 @@ export class McpSource implements ToolSource {
    * claimed here, because a claim on the connection would opt every SDK call
    * in, and the SDK cannot read a task result; the task wire claims it per
    * request instead (`mcp-task-client.ts`).
+   *
+   * `io.modelcontextprotocol/skills` (SEP-2640) is claimed on both eras
+   * because skill discovery runs on both: {@link listSkills} enumerates, and
+   * the runtime verifies each `SKILL.md` it later reads against the listing.
    */
   private static readonly CAPABILITIES: ClientCapabilities = {
     tasks: {
       requests: { tools: { call: {} } },
       cancel: {},
     },
+    extensions: skillsClientExtension(),
   };
 
   /**
@@ -1390,9 +1401,8 @@ export class McpSource implements ToolSource {
    * before the handshake completes and after `stop()`.
    *
    * Exposed so a caller can honour the spec's rule that declared capabilities
-   * are authoritative — `listResources` already reads them through the client
-   * for exactly that reason — without reaching through {@link getClient}, which
-   * hands out the whole SDK surface for what is one read.
+   * are authoritative without reaching through {@link getClient}, which hands
+   * out the whole SDK surface for what is one read.
    */
   getServerCapabilities(): ServerCapabilities | undefined {
     return this.client?.getServerCapabilities();
@@ -2227,92 +2237,84 @@ export class McpSource implements ToolSource {
   }
 
   /**
-   * Enumerate the server's resources via `resources/list` (best-effort).
+   * Whether skill discovery asks this server for `skills/list` (SEP-2640).
    *
-   * Used for skill discovery (SEP-2640, `io.modelcontextprotocol/skills`): the
-   * runtime lists a source's resources and reads the `skill://<name>/SKILL.md`
-   * entrypoints. Returns `{ resources, ok, truncated }`: `ok: false` means the
-   * enumeration couldn't complete cleanly — a transport error mid-list (partial
-   * `resources`) or a torn-down client — so the caller declines to cache it as a
-   * stable "no skills" and retries next turn. Only a genuine successful response —
-   * a clean empty page (no skills / no `resources` capability) or a cap-bounded
-   * read — is `ok: true`. A caller treating `ok: true` as a complete enumeration
-   * must ALSO check `truncated`: a cap-bounded read succeeds with resources still
-   * unenumerated, and caching it as "this is everything" is the silent-skip this
-   * field exists to prevent.
-   * Unlike `readResource`, this probe does NOT route failures through
-   * session recovery — a server that simply doesn't list resources must not
-   * restart-storm the source. Pagination is followed up to a small page cap so a
-   * misbehaving server can't spin the request path.
+   * - `declared`: the server advertised `io.modelcontextprotocol/skills`
+   *   ({@link serverExtensions}, from `server/discover` or `initialize`).
+   *   Declaring is what commits a server to the method.
+   * - `none`: a 2026-07-28 connection without the declaration. The
+   *   extensions a modern server advertises are complete, so it has no skills.
+   * - `probe`: a 2025-era remote connection without the declaration (an
+   *   in-process source is the platform's own app and is `none`). Some SDKs omit
+   *   `capabilities.extensions` from the legacy `initialize` result (the
+   *   Python `mcp` SDK does), so a server that serves the extension cannot say
+   *   so there. Discovery asks once per window, and a server that does not
+   *   know the method means none: `-32601`, or `-32602` from the Python SDK,
+   *   which rejects an unknown method as a request that failed validation.
+   *
+   * This decides only whether to ask. What is a skill still comes from the
+   * server's own listing, never from a resource's URI scheme, which is the
+   * inference SEP-2640 forbids.
    */
-  async listResources(): Promise<{
-    resources: Array<{ uri: string; name?: string; mimeType?: string }>;
-    ok: boolean;
-    /**
-     * The 10-page ceiling was hit with a cursor still outstanding, so later
-     * resources exist and were not enumerated. Distinct from `ok: false`: the
-     * calls all SUCCEEDED, the result is just short. Callers that treat a
-     * successful enumeration as complete — caching it, or reporting "this
-     * server publishes no skills" — must consult this too.
-     */
-    truncated: boolean;
-  }> {
-    if (!this.client) return { resources: [], ok: false, truncated: false }; // torn-down client is transient — retry (cheap no-op)
-    // A server that advertised NO `resources` capability has none — that is a
-    // COMPLETE enumeration of nothing, not a failure. Without this the call
-    // throws `Method not found` and reports as a transport failure, which is
-    // both a wasted round trip per source and a permanent false positive for
-    // every tools-only server (among the in-process platform sources, `usage`
-    // and `compose`; the rest advertise `resources` and are probed).
-    //
-    // Only a POSITIVE "no resources" short-circuits. Absent capabilities means
-    // we do not know yet, and answering "complete, nothing here" on a guess is
-    // the same silent skip this signal exists to make impossible — so an
-    // unknown server is probed exactly as before.
-    //
-    // The trade this buys: a server that DOES implement `resources/list` but
-    // omits `resources` from its declared capabilities now reads as a clean
-    // empty and caches as complete, with no degraded signal. Declared
-    // capabilities are authoritative per spec, and probing past them would
-    // restore the always-firing false positive above — but it is the one new
-    // way this change can make a skill go dark.
-    const caps = this.client.getServerCapabilities();
-    if (caps && !caps.resources) {
-      return { resources: [], ok: true, truncated: false };
-    }
-    const resources: Array<{ uri: string; name?: string; mimeType?: string }> = [];
+  skillsDiscovery(): "declared" | "probe" | "none" {
+    if (SKILLS_EXTENSION_ID in this.serverExtensions()) return "declared";
+    // An in-process source is the platform's own app: its skills reach the
+    // model through the skills source and the filesystem pool, so an
+    // undeclared one is never asked.
+    if (this.mode.type === "inProcess") return "none";
+    return this.protocolEra === "modern" ? "none" : "probe";
+  }
+
+  /**
+   * Enumerate the server's skills via `skills/list` (SEP-2640), best-effort.
+   *
+   * Call only when {@link skillsDiscovery} is not `none`. Entries come back
+   * unvalidated, for the caller to check one at a time. On a `probe`, a
+   * `-32601` or `-32602` answer to the first page is a complete, empty
+   * listing: the server does not serve the extension. Otherwise a failed call leaves a
+   * partial result (`ok: false`), and the 10-page cap can stop the walk with
+   * a cursor outstanding (`truncated: true`); either way the result is not the
+   * server's whole listing, and a caller must not cache it as complete.
+   * Failures do not route through session recovery: this is a discovery probe,
+   * and a misbehaving server must not restart-storm the source.
+   */
+  async listSkills(): Promise<{ entries: unknown[]; ok: boolean; truncated: boolean }> {
+    if (!this.client) return { entries: [], ok: false, truncated: false };
+    const probing = this.skillsDiscovery() === "probe";
+    const entries: unknown[] = [];
     let cursor: string | undefined;
+    let page = 0;
     try {
-      for (let page = 0; page < 10; page++) {
-        // One page per request: the SDK's `listResources()` without a cursor
-        // walks every page itself (to its own 64-page cap, which throws), so
-        // the page-level `request` is what keeps this walk to its 10-page cap
-        // and its `truncated` verdict.
-        const result = await this.client.request({
-          method: "resources/list",
-          params: cursor ? { cursor } : {},
-        });
-        for (const resource of result.resources ?? []) {
-          resources.push({ uri: resource.uri, name: resource.name, mimeType: resource.mimeType });
-        }
+      for (; page < 10; page++) {
+        // A raw request validated by our own schema, not the SDK's typed
+        // `skills/list`: SDK v2 strips `resultType` from a result before
+        // validating it against a schema that requires it, so it rejects every
+        // conforming `skills/list` result (modelcontextprotocol/typescript-sdk#2789).
+        const result = await this.client.request(
+          { method: SKILLS_LIST_METHOD, params: cursor ? { cursor } : {} },
+          SkillsListResultSchema,
+        );
+        entries.push(...result.skills);
         cursor = result.nextCursor;
         if (!cursor) break;
       }
       if (cursor) {
-        // Hit the page ceiling with more to read — surface it rather than silently
-        // drop later resources (a skill past the cap would go undiscovered).
-        log.warn("[mcp] listResources hit the 10-page cap; later resources not enumerated", {
+        log.warn("[mcp] listSkills hit the 10-page cap; later skills not enumerated", {
           source: this.name,
         });
-        return { resources, ok: true, truncated: true };
+        return { entries, ok: true, truncated: true };
       }
-    } catch {
-      // A transport error cut the enumeration short: report `ok: false` so the caller
-      // declines to cache this partial as a stable "no skills" (never recover/restart
-      // the source — this is a probe, not the app-surface readResource path).
-      return { resources, ok: false, truncated: false };
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code;
+      // Unknown method: `-32601` per JSON-RPC, `-32602` from the Python SDK,
+      // which validates a request against its known methods before routing.
+      // Only on an undeclared probe: from a declaring server either is a failure.
+      if (probing && page === 0 && (code === -32601 || code === -32602)) {
+        return { entries: [], ok: true, truncated: false };
+      }
+      return { entries, ok: false, truncated: false };
     }
-    return { resources, ok: true, truncated: false };
+    return { entries, ok: true, truncated: false };
   }
 
   /** Expose the underlying MCP client (kept for tests and rare introspection). */

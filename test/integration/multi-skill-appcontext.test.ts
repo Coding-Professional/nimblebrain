@@ -30,6 +30,7 @@ import { Runtime } from "../../src/runtime/runtime.ts";
 import { McpSource } from "../../src/tools/mcp-source.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 import { type RemoteMcpFixture, startRemoteMcpServer } from "../helpers/remote-mcp-fixture.ts";
+import { SKILLS_EXTENSION_CAPABILITY, serveSkills } from "../helpers/skills-server.ts";
 import { TEST_WORKSPACE_ID, provisionTestWorkspace } from "../helpers/test-workspace.ts";
 
 const SERVER_NAME = "ai-nimblebrain-multiskill-mcp";
@@ -68,7 +69,7 @@ function createMultiSkillServer(): Server {
 
   const server = new Server(
     { name: "multiskill", version: "0.1.0" },
-    { capabilities: { tools: {}, resources: {} } },
+    { capabilities: { tools: {}, resources: {}, ...SKILLS_EXTENSION_CAPABILITY } },
   );
   server.setRequestHandler('tools/list', async () => ({
     tools: TOOL_NAMES.map((n) => ({
@@ -87,6 +88,7 @@ function createMultiSkillServer(): Server {
       mimeType: "text/markdown",
     })),
   }));
+  serveSkills(server, () => bodies);
   server.setRequestHandler('resources/read', async (request) => {
     const text = bodies[request.params.uri];
     if (!text) throw new Error(`Resource not found: ${request.params.uri}`);
@@ -122,7 +124,7 @@ ${NEIGHBOUR_PHRASE} — this rule must be in context on every turn.`;
 
   const server = new Server(
     { name: "neighbour", version: "0.1.0" },
-    { capabilities: { tools: {}, resources: {} } },
+    { capabilities: { tools: {}, resources: {}, ...SKILLS_EXTENSION_CAPABILITY } },
   );
   server.setRequestHandler('tools/list', async () => ({
     tools: [{ name: "ping", description: "Ping", inputSchema: { type: "object", properties: {} } }],
@@ -133,6 +135,7 @@ ${NEIGHBOUR_PHRASE} — this rule must be in context on every turn.`;
   server.setRequestHandler('resources/list', async () => ({
     resources: [{ uri, name: "orientation", mimeType: "text/markdown" }],
   }));
+  serveSkills(server, () => ({ [uri]: body }));
   server.setRequestHandler('resources/read', async () => ({
     contents: [{ uri, mimeType: "text/markdown", text: body }],
   }));

@@ -52,6 +52,7 @@ On a 2025-era connection, `initialize` carries exactly these capabilities:
       "cancel": {}
     },
     "extensions": {
+      "io.modelcontextprotocol/skills": {},
       "ai.nimblebrain/host-resources": {
         "read": { "enabled": true, "range": false, "maxSize": 10485760 },
         "list": { "enabled": true },
@@ -63,7 +64,7 @@ On a 2025-era connection, `initialize` carries exactly these capabilities:
 }
 ```
 
-On a `2026-07-28` connection, every request's envelope carries the same `tasks` block and no `ai.nimblebrain/host-resources`:
+On a `2026-07-28` connection, every request's envelope carries the same `tasks` block and Skills claim, and no `ai.nimblebrain/host-resources`:
 
 ```json
 {
@@ -72,6 +73,9 @@ On a `2026-07-28` connection, every request's envelope carries the same `tasks` 
       "tasks": {
         "requests": { "tools": { "call": {} } },
         "cancel": {}
+      },
+      "extensions": {
+        "io.modelcontextprotocol/skills": {}
       }
     }
   }
@@ -85,7 +89,9 @@ On a `2026-07-28` connection, every request's envelope carries the same `tasks` 
 | 2025 | A tool that declares `execution.taskSupport` as `optional` or `required` is called with `params.task`. The host receives a `CreateTaskResult` right away, polls `tasks/get`, and reads the outcome from `tasks/result`. |
 | `2026-07-28` | The tasks extension (`io.modelcontextprotocol/tasks`). When the server advertises it, each `tools/call` names the extension in that request's own client capabilities, and the server decides per call whether to answer outright or with a task. The host polls `tasks/get` and reads the result it inlines. A task that asks for input (`input_required`) is cancelled and reported as an error, since the host has no one to ask. The extension is claimed on those requests only, never on the connection. |
 
-**`extensions`**: the vendor capabilities described on [NimbleBrain and MCP](/mcp/overview/#extensions), claimed on the 2025 era only. The one extension today, [`ai.nimblebrain/host-resources`](/mcp/host-resources/), is served through server-to-client requests, which `2026-07-28` removed. Read this block before calling an extension method.
+**`io.modelcontextprotocol/skills`**: the MCP [Skills Extension](/using/skills/#skills-published-by-an-mcp-server), claimed on both eras because skill discovery runs on both. On a `2026-07-28` connection the host asks for `skills/list` only when the server advertises the extension. On a 2025-era connection it asks whether or not the server declared it, because some SDKs leave `capabilities.extensions` out of the legacy `initialize` result; a `-32601` (method not found) answer means the server publishes no skills.
+
+**`ai.nimblebrain/*` extensions**: the vendor capabilities described on [NimbleBrain and MCP](/mcp/overview/#extensions), claimed on the 2025 era only. The one extension today, [`ai.nimblebrain/host-resources`](/mcp/host-resources/), is served through server-to-client requests, which `2026-07-28` removed. Read this block before calling an extension method.
 
 ### Client capabilities the host does not advertise
 

@@ -54,7 +54,9 @@ whether to use an extension or fall back. The field is taken from the SDK's
 generated spec types, which track the specification's draft schema and run ahead
 of the revision the SDK negotiates on the wire; it travels on the SDK's
 authority, not the pinned revision's, and that gap closes on its own as the
-revision lands.
+revision lands. The block also carries the official extensions this client
+consumes: `io.modelcontextprotocol/skills` is claimed on both eras, because
+skill discovery (`skills/list`, ADR-0011) runs on both.
 
 **Sampling, elicitation, roots, and logging are not advertised**, and this is not
 a not-yet.

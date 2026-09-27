@@ -85,7 +85,8 @@ A server can also offer the host something by publishing an ordinary MCP resourc
 | URI | Why it exists |
 |---|---|
 | [`app://instructions`](/apps/custom-instructions/) | Guidance the user saved for this app. The host adds it to the agent's prompt on every turn. The server owns where it is stored and how it is edited. |
-| [`skill://<name>/SKILL.md`](/using/skills/) | A skill the server publishes: guidance the agent loads when it is relevant, following the Agent Skills format. The host finds it by listing the server's resources. |
+
+Skills are not a resource convention. A server publishes them through the MCP [Skills Extension](/using/skills/#skills-published-by-an-mcp-server) (`skills/list`), and a `skill://` resource the server does not list is an ordinary resource.
 
 <Aside type="note" title="Tool visibility uses the specification">
 To make a tool callable by its app but hidden from the model, set the MCP Apps
