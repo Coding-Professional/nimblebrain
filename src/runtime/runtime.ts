@@ -1422,6 +1422,8 @@ export class Runtime {
       runId: handle.runId,
       toolCalls: handle.toolCalls,
       stopReason: handle.stopReason,
+      ...(handle.finishReason !== undefined ? { finishReason: handle.finishReason } : {}),
+      ...(handle.finishReasonRaw !== undefined ? { finishReasonRaw: handle.finishReasonRaw } : {}),
       usage: handle.usage,
     };
   }
@@ -1693,6 +1695,8 @@ export class Runtime {
       skillName,
       toolCalls: result.toolCalls,
       stopReason: result.stopReason,
+      ...(result.finishReason !== undefined ? { finishReason: result.finishReason } : {}),
+      ...(result.finishReasonRaw !== undefined ? { finishReasonRaw: result.finishReasonRaw } : {}),
       usage: {
         ...result.usage,
         model: spec.model,
