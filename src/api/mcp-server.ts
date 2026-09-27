@@ -621,6 +621,11 @@ export class McpServerHost {
         // The session is bound to the identity and workspace that initialized
         // it; `ownsTransport` holds every later request to both.
         this.transports.set(sid, { transport, identityId, workspaceId, lastAccessedAt: now });
+        // The one line that names the client by its own declared `clientInfo`;
+        // later misses for this session carry only the user agent.
+        log.info(
+          `[mcp] session initialized ${fmtSessionContext(request, sid, sessionCtx)} client=${fmtClientInfo(parsedBody)}`,
+        );
         // Fire-and-forget the registry write. The session is already live
         // on this process; if the registry is down we still serve the client.
         this.registry
@@ -1710,13 +1715,35 @@ function jsonRpcError(status: number, code: number, message: string): Response {
   );
 }
 
+/** Cap on a client-supplied string written to a log line. */
+const MAX_LOGGED_FIELD_CHARS = 200;
+
+/**
+ * A client-supplied value as a log field: length-capped and JSON-quoted, so a
+ * newline, a quote, or a `key=value` inside it cannot forge another field or line.
+ */
+function fmtClientField(value: string): string {
+  return JSON.stringify(value.slice(0, MAX_LOGGED_FIELD_CHARS));
+}
+
+/** The `clientInfo` an initialize request declares, as a quoted `name/version`. */
+function fmtClientInfo(body: unknown): string {
+  const info = isInitializeRequest(body) ? body.params.clientInfo : undefined;
+  if (!info?.name) return "none";
+  return fmtClientField(info.version ? `${info.name}/${info.version}` : info.name);
+}
+
 /**
  * Build a `key=value` log fragment with the request context that matters for
  * session-miss diagnosis: a sessionId prefix (UUIDs are not sensitive but the
- * prefix keeps lines greppable), identity (for cross-tenant correlation), and
- * the client IP from `x-forwarded-for` (the ALB sets it).
+ * prefix keeps lines greppable), identity (for cross-tenant correlation), the
+ * client IP from `x-forwarded-for` (the ALB sets it), and the `User-Agent`,
+ * which names the client on lines where no session (and so no `clientInfo`)
+ * exists.
  *
- * The workspace is the one the request's URL names.
+ * The workspace is the one the request's URL names. The IP and user agent are
+ * client-controlled (the left-most `x-forwarded-for` entry is whatever the
+ * caller sent), so both go through `fmtClientField`.
  */
 function fmtSessionContext(
   request: Request,
@@ -1726,6 +1753,9 @@ function fmtSessionContext(
   const sidPrefix = sessionId ? sessionId.slice(0, 8) : "none";
   const identityId = sessionCtx?.identity?.id ?? "none";
   const workspaceId = sessionCtx?.workspaceId ?? "none";
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "direct";
-  return `sessionId=${sidPrefix} identity=${identityId} workspace=${workspaceId} ip=${ip}`;
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const ua = request.headers.get("user-agent");
+  const ipField = ip ? fmtClientField(ip) : "direct";
+  const uaField = ua ? fmtClientField(ua) : "none";
+  return `sessionId=${sidPrefix} identity=${identityId} workspace=${workspaceId} ip=${ipField} ua=${uaField}`;
 }
