@@ -5,10 +5,12 @@ import type { SecretsConfig } from "../config/secrets.ts";
 import type { ConnectorsConfig } from "../connectors/providers/config.ts";
 import type { EventSink, ThinkingEffort } from "../engine/types.ts";
 import type { ContentPart, FileReference } from "../files/types.ts";
-import type { UserIdentity } from "../identity/provider.ts";
+import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
+import type { UserStore } from "../identity/user.ts";
 import type { ProvidersConfig } from "../model/registry.ts";
 import type { NotificationsPollConfig } from "../notifications/poll-config.ts";
 import type { TokenUsage } from "../usage/types.ts";
+import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { RunTrigger } from "./run-spec.ts";
 
 /** Model slot configuration. Each slot maps to a provider:model-id string. */
@@ -17,6 +19,13 @@ export interface ModelSlots {
   default: string;
   /** Cheap/fast model for auto-title and both history folds. */
   fast: string;
+}
+
+/** The runtime's identity stores, handed to `RuntimeConfig.identityProvider`. */
+export interface IdentityStores {
+  workDir: string;
+  userStore: UserStore;
+  workspaceStore: WorkspaceStore;
 }
 
 export interface RuntimeConfig {
@@ -210,6 +219,15 @@ export interface RuntimeConfig {
    * Subdirectories: conversations/, skills/, cache/
    */
   workDir?: string;
+
+  /**
+   * Builds the identity provider, for an in-process caller that supplies its
+   * own (a test). It is handed the runtime's own stores, the ones a provider
+   * built from `instance.json` gets. Omitted, the runtime builds the one
+   * `<workDir>/instance.json` names. The HTTP server authenticates with
+   * whichever one the runtime holds.
+   */
+  identityProvider?: (stores: IdentityStores) => IdentityProvider;
 
   /**
    * Which backend holds this deployment's secrets, and that backend's own
