@@ -101,11 +101,24 @@ function modernServer(opts: Parameters<typeof buildServer>[0] = {}): Fetch {
   return createMcpHandler(() => buildServer(opts)).fetch;
 }
 
-async function connect(url: string): Promise<McpSource> {
+async function connect(url: string, opts: { connector?: boolean } = {}): Promise<McpSource> {
   const source = new McpSource(
     "era",
     { type: "remote", url: new URL(url), allowInsecure: true },
     new NoopEventSink(),
+    // A connector source carries the context that registers the host-resources
+    // handlers, which is what entitles it to claim the extension.
+    opts.connector
+      ? {
+          workspaceId: "ws_era",
+          connectorId: "era",
+          hostResources: {
+            read: async () => ({ contents: [] }),
+            list: async () => ({ resources: [] }),
+          },
+          rateLimit: { check: () => {} },
+        }
+      : undefined,
   );
   await source.start();
   return source;
@@ -271,7 +284,7 @@ describe("the host-resources claim", () => {
       }
       return legacy(request);
     });
-    const source = await connect(served.url);
+    const source = await connect(served.url, { connector: true });
     try {
       expect(source.getNegotiatedProtocolVersion()).toBe("2025-11-25");
       expect(claimed?.extensions?.[HOST_RESOURCES_CAPABILITY_KEY]).toEqual(
@@ -279,6 +292,27 @@ describe("the host-resources claim", () => {
       );
       // The extension is added to the constructed claims, not swapped in for them.
       expect(claimed?.tasks).toEqual({ requests: { tools: { call: {} } }, cancel: {} });
+    } finally {
+      await source.stop();
+      served.close();
+    }
+  });
+
+  it("is absent from the 2025 initialize of a source that registers no handlers", async () => {
+    const legacy = legacyServer();
+    let claimed: { extensions?: Record<string, unknown> } | undefined;
+    const served = serve(async (request) => {
+      const body = await bodyOf(request);
+      if (body?.method === "initialize") {
+        claimed = body.params?.capabilities as typeof claimed;
+      }
+      return legacy(request);
+    });
+    const source = await connect(served.url);
+    try {
+      expect(source.getNegotiatedProtocolVersion()).toBe("2025-11-25");
+      expect(claimed).toBeDefined();
+      expect(claimed?.extensions?.[HOST_RESOURCES_CAPABILITY_KEY]).toBeUndefined();
     } finally {
       await source.stop();
       served.close();
@@ -298,7 +332,7 @@ describe("the host-resources claim", () => {
       }
       return modern(request);
     });
-    const source = await connect(served.url);
+    const source = await connect(served.url, { connector: true });
     try {
       expect(source.getNegotiatedProtocolVersion()).toBe("2026-07-28");
       await source.tools();

@@ -1109,7 +1109,12 @@ export class McpSource implements ToolSource {
    * https://modelcontextprotocol.io/extensions/overview). The host-resources
    * methods are server→client requests, a channel only the 2025 era has, so
    * the extension is claimed only on the handshake of a connection that can
-   * reach them (ADR-0023).
+   * reach them, and only by a source that serves them: one with a
+   * `connectorContext`, which is what registers the handlers
+   * ({@link registerConnectorHandlers}). A source without one (an in-process
+   * platform source, or a remote connector started on a path that does not
+   * thread the host-resources deps) claims nothing it would not answer
+   * (ADR-0023).
    */
   private static readonly INITIALIZE_EXTENSIONS: NonNullable<ClientCapabilities["extensions"]> =
     hostExtensions();
@@ -1128,7 +1133,7 @@ export class McpSource implements ToolSource {
     return new EraCapabilitiesClient(
       CLIENT_INFO,
       { capabilities: McpSource.CAPABILITIES, versionNegotiation: { mode: "auto" } },
-      McpSource.INITIALIZE_EXTENSIONS,
+      this.connectorContext ? McpSource.INITIALIZE_EXTENSIONS : {},
     );
   }
 
