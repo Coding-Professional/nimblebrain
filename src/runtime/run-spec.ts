@@ -58,9 +58,8 @@ export type RunTrigger = "chat" | "schedule" | "manual" | "event" | "api";
 /** Who a run acts as. */
 export interface RunPrincipal {
   /**
-   * The identity the run acts as — the caller's in production, `DEV_IDENTITY`
-   * when no identity provider is configured. Drives prompt preferences and
-   * role-based tool visibility.
+   * The identity the run acts as — the caller's, under every identity
+   * provider. Drives prompt preferences and role-based tool visibility.
    */
   identity: UserIdentity;
   /**
@@ -94,8 +93,7 @@ export interface RunInput {
    */
   content: Array<UserTextPart | UserResourceLinkPart>;
   /**
-   * The author stamped on that message. Absent leaves the message unattributed,
-   * which is what a dev-mode chat with no identity produces.
+   * The author stamped on that message. Absent leaves the message unattributed.
    */
   userId?: string;
   /** File references persisted alongside the message. */

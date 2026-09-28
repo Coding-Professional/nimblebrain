@@ -13,6 +13,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import type { ChatResult } from "../../src/runtime/types.ts";
+import { DEV_IDENTITY } from "../../src/identity/providers/dev.ts";
+import { devProvider, devWorkspace } from "../helpers/dev-provider.ts";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -46,6 +48,7 @@ export async function getEvalRuntime(): Promise<Runtime> {
   mkdirSync(_workDir, { recursive: true });
 
   _runtime = await Runtime.start({
+    identityProvider: devProvider,
     model: { provider: "anthropic", apiKey },
     defaultModel: DEFAULT_MODEL,
     workDir: _workDir,
@@ -90,7 +93,11 @@ export interface EvalCase {
  */
 export async function runEval(input: string): Promise<ChatResult> {
   const runtime = await getEvalRuntime();
-  return runtime.chat({ message: input });
+  return runtime.chat({
+    message: input,
+    identity: DEV_IDENTITY,
+    workspaceId: await devWorkspace(runtime),
+  });
 }
 
 // ---------------------------------------------------------------------------

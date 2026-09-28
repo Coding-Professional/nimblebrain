@@ -61,7 +61,7 @@ async function checkWritePermission(
   runtime: Runtime,
   wsId: string | null,
 ): Promise<PermissionDecision> {
-  // Unattended-run wall, checked before every other gate including dev mode.
+  // Unattended-run wall, checked before every other gate.
   //
   // The write persists into every later conversation in the workspace, for
   // every member, so it belongs to a present human. An unattended run has no
@@ -89,18 +89,9 @@ async function checkWritePermission(
     };
   }
 
-  // No workspace, no overlay to write — checked ahead of the dev-mode
-  // allow-through, which would otherwise return `allowed` with no wsId and
-  // leave the write site's non-null assertion false (rescued only by
-  // `resolveDir` throwing into the handler's catch).
+  // No workspace, no overlay to write.
   if (!wsId) {
     return { allowed: false, reason: "Writing instructions requires a workspace context" };
-  }
-
-  // No identity provider (an in-process runtime with no `instance.json`) —
-  // allow writes through.
-  if (runtime.getIdentityProvider() === null) {
-    return { allowed: true, wsId };
   }
 
   const identity = runtime.getCurrentIdentity();
