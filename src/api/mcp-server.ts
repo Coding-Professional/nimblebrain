@@ -805,7 +805,8 @@ function createHandlers(
     // ── Stage 1: a call that names a source is an app's (MCP Apps visibility)
     const appSource = scopedSourceName(request.params._meta);
     if (appSource !== undefined) {
-      await assertAppMayCall(name, appSource, runtime, wsId, identityId);
+      const refused = await assertAppMayCall(name, appSource, runtime, wsId, identityId);
+      if (refused) return refused;
     }
 
     // ── Stage 2: parse the namespaced tool name + route via orchestrator
@@ -1265,6 +1266,15 @@ async function executeWorkspaceToolCall(
       localName,
     );
     if (denied) return toCallToolResult(denied);
+    // The connector role gate (`admin_tools`), against the workspace this URL
+    // is bound to and the session's identity.
+    const adminDenied = await runtime.connectorAdminDenial(
+      wsId,
+      sessionCtx.identity,
+      sourceName,
+      localName,
+    );
+    if (adminDenied) return toCallToolResult(adminDenied);
   }
 
   const wsRegistry = runtime.getRegistryForWorkspace(wsId);
@@ -1486,6 +1496,10 @@ export const RESOURCE_SOURCE_META_KEY = "ai.nimblebrain/source";
  * matches no listed tool is refused too: its visibility cannot be read, and
  * routing would still reach a source whose listing failed (it reconnects on
  * demand), so letting it through would skip the check rather than the call.
+ *
+ * Returns the connector role gate's refusal when a tool is unlisted because
+ * the caller is not admitted to it (`admin_tools`), so an app's call is refused
+ * with the same `workspace_admin_required` every other door returns.
  */
 async function assertAppMayCall(
   name: string,
@@ -1493,7 +1507,7 @@ async function assertAppMayCall(
   runtime: Runtime,
   wsId: string,
   identityId: string,
-): Promise<void> {
+): Promise<CallToolResult | undefined> {
   if (!name.startsWith(`${appSource}__`)) {
     throw new McpError(
       ErrorCode.InvalidParams,
@@ -1503,6 +1517,15 @@ async function assertAppMayCall(
   }
   const tools = await runtime.listToolsForWorkspace(wsId, identityId);
   const tool = tools.find((t) => t.name === name);
+  if (!tool) {
+    const denied = await runtime.connectorAdminDenial(
+      wsId,
+      { id: identityId },
+      appSource,
+      name.slice(appSource.length + 2),
+    );
+    if (denied) return toCallToolResult(denied);
+  }
   if (!tool || !isAppCallable(tool)) {
     throw new McpError(
       ErrorCode.InvalidParams,

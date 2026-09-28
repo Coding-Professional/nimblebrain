@@ -79,6 +79,7 @@ import type {
   SkillsLoadedPayload,
   ThinkingEffort,
   ToolPromotionResult,
+  ToolResult,
   ToolRouter,
   ToolSchema,
 } from "../engine/types.ts";
@@ -122,6 +123,14 @@ import {
   type UnattendedDispatchOptions,
   type UnattendedDispatchResult,
 } from "../orchestrator/index.ts";
+import {
+  ADMIT_ALL,
+  adminToolDenial,
+  adminToolsContractWarnings,
+  type ConnectorAdmission,
+  filterAdmittedTools,
+  isAdminToolAllowed,
+} from "../permissions/admin-tools.ts";
 import {
   isDisallowed,
   type PermissionOwner,
@@ -217,6 +226,7 @@ import { toToolSchema } from "../tools/types.ts";
 import { createProcessLedger, type UsageLedger } from "../usage/ledger.ts";
 import { clearUsageLedger, recordLlmCall, setUsageLedger } from "../usage/record.ts";
 import type { TokenUsage } from "../usage/types.ts";
+import { canWriteWorkspaceScoped } from "../workspace/authz.ts";
 import { WorkspaceContext } from "../workspace/context.ts";
 import { retireLegacyPersonalWorkspaces } from "../workspace/legacy-personal.ts";
 import { defaultWorkspaceFor, ensureUserWorkspace } from "../workspace/provisioning.ts";
@@ -2019,10 +2029,12 @@ export class Runtime {
     attended: boolean,
   ): Promise<ToolSchema[]> {
     const registry = await this.ensureWorkspaceRegistry(wsId);
-    const [workspaceTools, identityTools] = await Promise.all([
+    const [allWorkspaceTools, identityTools, admission] = await Promise.all([
       registry.availableTools(),
       this.listIdentitySourceTools(),
+      this.connectorAdmission(wsId, identity),
     ]);
+    const workspaceTools = filterAdmittedTools(allWorkspaceTools, admission);
     const visible = (name: string) => isToolVisibleToRole(name, identity.orgRole);
     return [
       ...workspaceTools
@@ -3425,11 +3437,16 @@ export class Runtime {
    */
   async listToolsForWorkspace(wsId: string, identityId?: string): Promise<ToolSchema[]> {
     const registry = await this.ensureWorkspaceRegistry(wsId);
-    const [wsTools, identityTools, personalTools] = await Promise.all([
+    const [allWsTools, identityTools, personalTools, admission] = await Promise.all([
       registry.availableTools(),
       this.listIdentitySourceTools(),
       identityId ? this._listGrantedPersonalConnectorTools(identityId, wsId) : Promise.resolve([]),
+      this.connectorAdmission(wsId, identityId ? { id: identityId } : null),
     ]);
+    // A connector's `admin_tools` leave a non-admin's listing here, where every
+    // listing that reads this method (the engine's universe, `nb__search`,
+    // `/mcp` `tools/list`) picks it up. Dispatch refuses the same set.
+    const wsTools = filterAdmittedTools(allWsTools, admission);
     return [
       // Workspace tools go out BARE. The session reaches exactly one workspace,
       // so a `ws_<id>-` prefix could only ever repeat `wsId` — a constant, on
@@ -3562,7 +3579,9 @@ export class Runtime {
     );
     // Wire permission context so the registry can gate disallowed tools
     // before they reach the source.execute() path.
-    wsRegistry.setPermissionContext(wsId, this.getPermissionStore());
+    wsRegistry.setPermissionContext(wsId, this.getPermissionStore(), (serverName, toolName) =>
+      this.connectorAdminDenial(wsId, getRequestContext()?.identity, serverName, toolName),
+    );
     this._workspaceRegistries.set(wsId, wsRegistry);
     return wsRegistry;
   }
@@ -3991,6 +4010,89 @@ export class Runtime {
       },
       portFor: (wsId, serverName) => this.connectorPortFor(wsId, serverName),
     };
+  }
+
+  /**
+   * `principal`'s admission to the connector tools of `wsId`: which declared
+   * `admin_tools` it may list and call.
+   *
+   * A workspace admin is admitted to everything without reading the catalog, so
+   * the common admin path costs one workspace read. Anyone else pays one catalog
+   * read per listing and per connector tool call. No principal
+   * means no admin, so declared tools are refused, as `canWriteWorkspaceScoped`
+   * refuses.
+   *
+   * Kernel identity sources and personal connectors are not in the workspace
+   * registry and never reach this: a personal connector acts on its owner's
+   * account, not on the workspace.
+   */
+  async connectorAdmission(
+    wsId: string,
+    principal: Pick<UserIdentity, "id"> | null | undefined,
+  ): Promise<ConnectorAdmission> {
+    const ws = principal ? await this._workspaceStore.get(wsId) : null;
+    if (canWriteWorkspaceScoped(principal, ws).allowed) return ADMIT_ALL;
+    const declared = await this.adminToolsByServer();
+    if (declared.size === 0) return ADMIT_ALL;
+    return {
+      admits: (serverName, toolName) =>
+        isAdminToolAllowed(principal, ws, declared.get(serverName), toolName),
+    };
+  }
+
+  /**
+   * The `workspace_admin_required` refusal for one call, or `null` when
+   * `principal` may make it. Every dispatch door runs this beside
+   * `assertToolAllowed` for a workspace connector tool.
+   */
+  async connectorAdminDenial(
+    wsId: string,
+    principal: Pick<UserIdentity, "id"> | null | undefined,
+    serverName: string,
+    toolName: string,
+  ): Promise<ToolResult | null> {
+    const admission = await this.connectorAdmission(wsId, principal);
+    return admission.admits(serverName, toolName) ? null : adminToolDenial(serverName, toolName);
+  }
+
+  /**
+   * Install warnings for the `admin_tools` a connector's catalog entry declares:
+   * names that are also kernel-called handlers, and names the running server
+   * does not advertise. Empty when there is nothing to say.
+   */
+  async adminToolsContractWarnings(wsId: string, serverName: string): Promise<string[]> {
+    const entry = await this.trustedCatalogEntryFor(serverName);
+    if (!entry?.adminTools) return [];
+    const port = this.connectorPortFor(wsId, serverName);
+    let tools: Tool[] | undefined;
+    try {
+      tools = port ? await port.tools() : undefined;
+    } catch {
+      tools = undefined;
+    }
+    return adminToolsContractWarnings({
+      connector: serverName,
+      adminTools: entry.adminTools,
+      ...(entry.lifecycle ? { lifecycle: entry.lifecycle } : {}),
+      ...(entry.hooks ? { hooks: entry.hooks } : {}),
+      ...(tools ? { tools } : {}),
+    });
+  }
+
+  /** Declared `admin_tools` by installed source name, from the trusted catalog,
+   *  by the same slug rule {@link trustedCatalogEntryFor} uses. */
+  private async adminToolsByServer(): Promise<Map<string, readonly string[]>> {
+    const entries = await this.getConnectorCatalog().catalogEntries();
+    const seen = new Set<string>();
+    const out = new Map<string, readonly string[]>();
+    for (const e of entries) {
+      // First entry per slug wins, declaring or not, as in `trustedCatalogEntryFor`.
+      const slug = slugifyServerName(e.id);
+      if (seen.has(slug)) continue;
+      seen.add(slug);
+      if (e.adminTools) out.set(slug, e.adminTools);
+    }
+    return out;
   }
 
   /**
