@@ -1848,7 +1848,7 @@ describe("AgentEngine", () => {
           effort: "xhigh",
           source: "operator",
         });
-        expect(po.anthropic?.thinking).toEqual({ type: "adaptive" });
+        expect(po.anthropic?.thinking).toEqual({ type: "adaptive", display: "summarized" });
         expect(po.anthropic?.effort).toBe("xhigh");
       });
 
@@ -2254,7 +2254,7 @@ describe("AgentEngine", () => {
           effort: "max",
           source: "operator",
         });
-        expect(po.anthropic?.thinking).toEqual({ type: "adaptive" });
+        expect(po.anthropic?.thinking).toEqual({ type: "adaptive", display: "summarized" });
         expect(po.anthropic?.effort).toBe("max");
       });
 
@@ -2309,9 +2309,9 @@ describe("AgentEngine", () => {
       );
 
       const po = captured[0]!.providerOptions as
-        | { anthropic?: { thinking?: { type: string } } }
+        | { anthropic?: { thinking?: { type: string; display?: string } } }
         | undefined;
-      expect(po?.anthropic?.thinking).toEqual({ type: "adaptive" });
+      expect(po?.anthropic?.thinking).toEqual({ type: "adaptive", display: "summarized" });
     });
 
     it("does NOT set providerOptions when thinking is undefined", async () => {
