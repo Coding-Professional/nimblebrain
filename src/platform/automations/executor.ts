@@ -58,7 +58,7 @@ export interface TaskFnRequest {
   trigger?: "schedule" | "manual" | "event";
   model?: string;
   maxIterations?: number;
-  maxInputTokens?: number;
+  maxRunInputTokens?: number;
   allowedTools?: string[];
   metadata?: Record<string, unknown>;
   /**
@@ -192,7 +192,7 @@ function buildRequest(
   };
   if (automation.model != null) req.model = automation.model;
   if (automation.maxIterations != null) req.maxIterations = automation.maxIterations;
-  if (automation.maxInputTokens != null) req.maxInputTokens = automation.maxInputTokens;
+  if (automation.maxInputTokens != null) req.maxRunInputTokens = automation.maxInputTokens;
   // An empty list means no narrowing, as the form shows it ("all"), not a run
   // with only the system tools.
   if (automation.allowedTools?.length) req.allowedTools = automation.allowedTools;
@@ -459,6 +459,16 @@ function unrecognizedStopError(
   return `Model turn ended without a recognized stop (${raw}).`;
 }
 
+/** The error for a run the engine stopped at its input-token cap. */
+function runInputCapError(spent: number, cap: number | undefined): string {
+  const limit = cap != null ? ` of ${cap.toLocaleString("en-US")}` : "";
+  return (
+    `Stopped at its input-token cap${limit}: the run had spent ${spent.toLocaleString("en-US")} ` +
+    "input tokens, and its next step was projected to pass the cap. Raise Max Input Tokens or " +
+    "narrow the task."
+  );
+}
+
 function mapResultToRun(
   automation: Automation,
   startedAt: string,
@@ -501,6 +511,9 @@ function mapResultToRun(
       status = verdict.status;
       error = verdict.error;
     }
+  }
+  if (stopReason === "max_input_tokens") {
+    error = runInputCapError(data.usage.inputTokens, automation.maxInputTokens);
   }
   error ??= unrecognizedStopError(status, stopReason, data);
 
@@ -595,6 +608,8 @@ export function extractOutputFiles(toolCalls: TaskFnResult["toolCalls"]): RunFil
  *
  *   complete                                 → success (model said done)
  *   max_iterations                           → timeout (agent loop cap)
+ *   max_input_tokens                         → failure (run input cap; the
+ *                                              error names the cap)
  *   length / content_filter / error / other  → failure (model couldn't
  *                                              finish — surface so the
  *                                              operator knows)
