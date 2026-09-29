@@ -161,7 +161,10 @@ describe("nb__manage_workspaces", () => {
       expect(parsed.workspace.id).toBe("ws_custom_slug");
     });
 
-    test("creates workspace with connectors", async () => {
+    test("creates workspace with connectors, reporting them by name", async () => {
+      catalogEntries = [
+        { id: "com.example/echo", name: "Echo", url: "https://echo.example.com/mcp" },
+      ] as ConnectorCatalogEntry[];
       const result = await tool.handler({
         action: "create",
         name: "Connector Workspace",
@@ -170,11 +173,11 @@ describe("nb__manage_workspaces", () => {
 
       expect(result.isError).toBe(false);
       const parsed = parseResult(result) as {
-        workspace: { connectors: Array<{ url: string; serverName?: string }> };
+        workspace: { id: string; connectors: Array<Record<string, unknown>> };
       };
-      expect(parsed.workspace.connectors).toHaveLength(1);
-      expect(parsed.workspace.connectors[0].url).toBe("https://echo.example.com/mcp");
-      expect(parsed.workspace.connectors[0].serverName).toBe("echo");
+      expect(parsed.workspace.connectors).toEqual([{ serverName: "echo", name: "Echo" }]);
+      const stored = await store.get(parsed.workspace.id);
+      expect(stored?.connectors[0]?.url).toBe("https://echo.example.com/mcp");
     });
 
     test("requires name", async () => {
@@ -306,10 +309,18 @@ describe("nb__manage_workspaces", () => {
 
       expect(updateResult.isError).toBe(false);
       const updated = parseResult(updateResult) as {
-        workspace: { connectors: Array<{ url: string }> };
+        workspace: { connectors: Array<Record<string, unknown>> };
       };
-      expect(updated.workspace.connectors).toHaveLength(2);
-      expect(updated.workspace.connectors[0]?.url).toBe("https://echo.example.com/mcp");
+      // Uncatalogued, so each is named by its server name; the ref stays in the store.
+      expect(updated.workspace.connectors).toEqual([
+        { serverName: "echo", name: "echo" },
+        { serverName: "bash", name: "bash" },
+      ]);
+      const stored = await store.get(created.workspace.id);
+      expect(stored?.connectors.map((c) => c.url)).toEqual([
+        "https://echo.example.com/mcp",
+        "https://bash.example.com/mcp",
+      ]);
     });
 
     test("refuses a connector row with no reachable url", async () => {
@@ -521,7 +532,12 @@ describe("nb__manage_workspaces", () => {
 
     test("names each connector from the catalog and never returns the ref", async () => {
       catalogEntries = [
-        { id: "com.example/echo", name: "Echo", url: "https://echo.example.com/mcp" },
+        {
+          id: "com.example/echo",
+          name: "Echo",
+          url: "https://echo.example.com/mcp",
+          iconUrl: "https://static.example.com/echo.svg",
+        },
         { id: "com.example/mail", name: "Mail", url: "https://catalog.example.com/mail" },
       ] as ConnectorCatalogEntry[];
       await tool.handler({ action: "create", name: "Alpha" });
@@ -551,7 +567,15 @@ describe("nb__manage_workspaces", () => {
       const connectors = parsed.workspaces[0].connectors;
       expect(connectors.map((c) => c.name)).toEqual(["Echo", "Mail", connectors[2].serverName]);
       expect(connectors[2].serverName).toBeTruthy();
-      for (const c of connectors) expect(Object.keys(c).sort()).toEqual(["name", "serverName"]);
+      expect(connectors.map((c) => c.iconUrl)).toEqual([
+        "https://static.example.com/echo.svg",
+        undefined,
+        undefined,
+      ]);
+      expect(Object.keys(connectors[0]).sort()).toEqual(["iconUrl", "name", "serverName"]);
+      for (const c of connectors.slice(1)) {
+        expect(Object.keys(c).sort()).toEqual(["name", "serverName"]);
+      }
       expect(JSON.stringify(parsed)).not.toContain("inline-secret");
     });
 
