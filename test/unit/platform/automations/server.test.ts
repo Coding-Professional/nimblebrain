@@ -1263,7 +1263,7 @@ describe("validateAutomationFields", () => {
 
 	test("passes with no validation-relevant fields", () => {
 		expect(() =>
-			validateAutomationFields({ name: "test", prompt: "do stuff" }),
+			validateAutomationFields({}),
 		).not.toThrow();
 	});
 });

@@ -417,10 +417,10 @@ describe("integration: auth boundary", () => {
 });
 
 // =============================================================================
-// E2E Scenario 1: Install app -> tool call via API
+// E2E Scenario 1: registered app -> tool call via API
 // =============================================================================
 
-describe("E2E: install app -> tool call via API", () => {
+describe("E2E: registered app -> tool call via API", () => {
 	let runtime: Runtime;
 	let handle: ServerHandle;
 	let baseUrl: string;
@@ -464,16 +464,6 @@ describe("E2E: install app -> tool call via API", () => {
 		]);
 		const wsRegistry = runtime.getRegistryForWorkspace(TEST_WORKSPACE_ID);
 		wsRegistry.addSource(taskSource);
-
-		// Seed lifecycle instance to match the registered source
-		await runtime.getLifecycle().seedInstance("tasks", "@nimblebraininc/tasks", {
-			name: "@nimblebraininc/tasks",
-			ui: {
-				name: "Task Manager",
-				icon: "check",
-				primaryView: { resourceUri: "ui://tasks/board" },
-			},
-		}, undefined, TEST_WORKSPACE_ID);
 
 		handle = startServer({ runtime, port: 0});
 		baseUrl = `http://localhost:${handle.port}`;
@@ -544,9 +534,6 @@ describe("E2E: tool call via API", () => {
 		]);
 		const wsRegistry = runtime.getRegistryForWorkspace(TEST_WORKSPACE_ID);
 		wsRegistry.addSource(notesSource);
-		await runtime.getLifecycle().seedInstance("notes", "@test/notes", {
-			name: "@test/notes",
-		}, undefined, TEST_WORKSPACE_ID);
 
 		handle = startServer({ runtime, port: 0});
 		baseUrl = `http://localhost:${handle.port}`;

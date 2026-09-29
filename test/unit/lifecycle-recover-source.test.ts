@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import type { ConnectorInstance, ConnectorRef } from "../../src/connectors/runtime/types.ts";
+import { legacyConnectorRef } from "../helpers/connector-fixtures.ts";
 import type { EngineEvent, EventSink, ToolResult } from "../../src/engine/types.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
 import type { Tool, ToolSource } from "../../src/tools/types.ts";
@@ -47,7 +48,6 @@ function seedInstance(lifecycle: ConnectorLifecycleManager, serverName: string, 
     version: "remote",
     state: "starting",
     ui: null,
-    type: "plain",
     wsId: WS,
     oauthScope: "workspace",
     ...(ref ? { ref } : {}),
@@ -101,7 +101,7 @@ describe("ConnectorLifecycleManager.tryRecoverSource", () => {
   });
 
   test("returns false for a non-URL (named/stdio) ref without attempting a re-spawn", async () => {
-    seedInstance(lifecycle, "stdio", { name: "@scope/stdio" });
+    seedInstance(lifecycle, "stdio", legacyConnectorRef({ name: "@scope/stdio" }));
     const callCount = spyEnsure(lifecycle, async () => {});
     expect(await lifecycle.tryRecoverSource("stdio", WS, WORK_DIR)).toBe(false);
     expect(callCount()).toBe(0);

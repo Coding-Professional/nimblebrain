@@ -6,6 +6,7 @@ import type { ManagedConnectorProvider } from "../../src/connectors/providers/ma
 import { managedConnectorRegistryOf } from "../../src/connectors/providers/registry.ts";
 import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import type { ConnectorInstance, ConnectorRef } from "../../src/connectors/runtime/types.ts";
+import { legacyConnectorRef } from "../helpers/connector-fixtures.ts";
 import type { EngineEvent, EventSink } from "../../src/engine/types.ts";
 import { log } from "../../src/observability/log.ts";
 import { McpSource } from "../../src/tools/mcp-source.ts";
@@ -52,7 +53,6 @@ function seedInstance(
     version: "remote",
     state: "starting",
     ui: null,
-    type: "plain",
     wsId,
     oauthScope,
     ...(ref ? { ref } : {}),
@@ -94,7 +94,7 @@ describe("ConnectorLifecycleManager.startAuth — validation & idempotence", () 
   });
 
   test("rejects when connector ref has no URL (named or local connector)", async () => {
-    seedInstance(lifecycle, "stdio", "ws_test", "workspace", { name: "@scope/stdio" });
+    seedInstance(lifecycle, "stdio", "ws_test", "workspace", legacyConnectorRef({ name: "@scope/stdio" }));
     await expect(
       lifecycle.startAuth("stdio", "ws_test", "_workspace", OPTS),
     ).rejects.toThrow(/missing URL ref/);
@@ -151,7 +151,7 @@ describe("ConnectorLifecycleManager.disconnect — symmetric teardown", () => {
   });
 
   test("rejects when connector has no URL ref (revocation requires the AS URL)", async () => {
-    seedInstance(lifecycle, "stdio", "ws_test", "workspace", { name: "@scope/stdio" });
+    seedInstance(lifecycle, "stdio", "ws_test", "workspace", legacyConnectorRef({ name: "@scope/stdio" }));
     await expect(
       lifecycle.disconnect("stdio", "ws_test", "_workspace", { workDir: "/tmp" }),
     ).rejects.toThrow(/missing URL ref/);
