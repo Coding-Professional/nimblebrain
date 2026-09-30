@@ -224,6 +224,7 @@
 
 ### Fixed
 
+- **A remote OAuth connector whose server refuses `openid` signs in again.** A server that advertises OpenID Connect but answers `invalid_scope` to this client is asked once more with the connector's own scopes, and the row reads **Connected** with no account ([#1431](https://github.com/NimbleBrainInc/nimblebrain/issues/1431)).
 - **`tools/call` answers an unknown tool with a standard error body.** The `404 tool_not_found` now carries `message`, with `server` and `tool` under `details`, like every other REST error.
 - **A disconnected connector reads as at rest, not broken.** Disconnect leaves a workspace connector installed as a neutral **Not connected** with **Connect**, and off the overview's attention list; amber **Reconnect** is kept for a connection whose credential the vendor rejected, and now survives a restart. Disconnect asks first and says what stays and that Uninstall removes it.
 - **A remote OAuth connector signed into mid-session lists its tools.** A tool read during pending auth reached a client that had not finished its handshake; the MCP SDK answered with an empty list, and the source kept it, so the connector ran with 0 tools until the next restart. A source now reports "not started" until its client has connected.
