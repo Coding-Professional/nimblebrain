@@ -37,7 +37,8 @@ export interface EventConnection {
   close(): void;
 }
 
-/** Per-chunk SSE accumulator: the `event:` name seen so far, awaiting its `data:`. */
+/** SSE frame accumulator, carried across reads for one connection: the `event:`
+ *  name seen so far, awaiting its `data:`. */
 interface SseParserState {
   currentEvent: string;
 }
@@ -173,10 +174,12 @@ export function connectEvents(options: ConnectEventsOptions): EventConnection {
 
   /** Read the SSE body to completion (or close), decoding line-by-line and
    *  dispatching each complete frame in arrival order. The trailing partial line
-   *  stays buffered across reads; the event accumulator resets each read chunk. */
+   *  and the frame being accumulated both carry across reads: a network chunk
+   *  can end between a frame's `event:` and `data:` lines. */
   async function pumpStream(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
     const decoder = new TextDecoder();
     let buffer = "";
+    const state: SseParserState = { currentEvent: "" };
 
     for (;;) {
       const { done, value } = await reader.read();
@@ -186,8 +189,6 @@ export function connectEvents(options: ConnectEventsOptions): EventConnection {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-
-      const state: SseParserState = { currentEvent: "" };
       for (const line of lines) consumeLine(line, state);
     }
   }
