@@ -407,6 +407,10 @@ export class McpSource implements ToolSource {
    *  session-loss reads here at once; without this each would fire its own
    *  restart — a restart storm on a single source. */
   private restartInFlight: Promise<boolean> | null = null;
+  /** A {@link start} in progress. A connect flow registers a source before its
+   *  first start settles, so a restart can be asked for while it is still
+   *  connecting; {@link tryRestart} joins this instead of stopping it. */
+  private startInFlight: Promise<void> | null = null;
   /** Backoff schedule for `recover`'s re-establish loop. Defaults to
    *  `SESSION_RECOVERY_DELAYS_MS`; overridable so tests exercise the policy
    *  branches without real sleeps. */
@@ -597,6 +601,16 @@ export class McpSource implements ToolSource {
   }
 
   async start(): Promise<void> {
+    const starting = this.doStart();
+    this.startInFlight = starting;
+    try {
+      await starting;
+    } finally {
+      if (this.startInFlight === starting) this.startInFlight = null;
+    }
+  }
+
+  private async doStart(): Promise<void> {
     // Clear deliberate-teardown flags so a restart re-enables crash detection
     // on the new transport. Set in `stop()` to suppress onclose-emitted
     // `source.crashed` events during graceful teardown.
@@ -1449,9 +1463,14 @@ export class McpSource implements ToolSource {
    * reconnecting an orphaned, registry-removed instance — see the field doc on
    * {@link stopped}. A self-dropped transport (idle close, network blip) leaves
    * this false, so it still reconnects.
+   *
+   * A restart in flight passes through `stop()`, which sets `stopped` until its
+   * `start()` clears it; that is not a teardown, so it reads false here. Read as
+   * true, a HealthMonitor check landing in that window would mark a live source
+   * dead for good.
    */
   isStopped(): boolean {
-    return this.stopped;
+    return this.stopped && this.restartInFlight === null;
   }
 
   /** Time (ms) since the source was last started, or null if never started. */
@@ -1525,8 +1544,7 @@ export class McpSource implements ToolSource {
    * While waiting it re-attempts the connection itself, at most once per
    * `retryMs` across all waiters (spaced from `lastReconnectFailedAt`, and
    * coalesced onto one stop()/start() by {@link tryRestart}). It cannot rely on
-   * HealthMonitor alone: that sweeps every 30s and tracks only the sources that
-   * existed at boot.
+   * HealthMonitor alone: that sweeps every 30s, longer than the wait.
    */
   private async awaitRestartingSource(signal?: AbortSignal): Promise<boolean> {
     const { waitMs, horizonMs, retryMs } = this.restartingSourceWait;
@@ -1540,9 +1558,7 @@ export class McpSource implements ToolSource {
         await settleWithin(null, Math.min(nextAttemptAt - Date.now(), remaining), signal);
         continue;
       }
-      // A restart in flight passes through stop(), which sets `stopped` until its
-      // start() clears it, so only a quiet `stopped` means a deliberate teardown.
-      if (!this.restartInFlight && this.isStopped()) return false;
+      if (this.isStopped()) return false;
       const attempt = this.tryRestart().then(() => {
         if (!this.client) this.lastReconnectFailedAt = Date.now();
       });
@@ -3046,6 +3062,12 @@ export class McpSource implements ToolSource {
     // inline session recovery (readResource / callTool) and HealthMonitor can
     // all reach here for the same source after a remote roll. See `restartInFlight`.
     if (this.restartInFlight) return this.restartInFlight;
+    // A connect already under way is joined, not restarted: stop() would tear
+    // down the connection it is building, failing the Connect a user waits on.
+    if (this.startInFlight) {
+      await this.startInFlight.catch(() => {});
+      return this.isAlive();
+    }
     this.restartInFlight = this.doRestart();
     try {
       return await this.restartInFlight;
