@@ -171,12 +171,14 @@ import {
   readConnectorSkillCandidates,
 } from "../skills/connector-skill-store.ts";
 import {
+  connectorToolAffinity,
   type DiscoveredSkill,
   disambiguateSkillNames,
   discoveredSkillFromEntry,
   hydrateSkill,
   PUBLISHED_SKILL_SCOPE,
   parseSkillMarkdown,
+  reportUnmatchedToolAffinity,
   synthesizeConnectorSkill,
 } from "../skills/connector-skills.ts";
 import {
@@ -531,6 +533,13 @@ export class Runtime {
    * and the surface-once candidates together, since both read this.
    */
   private skillResourceCache = new Map<string, { skills: DiscoveredSkill[]; fetchedAt: number }>();
+  /**
+   * The overlay version (lock shas) and advertised tool names each overlaid
+   * connector was last checked against, keyed by workspace and server, so a
+   * check runs again only when the overlay or the connector's tools change, not
+   * every turn. Bounded by {@link boundedSet}.
+   */
+  private overlayAffinityChecked = new Map<string, string>();
   private static readonly SKILL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   /**
    * Verified, budget-capped server skill bodies keyed by the `SKILL.md`
@@ -2856,8 +2865,70 @@ export class Runtime {
       });
     } else {
       this.skillResourceCache.set(cacheKey, { skills, fetchedAt: Date.now() });
+      await this.reportUnmatchedPublishedAffinity(wsId, serverName, unwrapped, skills);
     }
     return skills;
+  }
+
+  /**
+   * Warn for each published skill whose declared tool-affinity names no tool
+   * its server advertises. Discovery is where the declared affinity and the
+   * server's tools are both in hand; it runs on a complete enumeration, so once
+   * per discovery TTL per server, against the source's memoized tool list.
+   */
+  private async reportUnmatchedPublishedAffinity(
+    wsId: string,
+    serverName: string,
+    source: ToolSource,
+    skills: DiscoveredSkill[],
+  ): Promise<void> {
+    const declared = skills.filter((s) => s.toolAffinity?.length);
+    if (declared.length === 0) return;
+    reportUnmatchedToolAffinity({
+      wsId,
+      serverName,
+      toolNames: await advertisedToolNames(source),
+      skills: declared.map((s) => ({
+        name: s.name,
+        toolAffinity: connectorToolAffinity(serverName, s.toolAffinity),
+      })),
+    });
+  }
+
+  /**
+   * Warn for each materialized overlay whose tool-affinity names no tool its
+   * connector advertises. An overlay is materialized before its connector has
+   * connected, so the check waits for the connector's tools: a connector that
+   * advertises none yet is checked on a later call. Each check is recorded
+   * against the overlay version and the advertised tool set
+   * (`overlayAffinityChecked`), so it runs again only when either changes.
+   */
+  private async reportUnmatchedOverlayAffinity(
+    wsId: string,
+    sources: ToolSource[],
+    lockKeys: Map<string, string>,
+  ): Promise<void> {
+    const pending = (
+      await Promise.all(
+        sources.map(async (source) => {
+          const toolNames = await advertisedToolNames(source);
+          const key = `${wsId}\0${source.name}`;
+          const checked = [lockKeys.get(source.name) ?? "", ...toolNames].join("\0");
+          return { serverName: source.name, toolNames, key, checked };
+        }),
+      )
+    ).filter((c) => c.toolNames.length > 0 && this.overlayAffinityChecked.get(c.key) !== c.checked);
+    if (pending.length === 0) return;
+    const overlays = this.listConnectorOverlays(wsId);
+    for (const { serverName, toolNames, key, checked } of pending) {
+      boundedSet(this.overlayAffinityChecked, key, checked);
+      reportUnmatchedToolAffinity({
+        wsId,
+        serverName,
+        toolNames,
+        skills: overlays.filter((o) => o.server === serverName),
+      });
+    }
   }
 
   /**
@@ -3051,9 +3122,10 @@ export class Runtime {
    * Discover every MCP source in `wsId`'s registry that publishes skills
    * (SEP-2640 `skills/list`) and synthesize a body-less `Skill` for each,
    * honoring the loading strategy the skill declares in its frontmatter. A
-   * `dynamic` skill (the default when none is declared) tool-affines to
-   * `<serverName>__*` and loads via `selectLayer3Skills` whenever the server's
-   * tools are in the active toolset; an `always` skill routes to the context
+   * `dynamic` skill (the default when none is declared) tool-affines to the
+   * server's tools it declares, or to `<serverName>__*` when it declares none
+   * (`connectorToolAffinity`), and loads via `selectLayer3Skills` when a
+   * matching tool is in the active toolset; an `always` skill routes to the context
    * channel. Callers partition the returned pool by role (see
    * `selectRequestLayer3`) — no `appContext` required.
    *
@@ -3099,17 +3171,22 @@ export class Runtime {
     // `skill://…/SKILL.md` guidance — the curated overlay supersedes it (and
     // would otherwise double the guidance under two framings). A server "has an
     // overlay" iff its persisted ref carries a non-empty `skillsLock`.
-    const overlaidServers = new Set(
-      this.getConnectorInstancesForWorkspace(wsId)
-        .filter((i) => i.ref && "skillsLock" in i.ref && (i.ref.skillsLock?.length ?? 0) > 0)
-        .map((i) => i.serverName),
-    );
+    // The lock's shas key the overlay affinity check to the overlay version.
+    const overlayLocks = new Map<string, string>();
+    for (const i of this.getConnectorInstancesForWorkspace(wsId)) {
+      const lock = i.ref && "skillsLock" in i.ref ? i.ref.skillsLock : undefined;
+      if (lock?.length) overlayLocks.set(i.serverName, lock.map((e) => e.sha).join(","));
+    }
 
     const candidates: string[] = [];
+    const overlaidSources: ToolSource[] = [];
     const registeredNames = new Set<string>();
     for (const source of registry.getSources()) {
       registeredNames.add(source.name);
-      if (overlaidServers.has(source.name)) continue;
+      if (overlayLocks.has(source.name)) {
+        overlaidSources.push(source);
+        continue;
+      }
       const inner = source instanceof SharedSourceRef ? source.unwrap() : source;
       if (!(inner instanceof McpSource)) continue;
       candidates.push(source.name);
@@ -3121,6 +3198,11 @@ export class Runtime {
     // latency on workspaces with many non-skill servers. `discoverServerSkills`
     // caches both positive and empty results so steady-state cost is zero. A
     // server may expose more than one skill, so each candidate yields 0..N.
+    const overlayAffinityCheck = this.reportUnmatchedOverlayAffinity(
+      wsId,
+      overlaidSources,
+      overlayLocks,
+    );
     const synthesized = await Promise.all(
       candidates.map(async (name) => {
         try {
@@ -3147,6 +3229,7 @@ export class Runtime {
               ...(s.loadingStrategy ? { loadingStrategy: s.loadingStrategy } : {}),
               ...(s.priority !== undefined ? { priority: s.priority } : {}),
               ...(s.triggers?.length ? { triggers: s.triggers } : {}),
+              ...(s.toolAffinity?.length ? { toolAffinity: s.toolAffinity } : {}),
             }),
           );
         } catch {
@@ -3154,6 +3237,7 @@ export class Runtime {
         }
       }),
     );
+    await overlayAffinityCheck;
     return synthesized.flat();
   }
 
@@ -4954,12 +5038,13 @@ export class Runtime {
    *     tools were active at turn start is already in `<layer3-skill>`.
    *
    *  The second is not a corner case. `selectLayer3Skills` matches the very
-   *  `<server>__*` glob synthesis stamps on every published skill, so Layer 3
-   *  and this candidate list select on identical criteria — leaving a selected
-   *  skill in the pool re-delivered its body as a synthetic message on the first
-   *  call to any of its server's tools, where it then rode the rest of the
-   *  conversation. Because the glob is per-SERVER, one such call re-delivered
-   *  every skill that server published, not just the called tool's own.
+   *  tool-affinity synthesis stamps on every published skill, so Layer 3 and
+   *  this candidate list select on identical criteria — leaving a selected
+   *  skill in the pool would re-deliver its body as a synthetic message on the
+   *  first call to a matching tool, where it would then ride the rest of the
+   *  conversation. A skill that declares no affinity is bound to its whole
+   *  server, so one such call would re-deliver every such skill that server
+   *  publishes.
    *
    *  What remains is what the channel is for: a skill whose tools were proxied
    *  out of the active set at turn start, so Layer 3 could not select it, and
@@ -6036,7 +6121,7 @@ async function hydrateSelected(selected: SelectedSkill[]): Promise<SelectedSkill
   return loaded.filter((sel): sel is SelectedSkill => sel !== null);
 }
 
-/** Entries a body cache holds before evicting its oldest. */
+/** Entries a bounded runtime map (skill body caches, overlay checks) holds before evicting its oldest. */
 const SKILL_BODY_CACHE_MAX = 512;
 
 /** `map.set` that evicts the oldest entry once the map holds {@link SKILL_BODY_CACHE_MAX}. */
@@ -6047,6 +6132,18 @@ function boundedSet<V>(map: Map<string, V>, key: string, value: V): void {
     if (oldest !== undefined) map.delete(oldest);
   }
   map.set(key, value);
+}
+
+/**
+ * The names of the tools `source` advertises, or none when it cannot list them
+ * yet (a source that has not connected throws).
+ */
+async function advertisedToolNames(source: ToolSource): Promise<string[]> {
+  try {
+    return (await source.tools()).map((t) => t.name);
+  } catch {
+    return [];
+  }
 }
 
 /**

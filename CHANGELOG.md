@@ -226,6 +226,7 @@
 
 ### Fixed
 
+- **A connector skill loads for the tools it names, not every tool of its connector.** A server-published skill or curated overlay that declares `metadata.nimblebrain.tool-affinity` (bare tool names or globs) is bound to those tools under the connector's namespace; one that declares none still loads for any of the connector's tools. A declared pattern that matches none of the connector's tools is logged as a warning, and an overlay's `metadata.nimblebrain` block may carry `tool-affinity` alone ([#1467](https://github.com/NimbleBrainInc/nimblebrain/issues/1467)).
 - **An agent call naming an argument its tool's schema does not declare is refused before dispatch, with the valid arguments listed.** ([#1466](https://github.com/NimbleBrainInc/nimblebrain/issues/1466)).
 - **A remote OAuth connector whose server refuses `openid` signs in again.** A server that advertises OpenID Connect but answers `invalid_scope` to this client is asked once more with the connector's own scopes, and the row reads **Connected** with no account ([#1431](https://github.com/NimbleBrainInc/nimblebrain/issues/1431)).
 - **`tools/call` answers an unknown tool with a standard error body.** The `404 tool_not_found` now carries `message`, with `server` and `tool` under `details`, like every other REST error.
