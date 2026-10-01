@@ -1,6 +1,5 @@
 import { Check, Copy } from "lucide-react";
 import { Button } from "../../components/ui/button";
-import { Label } from "../../components/ui/label";
 import { useWorkspaceContext } from "../../context/WorkspaceContext";
 import { useFlashState } from "../../hooks/useFlashState";
 import { RequireActiveWorkspace, Section, SettingsFormPage } from "./components";
@@ -56,7 +55,6 @@ function McpUrl({ url }: { url: string | null }) {
   return (
     <div className="space-y-2">
       <div className="space-y-1.5">
-        <Label className="text-xs text-muted-foreground">MCP URL</Label>
         <div className="flex items-center gap-2 rounded-md border border-border/60 bg-muted/50 px-3 py-2">
           {/* Always visible, so a failed clipboard write (Safari over plain
               HTTP, a sandboxed iframe, a denied permission) still leaves the

@@ -1,7 +1,8 @@
+import { Check, Copy } from "lucide-react";
 import { useWorkspaceContext } from "../../context/WorkspaceContext";
+import { useFlashState } from "../../hooks/useFlashState";
 import { useCanWriteActiveWorkspace } from "../../hooks/useScopedRole";
 import {
-  CopyableWorkspaceId,
   RequireActiveWorkspace,
   Section,
   SettingsFormPage,
@@ -9,8 +10,10 @@ import {
 } from "./components";
 
 /**
- * Workspace "General" tab — the workspace ID and the workspace's custom
- * instructions.
+ * Workspace "General" tab — the workspace's custom instructions, with the
+ * workspace ID as quiet metadata in the header's top-right corner. Most members
+ * never need the ID, so it gets no section of its own; it is here, not on the
+ * MCP tab, because it identifies the workspace.
  *
  * Route: /w/:slug/settings/general (the workspace is the URL slug).
  * Permission: any workspace member can read; only a workspace **admin member**
@@ -38,19 +41,39 @@ function Inner() {
 
   return (
     <SettingsFormPage
-      title={ws.name}
-      description="Settings for the active workspace. Changes affect everyone in this workspace."
+      title="General"
+      description="Changes here affect everyone in this workspace."
+      action={<WorkspaceIdChip workspaceId={ws.id} />}
     >
-      <Section title="Workspace ID" flush>
-        <CopyableWorkspaceId workspaceId={ws.id} />
-      </Section>
-
       <Section
-        title="Workspace Instructions"
-        description="Custom instructions injected into every conversation in this workspace. Applies on top of organization-wide policies and is readable by anyone in the workspace."
+        flush
+        title="Workspace instructions"
+        description="Guidance the assistant follows in every conversation in this workspace, on top of your organization's. Everyone here can see it."
       >
         <WorkspaceInstructions wsId={ws.id} canEdit={canEdit} />
       </Section>
     </SettingsFormPage>
+  );
+}
+
+function WorkspaceIdChip({ workspaceId }: { workspaceId: string }) {
+  const [copied, flashCopied] = useFlashState(1500);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        navigator.clipboard
+          .writeText(workspaceId)
+          .then(flashCopied)
+          .catch(() => {});
+      }}
+      aria-label={`Copy workspace ID ${workspaceId}`}
+      title={copied ? "Copied" : "Copy workspace ID"}
+      data-testid="workspace-id-chip"
+      className="mt-1 inline-flex items-center gap-1.5 rounded-sm px-1.5 py-1 text-xs text-muted-foreground hover:bg-foreground/5 hover:text-foreground transition-colors"
+    >
+      <code className="font-mono">{workspaceId}</code>
+      {copied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
   );
 }
