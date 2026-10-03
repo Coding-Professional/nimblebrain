@@ -50,17 +50,17 @@ export function NotificationsProvider({
   const [error, setError] = useState<string | null>(null);
 
   // The workspace a read was issued for. A read that lands after a switch is
-  // dropped rather than applied: the tool answers for whatever workspace the
-  // request header named at send time, so a late response is another
-  // workspace's inbox, and painting it here is a cross-workspace leak in the
-  // one place the user would never think to check.
+  // dropped rather than applied: it answers for the workspace it named at send
+  // time, so a late response is another workspace's inbox, and painting it
+  // here is a cross-workspace leak in the one place the user would never think
+  // to check.
   const requestedFor = useRef<string | undefined>(undefined);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const read = useCallback(async (wsId: string) => {
     requestedFor.current = wsId;
     try {
-      const out = await listNotifications({ limit: INBOX_PAGE_SIZE });
+      const out = await listNotifications({ limit: INBOX_PAGE_SIZE }, wsId);
       if (requestedFor.current !== wsId) return;
       setItems(out.notifications);
       setError(null);
@@ -119,7 +119,7 @@ export function NotificationsProvider({
         ),
       );
       try {
-        await markNotificationsRead(ids);
+        await markNotificationsRead(ids, workspaceId);
       } catch {
         // The optimistic paint is wrong now. Re-read rather than reverting by
         // hand — the store is the only thing that knows what actually changed.
