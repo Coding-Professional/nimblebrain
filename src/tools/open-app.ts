@@ -55,7 +55,7 @@ export function createOpenAppTool(runtime: Runtime): InProcessTool {
   return {
     name: OPEN_APP_TOOL,
     description:
-      'Open an app on the user\'s screen, optionally at a specific view inside it. Use it when the user asks to open, show, or go to an app or a record ("open People", "show me Chris in People"). To open a record, first find it with the app\'s own tools, then pass its resource URI as `target`. Opens only on the screen of the user who asked, in the conversation they are watching.',
+      'Open an app on the user\'s screen, optionally at a specific view inside it. Use it when the user asks to open, show, or go to an app or a record ("open People", "show me Chris in People"). To open a record, first find it with the app\'s own tools, then pass its resource URI as `target` (an app\'s records often carry it as `uri`). The app opens either way, and goes to the target only if it supports that address, so tell the user the app is opening, not that the record is on screen. Opens only on the screen of the user who asked, in the conversation they are watching.',
     inputSchema: {
       type: "object",
       properties: {
@@ -70,7 +70,7 @@ export function createOpenAppTool(runtime: Runtime): InProcessTool {
           minLength: 1,
           maxLength: 512,
           description:
-            "The view to open inside the app: its stable address, the record's resource URI when it has one. Omit to open the app's home.",
+            "The view to open inside the app: its stable address, the record's resource URI when it has one. An app that does not support opening at an address shows its home screen, or stays on what it was showing if it was already open. Omit to open the app's home.",
         },
       },
       required: ["app"],
@@ -93,7 +93,14 @@ export function createOpenAppTool(runtime: Runtime): InProcessTool {
       }
       const name = found.label ?? found.route ?? found.serverName;
       return {
-        content: textContent(`Opened ${name}${target ? ` at ${target}` : ""}.`),
+        // The app, not this server, decides whether it can go to `target`, and
+        // nothing reports back whether it did, so the answer claims only what
+        // is known: the app is opening, and the target was asked for.
+        content: textContent(
+          target
+            ? `Opening ${name}, asking it to go to ${target}. ${name} goes there if it supports opening at that address; otherwise it shows its home screen, or stays on what it was showing if it was already open.`
+            : `Opening ${name}.`,
+        ),
         structuredContent: {
           app: found.route ?? found.serverName,
           name,
