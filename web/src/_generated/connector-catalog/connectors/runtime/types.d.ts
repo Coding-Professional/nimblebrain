@@ -29,7 +29,7 @@ export interface PlacementDeclaration {
     priority?: number;
     /** Human-readable label (for sidebar items, tabs, etc.). */
     label?: string;
-    /** Icon (emoji or identifier). */
+    /** Lucide icon name, shown on a `sidebar.bottom` entry. A connector's other sidebar entries show its catalog `icons`. */
     icon?: string;
     /** Route path. Registers as /app/<path> (or "/" for Home). Works in sidebar and main slots. */
     route?: string;
@@ -262,9 +262,6 @@ export interface HostManifestMeta {
      */
     host_version: string;
     placements?: PlacementDeclaration[];
-    primaryView?: {
-        resourceUri: string;
-    };
     /**
      * Inbound event streams this server accepts, one per vendor. The runtime
      * mints a capability URL per `(workspace, connector, vendor)` at install and

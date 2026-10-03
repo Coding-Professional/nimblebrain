@@ -26,7 +26,7 @@ export interface PlacementDeclaration {
   priority?: number;
   /** Human-readable label (for sidebar items, tabs, etc.). */
   label?: string;
-  /** Icon (emoji or identifier). */
+  /** Lucide icon name, shown on a `sidebar.bottom` entry. A connector's other sidebar entries show its catalog `icons`. */
   icon?: string;
   /** Route path. Registers as /app/<path> (or "/" for Home). Works in sidebar and main slots. */
   route?: string;
@@ -263,11 +263,11 @@ export interface HostManifestMeta {
    * is major 1.
    */
   host_version: string;
-  // `name`, `icon` and `category` are deprecated and ignored: the schema still
-  // accepts them so existing catalogs load, and nothing reads them. A
-  // connector's display identity is its catalog entry's core fields.
+  // No `name`, `icon`, `category` or `primaryView`: a connector's display
+  // identity is its catalog entry's core `title` and `icons`, and its views are
+  // its placements. A block that still carries them validates (unknown keys are
+  // ignored) and nothing reads them.
   placements?: PlacementDeclaration[];
-  primaryView?: { resourceUri: string };
   /**
    * Inbound event streams this server accepts, one per vendor. The runtime
    * mints a capability URL per `(workspace, connector, vendor)` at install and
