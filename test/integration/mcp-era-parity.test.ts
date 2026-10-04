@@ -5,33 +5,27 @@
  * runs against each leg through a driver per era, and every assertion is
  * shared, so a change that lets the legs drift fails here.
  *
- * - 2025 leg: the SDK v1 client, sessionful. It serves no task augmentation
+ * - 2025 leg: the SDK v2 client on its plain `initialize` handshake, sessionful. It serves no task augmentation
  *   (ADR-0046): no `tasks` capability, a `params.task` ignored, no `tasks/*`.
  * - 2026 leg: the SDK v2 client for what it speaks, and the tasks extension
  *   (SEP-2663) on the wire for what it does not (typescript-sdk#2189): opt-in
  *   per request, a flat task, `tasks/get` inlining the outcome.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type CallToolResult,
   CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
-  Client as ModernClient,
-  StreamableHTTPClientTransport as ModernTransport,
+  Client,
   PROTOCOL_VERSION_META_KEY,
-} from "@modelcontextprotocol/client";
-import { Client as LegacyClient } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport as LegacyTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import {
-  type CallToolResult,
-  CallToolResultSchema,
-  EmptyResultSchema,
+  StreamableHTTPClientTransport,
   type Task,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/client";
 import { NoopEventSink } from "../../src/adapters/noop-events.ts";
 import { TASKS_EXTENSION_ID } from "../../src/api/mcp-modern-tasks.ts";
 import { RESOURCE_SOURCE_META_KEY } from "../../src/api/mcp-server.ts";
@@ -40,6 +34,7 @@ import { textContent } from "../../src/engine/content-helpers.ts";
 import type { ToolResult } from "../../src/engine/types.ts";
 import { FIRST_PARTY_GRANT, type VerifiedIdentity } from "../../src/identity/provider.ts";
 import { DevIdentityProvider } from "../../src/identity/providers/dev.ts";
+import { log } from "../../src/observability/log.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import { defineInProcessApp } from "../../src/tools/in-process-app.ts";
 import {
@@ -274,20 +269,55 @@ async function errorCode(p: Promise<unknown>): Promise<number | undefined> {
   }
 }
 
-/** A 2025-era client of the door, as the owner or as {@link OTHER}. */
-async function legacyClient(as: "owner" | "other" = "owner"): Promise<LegacyClient> {
-  const client = new LegacyClient({ name: "parity-2025", version: "1.0.0" });
+const LEGACY_VERSION = "2025-11-25";
+
+/**
+ * A 2025-era client of the door, as the owner or as {@link OTHER}: the SDK 2
+ * client on its plain `initialize` handshake. Also the session id, for the
+ * requests the client will not send itself (`legacyPost`).
+ */
+async function legacyClient(
+  as: "owner" | "other" = "owner",
+): Promise<{ client: Client; sessionId: string }> {
+  const client = new Client({ name: "parity-2025", version: "1.0.0" });
   const headers: Record<string, string> = as === "other" ? { [OTHER_HEADER]: "1" } : {};
-  await client.connect(new LegacyTransport(mcpUrl(), { requestInit: { headers } }));
-  return client;
+  const transport = new StreamableHTTPClientTransport(mcpUrl(), { requestInit: { headers } });
+  await client.connect(transport);
+  expect(client.getNegotiatedProtocolVersion()).toBe(LEGACY_VERSION);
+  if (!transport.sessionId) throw new Error("the 2025 leg allocated no session");
+  return { client, sessionId: transport.sessionId };
+}
+
+/**
+ * One 2025 request on the wire, in an existing session: what a client that
+ * still speaks the 2025-11-25 tasks utility sends. The SDK 2 client sends
+ * neither a `params.task` nor a `tasks/*` request itself.
+ */
+async function legacyPost(
+  sessionId: string,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<{ result?: Record<string, unknown>; error?: { code: number } }> {
+  const res = await fetch(mcpUrl(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+      "mcp-protocol-version": LEGACY_VERSION,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const text = await res.text();
+  const json = text.startsWith("{") ? text : (text.match(/^data: (.*)$/m)?.[1] ?? "{}");
+  return JSON.parse(json);
 }
 
 async function legacyDriver(): Promise<EraDriver> {
-  const owner = await legacyClient();
+  const { client: owner } = await legacyClient();
   return {
     listTools: async () => (await owner.listTools()).tools.map((t) => t.name),
-    callTool: async (name, args) =>
-      (await owner.callTool({ name, arguments: args }, CallToolResultSchema)) as CallToolResult,
+    callTool: async (name, args) => owner.callTool({ name, arguments: args }),
     readResource: async (uri) => {
       const read = await owner.readResource({ uri });
       const first = read.contents[0];
@@ -355,11 +385,11 @@ async function modernResult(
 }
 
 async function modernDriver(): Promise<EraDriver> {
-  const client = new ModernClient(
+  const client = new Client(
     { name: "parity-2026", version: "1.0.0" },
     { versionNegotiation: { mode: "auto" } },
   );
-  await client.connect(new ModernTransport(mcpUrl()));
+  await client.connect(new StreamableHTTPClientTransport(mcpUrl()));
   expect(client.getNegotiatedProtocolVersion()).toBe(MODERN_VERSION);
   return {
     listTools: async () => (await client.listTools()).tools.map((t) => t.name),
@@ -425,10 +455,11 @@ describe.each([
 });
 
 describe("/mcp/<wsId> on 2025-11-25 serves no task augmentation", () => {
-  let client: LegacyClient;
+  let client: Client;
+  let sessionId: string;
 
   beforeAll(async () => {
-    client = await legacyClient();
+    ({ client, sessionId } = await legacyClient());
   });
 
   afterAll(async () => {
@@ -439,17 +470,25 @@ describe("/mcp/<wsId> on 2025-11-25 serves no task augmentation", () => {
     expect(client.getServerCapabilities()?.tasks).toBeUndefined();
   });
 
-  it("runs a call carrying params.task to completion, ignoring the task", async () => {
+  it("runs a call carrying params.task to completion, ignoring the task, and logs it", async () => {
     const before = jobs.started;
-    const result = await client.request(
-      {
-        method: "tools/call",
-        params: { name: `${SOURCE}__research`, arguments: {}, task: { ttl: 60_000 } },
-      },
-      CallToolResultSchema,
-    );
-    expect(result.content).toEqual([{ type: "text", text: "research:" }]);
-    expect(jobs.started).toBe(before);
+    const info = spyOn(log, "info");
+    try {
+      const { result, error } = await legacyPost(sessionId, "tools/call", {
+        name: `${SOURCE}__research`,
+        arguments: {},
+        task: { ttl: 60_000 },
+      });
+      expect(error).toBeUndefined();
+      expect(result?.content).toEqual([{ type: "text", text: "research:" }]);
+      expect(jobs.started).toBe(before);
+      // The log line is how 2025 task traffic stays visible.
+      expect(info.mock.calls.some(([msg]) => msg.startsWith("[mcp] ignored params.task"))).toBe(
+        true,
+      );
+    } finally {
+      info.mockRestore();
+    }
   });
 
   it("runs a task-only tool to completion", async () => {
@@ -462,18 +501,18 @@ describe("/mcp/<wsId> on 2025-11-25 serves no task augmentation", () => {
   for (const method of ["tasks/get", "tasks/result", "tasks/cancel", "tasks/list"]) {
     it(`answers ${method} as method not found`, async () => {
       const params = method === "tasks/list" ? {} : { taskId: "job-any" };
-      expect(await errorCode(client.request({ method, params }, EmptyResultSchema))).toBe(-32601);
+      expect((await legacyPost(sessionId, method, params)).error?.code).toBe(-32601);
     });
   }
 });
 
 describe("/mcp/<wsId> task lifecycle on 2026-07-28", () => {
   it("advertises the tasks extension before any call", async () => {
-    const client = new ModernClient(
+    const client = new Client(
       { name: "parity-2026", version: "1.0.0" },
       { versionNegotiation: { mode: "auto" } },
     );
-    await client.connect(new ModernTransport(mcpUrl()));
+    await client.connect(new StreamableHTTPClientTransport(mcpUrl()));
     try {
       expect(client.getServerCapabilities()?.extensions?.[TASKS_EXTENSION_ID]).toBeDefined();
     } finally {

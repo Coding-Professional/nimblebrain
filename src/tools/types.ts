@@ -181,8 +181,8 @@ export interface TaskOwnerContext {
  * caller's `TaskOwnerContext` doesn't match the one stamped at creation.
  *
  * Unified on purpose: we don't want to leak task existence to callers who
- * don't own the task. The `/mcp` layer maps this to JSON-RPC `-32602` per
- * MCP tasks spec (draft 2025-11-25).
+ * don't own the task. The `/mcp` layer maps this to JSON-RPC `-32602`, as the
+ * tasks extension (SEP-2663) asks.
  */
 export class TaskNotFoundError extends Error {
   readonly taskId: string;

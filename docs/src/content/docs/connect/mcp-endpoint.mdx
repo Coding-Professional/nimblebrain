@@ -29,7 +29,7 @@ The methods, on each [protocol era](#protocol-versions):
 
 - **POST** — every JSON-RPC message. A 2025-era client opens a session with `initialize` and sends the rest of its messages in it. A `2026-07-28` client sends each request on its own.
 - **DELETE** — terminate a 2025-era session (with a valid `Mcp-Session-Id`). A `2026-07-28` client has no session to end.
-- **GET** — returns `405 Method Not Allowed` with `Allow: POST, DELETE` on either era. NimbleBrain does not offer the optional GET-style server-to-client SSE channel; progress and task updates flow over the POST that started them. Spec-compliant clients fall back to POST-only automatically.
+- **GET** — returns `405 Method Not Allowed` with `Allow: POST, DELETE` on either era. NimbleBrain does not offer the optional GET-style server-to-client SSE channel; progress flows over the POST that started the call. Spec-compliant clients fall back to POST-only automatically.
 
 <Aside type="caution" title="Bare /mcp is refused">
 `/mcp` with no workspace is not an endpoint. It answers `404` with a JSON-RPC error naming the URL shape to use, and no workspace is ever chosen for you. A client configured with the bare URL must be reconfigured with its workspace's URL.
@@ -127,7 +127,7 @@ The endpoint serves both protocol eras on the same URL, and they are equivalent 
 | Negotiates `2026-07-28` (its requests carry the per-request `_meta` envelope; it probes with `server/discover`) | Per request, with no session: each request is authenticated, membership-checked and answered on its own. `server/discover` answers the server's capabilities. |
 | Opens with the 2025 `initialize` handshake (`2025-11-25` or an earlier revision) | In a session, as below. |
 
-The tools, resources, workspace wall and error shapes are the same on both. Neither era advertises `listChanged` or `resources.subscribe`, so a `2026-07-28` client has nothing to open a `subscriptions/listen` stream for.
+The tools, resources, workspace wall and error shapes are the same on both; a `resources/read` whose URI resolves nowhere answers `-32602` on either. On 2025, a tool whose `outputSchema` root is not an object is listed with that schema wrapped as the `result` property of an object schema, and its `structuredContent` is wrapped to match. Neither era advertises `listChanged` or `resources.subscribe`, so a `2026-07-28` client has nothing to open a `subscriptions/listen` stream for.
 
 Long-running tools run as tasks on `2026-07-28` only, through the MCP tasks extension. The 2025-11-25 tasks utility is not served:
 
