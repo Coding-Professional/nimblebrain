@@ -37,7 +37,7 @@ export default defineConfig({
     '/cli/status': '/cli/overview/',
     '/cli/reload': '/cli/overview/',
     '/cli/telemetry': '/using/telemetry/',
-    '/cli/automation': '/using/automations/',
+    '/cli/automation': '/using/tasks/',
     // Extension pages moved into their own section.
     '/apps/facets': '/extensions/facets/',
     '/apps/lifecycle': '/extensions/lifecycle/',
@@ -112,7 +112,7 @@ export default defineConfig({
                   { label: 'Files', slug: 'using/files' },
                   { label: 'File Context', slug: 'using/file-context' },
                   { label: 'Skills', slug: 'using/skills' },
-                  { label: 'Automations', slug: 'using/automations' },
+                  { label: 'Tasks', slug: 'using/tasks' },
                   {
                     label: 'Notifications',
                     items: [

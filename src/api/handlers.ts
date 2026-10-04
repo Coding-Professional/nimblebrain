@@ -455,7 +455,7 @@ export async function handleChatStream(
         // back" contract. Binding the run to the connection would silently
         // abandon a prompt the moment a mobile client dropped. The one
         // caller that must cancel on a deadline — the automations executor —
-        // owns its own AbortController in platform/automations/executor.ts.
+        // owns its own AbortController in platform/tasks/executor.ts.
         .chat(parsed, sink)
         .then((result) => {
           const doneData = chatResponseBody(result);
@@ -917,7 +917,7 @@ export async function handleReadResource(
     return apiError(400, "bad_request", "'server' is required");
   }
 
-  // Identity sources (conversations, files, automations) live OUTSIDE any
+  // Identity sources (conversations, files, tasks) live OUTSIDE any
   // workspace registry — they're reached through the identity door, the same
   // decision the orchestrator and `handleToolCall` make. Their data is
   // workspace-owned, so the read resolves in the workspace in the URL.

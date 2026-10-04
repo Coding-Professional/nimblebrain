@@ -384,7 +384,7 @@ function AuthenticatedAppContent({
         <ErrorBoundary resetKeys={[location.pathname]}>
           <Routes>
             {/* Global Home — workspace-agnostic landing (greeting +
-                workspaces grid). Chat, Conversations, Automations, Files
+                workspaces grid). Chat, Conversations, Tasks, Files
                 are all identity-bound now, so the root URL is the
                 user's cross-workspace home. */}
             <Route path="/" element={<GlobalHomePage />} />
@@ -398,7 +398,7 @@ function AuthenticatedAppContent({
             <Route path="/w/:slug" element={<WorkspaceRouteGuard />}>
               {/* Workspace overview — header + app grid. */}
               <Route index element={<WorkspaceOverviewPage />} />
-              {/* Identity views (Conversations / Automations / Files) — each at
+              {/* Identity views (Conversations / Tasks / Files) — each at
                   its own segment (e.g. `/w/<slug>/conversations`). The view is
                   workspace-scoped (the slug = the focused workspace); the tools
                   still dispatch bare through the identity door (see the bridge,

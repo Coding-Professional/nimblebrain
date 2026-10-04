@@ -481,7 +481,7 @@
       "additionalProperties": false
     },
     "automations": {
-      "description": "Automation run guardrails: how many runs the process holds in flight and waiting, across every workspace, and the most any one run may spend. The per-run ceilings bound each automation's own caps, and the runtime defaults for caps it leaves unset, at execution time.",
+      "description": "Guardrails for unattended (task) runs: how many runs the process holds in flight and waiting, across every workspace, and the most any one run may spend. The per-run ceilings bound each automation's own caps, and the runtime defaults for caps it leaves unset, at execution time.",
       "type": "object",
       "properties": {
         "maxConcurrentRuns": {
