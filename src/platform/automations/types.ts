@@ -260,10 +260,13 @@ export interface AutomationRun {
     | "complete"
     | "max_iterations"
     | "max_input_tokens"
+    | "spend_limit"
     | "length"
     | "content_filter"
     | "error"
     | "other";
+  /** The spend account that stopped the run, when `stopReason` is `spend_limit`. */
+  spendAccountId?: string;
 }
 
 // ---------------------------------------------------------------------------

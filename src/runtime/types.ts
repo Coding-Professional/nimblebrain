@@ -14,6 +14,7 @@ import type { TokenUsage } from "../usage/types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { AdmissionLease } from "./admission.ts";
 import type { RunTrigger } from "./run-spec.ts";
+import type { SpendAccount } from "./spend.ts";
 
 /** Model slot configuration. Each slot maps to a provider:model-id string. */
 export interface ModelSlots {
@@ -476,6 +477,14 @@ export interface TaskRequest {
    * Absent = no cap.
    */
   maxRunInputTokens?: number;
+  /**
+   * The spend accounts the run draws on: opaque ids the caller chose, each with
+   * a unit and the amount remaining. Runs in flight that name the same id share
+   * one balance. Each model call's output is clamped to what they allow, and
+   * the run ends with stopReason `spend_limit` before a call they cannot pay
+   * for (`src/runtime/spend.ts`). Absent = no account.
+   */
+  spendAccounts?: SpendAccount[];
   /** Glob patterns filtering which tools are available. Matches use the same logic as chat. */
   allowedTools?: string[];
   /**
@@ -555,5 +564,7 @@ export interface TaskResult {
    */
   finishReason?: string;
   finishReasonRaw?: string;
+  /** The account that stopped the run, when `stopReason` is `spend_limit`. */
+  spendAccountId?: string;
   usage: TurnUsage;
 }
