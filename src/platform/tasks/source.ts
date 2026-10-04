@@ -1,6 +1,7 @@
 import { effectiveRunLimits } from "../../config/tasks.ts";
 import { textContent } from "../../engine/content-helpers.ts";
 import type { EventSink } from "../../engine/types.ts";
+import type { NotificationEnvelope } from "../../notifications/types.ts";
 import { log } from "../../observability/log.ts";
 import { getRequestContext } from "../../runtime/request-context.ts";
 import type { Runtime } from "../../runtime/runtime.ts";
@@ -8,12 +9,21 @@ import type { TaskRequest } from "../../runtime/types.ts";
 import { isTaskForbiddenIdentityTool } from "../../tools/identity-sources.ts";
 import { defineInProcessApp, type InProcessTool } from "../../tools/in-process-app.ts";
 import type { McpSource } from "../../tools/mcp-source.ts";
+import { splitInnerToolName } from "../../util/tool-name.ts";
 import { TaskEventTrigger } from "./event-trigger.ts";
-import { createDirectExecutor, type ExecutorContext } from "./executor.ts";
+import { applyOutputSchema, createDirectExecutor, type ExecutorContext } from "./executor.ts";
+import {
+  assessRun,
+  JUDGE_CALL_TIMEOUT_MS,
+  JUDGE_RESULT_MAX_BYTES,
+  type JudgePort,
+  judgeWarnings,
+} from "./judge.ts";
 import { migrateTaskStorage } from "./migrate-storage.ts";
 import { countsAsEventFire, isOpenRun, Scheduler } from "./scheduler.ts";
 import { TOOL_SCHEMAS } from "./schemas.ts";
 import {
+  handleAssess,
   handleCancel,
   handleCreate,
   handleDelete,
@@ -23,10 +33,13 @@ import {
   handleRuns,
   handleStatus,
   handleUpdate,
+  runOutputTaskId,
   type ToolContext,
+  withWarnings,
 } from "./server.ts";
 import {
   deleteTaskDefinition,
+  findRun,
   loadOwnerTasks,
   loadTask,
   readAllRuns,
@@ -36,9 +49,10 @@ import {
   readRunsPage,
   readRunTicket,
   saveTask,
+  updateRun,
 } from "./store.ts";
 import { createTaskRunSource } from "./task-source.ts";
-import type { RunTicket, Task } from "./types.ts";
+import type { RunTicket, Task, TaskRun } from "./types.ts";
 import { TASKS_PANEL_HTML } from "./ui-resource.ts";
 
 /**
@@ -110,6 +124,97 @@ function saveOwnerTasks(
 }
 
 /**
+ * How assessment reaches a workspace's judge server: the sources connected in
+ * the run's workspace (with their bare tool names, for discovery), and one
+ * call through the unattended dispatch door as the task's owner, which applies
+ * the wall, the owner's tool policy, a timeout that cancels, and a result cap.
+ */
+function createJudgePort(runtime: Runtime): JudgePort {
+  return {
+    sources: async (wsId) => {
+      const registry = await runtime.ensureWorkspaceRegistry(wsId);
+      return Promise.all(
+        registry.getSources().map(async (source) => {
+          try {
+            const tools = await source.tools();
+            return {
+              name: source.name,
+              toolNames: tools.map((t) => splitInnerToolName(t.name).bareToolName),
+            };
+          } catch {
+            // A source that cannot list its tools offers no judge right now.
+            return { name: source.name, toolNames: [], unlisted: true };
+          }
+        }),
+      );
+    },
+    call: ({ wsId, ownerId, tool, input, reason }) =>
+      runtime.dispatchUnattended({
+        principalId: ownerId,
+        workspaceId: wsId,
+        tool,
+        input,
+        reason,
+        timeoutMs: JUDGE_CALL_TIMEOUT_MS,
+        maxResultBytes: JUDGE_RESULT_MAX_BYTES,
+      }),
+  };
+}
+
+/**
+ * The inbox item for a poor result (ADR-0008). The inbox is workspace-owned
+ * with no owner partition, so every member who can read it sees the item,
+ * while a task is private to its owner (ADR-0004). So the item is generic: it
+ * names no task, no criterion or rule, and nothing of the deliverable, only
+ * the run's id and its owner's id. The detail stays on the run, which only the
+ * owner can open (`tasks__run_result`, the Tasks panel).
+ */
+export function poorResultEnvelope(task: Task, run: TaskRun): NotificationEnvelope {
+  const body = [
+    `The task's owner can read run ${run.id} in Tasks.`,
+    run.retryOf ? `It retried run ${run.retryOf}.` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return {
+    eventId: `poor-result:${run.id}`,
+    name: "task.run.poor_result",
+    timestamp: new Date().toISOString(),
+    data: {
+      runId: run.id,
+      ownerId: task.ownerId ?? null,
+      ...(run.retryOf ? { retryOf: run.retryOf } : {}),
+    },
+    _meta: {
+      "ai.nimblebrain/notification": {
+        level: "attention",
+        title: "A task run had a poor result",
+        body,
+      },
+    },
+  };
+}
+
+/**
+ * Put a poor result in the task's workspace inbox, where the owner's views and
+ * any route the workspace configured pick it up. Idempotent per run, and
+ * best-effort: a refused write is logged and changes nothing about the run.
+ */
+function notifyPoorResult(runtime: Runtime, task: Task, run: TaskRun): void {
+  const wsId = task.workspaceId;
+  if (!wsId || !run.assessment) return;
+  try {
+    runtime.getNotificationStore(wsId).append("tasks", poorResultEnvelope(task, run));
+  } catch (err) {
+    log.warn("[tasks] could not write a poor-result notification", {
+      taskId: task.id,
+      runId: run.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * Create the "tasks" platform source — an in-process MCP server.
  *
  * Tools: create, update, delete, list, status, runs, run
@@ -141,6 +246,7 @@ export async function createTasksSource(
     resolveExecutorContext,
     runLimitsOf,
   );
+  const judgePort = createJudgePort(runtime);
   const scheduler = new Scheduler(executor, {
     workDir,
     defaultTimezone,
@@ -148,6 +254,8 @@ export async function createTasksSource(
     // with every other unattended run.
     admission: runtime.getRunAdmission(),
     onRunRecorded: (owner) => runtime.announceIdentitySourceChange("tasks", owner),
+    assess: (task, run, result) => assessRun(task, run, result, { port: judgePort }),
+    notifyPoorResult: (task, run) => notifyPoorResult(runtime, task, run),
   });
   scheduler.start();
 
@@ -245,6 +353,28 @@ export async function createTasksSource(
       readRunsPage: (id, opts) => readRunsPage(workDir, wsId, owner, id, opts),
       readAllRuns: (opts) => readAllRuns(workDir, wsId, owner, opts),
       readRunResult: (id, runId) => readRunResult(workDir, wsId, owner, id, runId),
+      findRun: (id, runId) => findRun(workDir, wsId, owner, id, runId),
+      updateRun: (id, runId, update) => {
+        const updated = updateRun(workDir, wsId, owner, id, runId, update);
+        if (updated) runtime.announceIdentitySourceChange("tasks", owner);
+        return updated;
+      },
+      reassessRun: async (task, run) => {
+        // The output schema is checked again too, against the task's current
+        // one: the record's validity is the schema the run ran under.
+        const stored = readRunResult(workDir, wsId, owner, task.id, run.id);
+        const checked: TaskRun = { ...run };
+        delete checked.outputSchemaValid;
+        delete checked.outputSchemaErrors;
+        const result = stored ? { ...stored } : null;
+        if (result) {
+          delete result.structured;
+          applyOutputSchema(task, checked, result);
+        }
+        const assessment = await assessRun(task, checked, result, { port: judgePort });
+        return scheduler.recordAssessment(task, run.id, assessment);
+      },
+      callerVia: () => (getRequestContext()?.shellCall ? "ui" : "remote"),
       defaultTimezone,
       runLimitsOf,
       defaultModel: runtime.getDefaultModel(),
@@ -274,7 +404,7 @@ export async function createTasksSource(
     }
     return (
       `Tool "tasks__${name}" is not available inside an unattended ` +
-      "task run. A task cannot create, modify, delete, or trigger " +
+      "task run. A task cannot create, modify, delete, trigger, or assess " +
       "tasks from within its own run. Manage tasks from an interactive session."
     );
   }
@@ -317,6 +447,19 @@ export async function createTasksSource(
     };
   }
 
+  /** A write's answer with warnings about the judge its saved task will find. */
+  async function withJudgeWarnings<T extends { message?: string }>(
+    out: T,
+    task: Task | undefined,
+    about: "task" | "run" = "task",
+  ): Promise<T> {
+    return task ? withWarnings(out, await judgeWarnings(task, judgePort, about)) : out;
+  }
+
+  function warnAboutJudge<T extends { task: Task; message: string }>(out: T): Promise<T> {
+    return withJudgeWarnings(out, out.task);
+  }
+
   const tools: InProcessTool[] = TOOL_SCHEMAS.map((schema) => ({
     ...schema,
     handler: withErrorHandling((input) => {
@@ -333,9 +476,9 @@ export async function createTasksSource(
       const ctx = getToolContext();
       switch (schema.name) {
         case "create":
-          return handleCreate(input, ctx);
+          return warnAboutJudge(handleCreate(input, ctx));
         case "update":
-          return handleUpdate(input, ctx);
+          return warnAboutJudge(handleUpdate(input, ctx));
         case "delete":
           return handleDelete(input, ctx);
         case "list":
@@ -347,9 +490,17 @@ export async function createTasksSource(
         case "run_result":
           return handleRunResult(input, ctx);
         case "run":
-          return handleRun(input, ctx);
+          return handleRun(input, ctx).then((out) =>
+            // An inline one-off is saved by the call, so it is warned about
+            // like a create; a saved task was warned about when it was written.
+            input.name === undefined
+              ? withJudgeWarnings(out, ctx.definitions().get(runOutputTaskId(out)), "run")
+              : out,
+          );
         case "cancel":
           return handleCancel(input, ctx);
+        case "assess":
+          return handleAssess(input, ctx);
         default:
           throw new Error(`Unknown tool: ${schema.name}`);
       }
