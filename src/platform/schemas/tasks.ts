@@ -1195,13 +1195,15 @@ export interface TasksRunsOutput {
 
 /**
  * A warning a write returns about the task it saved, which it saved anyway.
+ * `allowed_tool_unavailable`: one allowedTools entry matches no tool the owner
+ * can reach in this workspace; a run will fail until that changes.
  * `no_judge`, `judge_ambiguous`, `judge_not_found`: the task has criteria and
  * its workspace has no judge server it can use (none connected, several and
  * none named, or the named one is not a connected judge), so its runs are
  * `uncertain` (Needs review) until one is connected or named.
  */
 export interface TaskWarning {
-  code: "no_judge" | "judge_ambiguous" | "judge_not_found";
+  code: "no_judge" | "judge_ambiguous" | "judge_not_found" | "allowed_tool_unavailable";
   message: string;
 }
 
