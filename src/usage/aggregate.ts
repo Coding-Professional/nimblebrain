@@ -19,7 +19,7 @@
  * cannot price is reported as unpriced rather than as zero.
  */
 
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -826,4 +826,50 @@ export async function aggregateUsage(
     breakdown,
     breakdowns,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Spend of named task runs
+// ---------------------------------------------------------------------------
+
+/**
+ * What the ledger says each of a set of task runs cost, in USD, by run id:
+ * every line from `range.from` onward whose task run is one of `taskRunIds`
+ * (and, when given, bound to `workspaceId`), priced the way the report prices
+ * it (stored rates first, then the catalog; an unpriced line adds nothing). A
+ * line is written as each model call completes, so a run that never reached
+ * its record (lost in a crash) is counted too. Synchronous, and reads only the
+ * month shards the range spans.
+ */
+export function ledgerCostByTaskRun(
+  workDir: string,
+  taskRunIds: ReadonlySet<string>,
+  range: { from: string; to: string },
+  workspaceId?: string,
+): Map<string, number> {
+  const costs = new Map<string, number>();
+  if (taskRunIds.size === 0) return costs;
+  const filters = workspaceId !== undefined ? { workspaceId } : {};
+  for (const month of usageMonthsInRange(range.from, range.to)) {
+    const dir = usageMonthDir(workDir, month);
+    for (const shard of shardsForMonth(dir)) {
+      for (const record of parseShard(readShardSync(join(dir, shard)), range, undefined, filters)) {
+        const runId = taskRunOf(record);
+        if (runId && taskRunIds.has(runId)) {
+          const cost = costBreakdown(record.model, record.usage, record.rates).total;
+          costs.set(runId, (costs.get(runId) ?? 0) + cost);
+        }
+      }
+    }
+  }
+  return costs;
+}
+
+/** A shard's text, or empty when it vanished between listing and read (retention sweep). */
+function readShardSync(path: string): string {
+  try {
+    return readFileSync(path, "utf-8");
+  } catch {
+    return "";
+  }
 }

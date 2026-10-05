@@ -76,6 +76,9 @@ const ADMISSION_KEY_PREFIX = "task:";
 /** The withdrawal reason `dropWorkspace` gives the runs it takes out of the queue. */
 const WORKSPACE_DELETED = "workspace_deleted";
 
+/** The withdrawal reason a paused batch gives its runs still waiting in the queue. */
+const BATCH_PAUSED = "batch_paused";
+
 /** What `runFromEvent` answers when the task already has a run. */
 const EVENT_DUPLICATE_ANSWER = {
   "Already running": "a previous run of this task is still in flight",
@@ -137,7 +140,36 @@ export interface RequestedRun {
   retryOf?: string;
   /** Goes ahead of the prompt for this run only: a retry's account of what failed. */
   guidance?: string;
+  /** The batch item this run is (`tasks__run_batch`); recorded on the run. */
+  batch?: { batchId: string; index: number };
 }
+
+/**
+ * What a batch run carries beyond a requested run (see
+ * {@link Scheduler.requestBatchRun}).
+ */
+export interface BatchRunOptions {
+  /**
+   * Spend accounts the run names beyond the task's own (the batch's), read
+   * when the run starts so a queued run names what is left then.
+   */
+  accounts: () => RunSpendAccount[];
+  /** Called when the run takes its slot and starts (a queued one later than it was asked for). */
+  onStarted?: () => void;
+}
+
+/**
+ * What a batch run request became. `refused` writes no record: the item was
+ * not asked for, and its batch decides what to do (retry later, or pause).
+ */
+export type BatchRunTicket =
+  | { state: "started" | "queued"; run: Promise<TaskRun> }
+  | {
+      state: "refused";
+      /** `queue_full`: no slot and no room to wait; asking again later may work. */
+      reason: "not_found" | "stopped" | "queue_full" | "budget";
+      message: string;
+    };
 
 /**
  * The executor function that the scheduler delegates to. Returns the run summary
@@ -157,6 +189,8 @@ export type Executor = (
   lease?: AdmissionLease,
   /** The run's id when it was minted ahead of the run (a requested run); the runtime adopts it. */
   runId?: string,
+  /** Spend accounts the run names beyond the task's own token budget (a batch's). */
+  extraAccounts?: readonly RunSpendAccount[],
 ) => Promise<{ run: TaskRun; result: TaskRunResult | null }>;
 
 /**
@@ -190,7 +224,11 @@ interface QueuedOutcome {
 
 /** One run waiting for a slot. */
 interface QueuedRun {
+  /** The task's key (`keyOf`). */
   key: string;
+  /** The run's own key when it is not the task's: a batch run (see `requestBatchRun`). */
+  runKey?: string;
+  batch?: BatchRunOptions;
   trigger: "manual" | "event";
   input?: RunInput;
   requested?: RequestedRun;
@@ -638,7 +676,10 @@ export interface RunSpendAccount {
 }
 
 /** What every id `budgetSpendAccounts` produces starts with. */
-const BUDGET_ACCOUNT_PREFIX = "task-budget:";
+export const BUDGET_ACCOUNT_PREFIX = "task-budget:";
+
+/** What every batch's spend account id starts with (`task-batch:<wsId>/<ownerId>/<batchId>`). */
+export const BATCH_ACCOUNT_PREFIX = "task-batch:";
 
 /**
  * The token budget as the spend accounts a run names: one per cap, holding
@@ -767,6 +808,9 @@ function withRequest(run: TaskRun, requested: RequestedRun): TaskRun {
     ...(requested.input !== undefined ? { input: requested.input } : {}),
     ...(requested.idempotencyKey !== undefined ? { idempotencyKey: requested.idempotencyKey } : {}),
     ...(requested.retryOf !== undefined ? { retryOf: requested.retryOf } : {}),
+    ...(requested.batch
+      ? { batchId: requested.batch.batchId, batchIndex: requested.batch.index }
+      : {}),
   };
 }
 
@@ -1102,6 +1146,70 @@ export class Scheduler {
     };
   }
 
+  /**
+   * Ask for one batch item's run (`requested.batch` names it). Unlike Run now,
+   * a task may have many of these at once: each holds its slot and its queue
+   * place under its own key (the task's key plus the run id), so batch runs are
+   * never duplicates of each other or of the task's own run. The door's
+   * admission and fair share apply to each exactly as to any run.
+   *
+   * Nothing is written for a refused request (the batch keeps the item
+   * pending); an admitted one gets its ticket, settles once assessed, and is
+   * cancelled by run id (`cancelRunById`). A batch run's poor result sets off
+   * no `onPoorResult` (see `afterAssessed`).
+   */
+  requestBatchRun(
+    wsId: string,
+    ownerId: string,
+    taskId: string,
+    requested: RequestedRun,
+    options: BatchRunOptions,
+  ): BatchRunTicket {
+    const key = Scheduler.keyOf({ id: taskId, ownerId, workspaceId: wsId });
+    const auto = this.definitions.get(key);
+    if (!auto) {
+      return { state: "refused", reason: "not_found", message: "the task is no longer here" };
+    }
+    if (!this.running) return { state: "refused", reason: "stopped", message: STOPPED_REASON };
+    const budget = runNowBudgetRefusal(auto, Date.now());
+    if (budget) return { state: "refused", reason: "budget", message: budget };
+
+    const batchRun = { runKey: `${key}#${requested.runId}`, options };
+    const input = requestedInput(requested);
+    const admitted = this.admit(key, "manual", input, requested, batchRun);
+    if (admitted.state === "refused") {
+      return admitted.reason === "stopped"
+        ? { state: "refused", reason: "stopped", message: STOPPED_REASON }
+        : {
+            state: "refused",
+            reason: "queue_full",
+            message: this.refusalReason(admitted.reason, "runNow"),
+          };
+    }
+    // Before the dispatch below, which rewrites it `running` synchronously.
+    this.openTicket(auto, requested);
+    if (admitted.state === "started") {
+      const run = this.dispatchRun(
+        auto,
+        "manual",
+        input,
+        admitted.lease,
+        requested,
+        "assessed",
+        batchRun,
+      );
+      return { state: "started", run: this.trackOpen(batchRun.runKey, requested, run) };
+    }
+    return {
+      state: "queued",
+      run: this.trackOpen(
+        batchRun.runKey,
+        requested,
+        admitted.outcome.then((outcome) => outcome.run),
+      ),
+    };
+  }
+
   /** Record that a requested run admitted (started or queued) claims its idempotency key. */
   private recordKey(auto: Task, requested: RequestedRun): void {
     const { workspaceId: wsId, ownerId } = auto;
@@ -1183,8 +1291,7 @@ export class Scheduler {
   cancelRunById(wsId: string, ownerId: string, runId: string): boolean {
     const open = this.openRuns.get(runId);
     if (!open?.key.startsWith(`${wsId}/${ownerId}/`)) return false;
-    const taskId = open.key.slice(open.key.lastIndexOf("/") + 1);
-    return this.cancelRun(wsId, ownerId, taskId);
+    return this.cancelKey(open.key);
   }
 
   /**
@@ -1292,6 +1399,7 @@ export class Scheduler {
     trigger: QueuedRun["trigger"],
     input?: RunInput,
     requested?: RequestedRun,
+    batchRun?: { runKey: string; options: BatchRunOptions },
   ):
     | { state: "started"; lease: AdmissionLease }
     | { state: "queued"; position: number; outcome: Promise<QueuedOutcome> }
@@ -1300,6 +1408,7 @@ export class Scheduler {
     const outcome = new Promise<QueuedOutcome>((resolve, reject) => {
       entry = {
         key,
+        ...(batchRun ? { runKey: batchRun.runKey, batch: batchRun.options } : {}),
         trigger,
         ...(input ? { input } : {}),
         ...(requested ? { requested } : {}),
@@ -1307,7 +1416,7 @@ export class Scheduler {
         reject,
       };
     });
-    const ticket = this.admission.request(Scheduler.admissionOf(key), {
+    const ticket = this.admission.request(Scheduler.admissionOf(batchRun?.runKey ?? key), {
       admitted: (lease) => this.startQueued(entry, lease),
       withdrawn: (reason) => this.leftQueue(entry, reason),
     });
@@ -1364,7 +1473,10 @@ export class Scheduler {
         refuse("Disabled while queued (event)");
         return;
       }
-      const budget = entry.trigger === "manual" ? runNowBudgetRefusal(auto, Date.now()) : null;
+      // A batch run is held to the budget by the door's spend accounts; its
+      // batch pauses when one stops it.
+      const budget =
+        entry.trigger === "manual" && !entry.batch ? runNowBudgetRefusal(auto, Date.now()) : null;
       if (budget) {
         lease.release();
         refuse(budget);
@@ -1378,10 +1490,17 @@ export class Scheduler {
     // A Run now waits for its assessment, so its caller gets the judged record;
     // an event run settles its batch once the run is recorded.
     const settles: DispatchSettles = entry.trigger === "manual" ? "assessed" : "recorded";
-    this.dispatchRun(auto, entry.trigger, entry.input, lease, entry.requested, settles).then(
-      (run) => entry.resolve({ run, started: true }),
-      entry.reject,
-    );
+    const batchRun =
+      entry.runKey && entry.batch ? { runKey: entry.runKey, options: entry.batch } : undefined;
+    this.dispatchRun(
+      auto,
+      entry.trigger,
+      entry.input,
+      lease,
+      entry.requested,
+      settles,
+      batchRun,
+    ).then((run) => entry.resolve({ run, started: true }), entry.reject);
   }
 
   /**
@@ -1396,7 +1515,9 @@ export class Scheduler {
       ? "Cancelled by user while queued"
       : reason === WORKSPACE_DELETED
         ? "the workspace was deleted"
-        : "Queued run dropped: the runtime stopped before a run slot freed";
+        : reason === BATCH_PAUSED
+          ? "Withdrawn from the queue: its batch paused before a run slot freed"
+          : "Queued run dropped: the runtime stopped before a run slot freed";
     const status = cancelled ? "cancelled" : "skipped";
     try {
       entry.resolve(
@@ -1454,7 +1575,22 @@ export class Scheduler {
    * neither.
    */
   cancelRun(wsId: string, ownerId: string, taskId: string): boolean {
-    const key = Scheduler.keyOf({ id: taskId, ownerId, workspaceId: wsId });
+    return this.cancelKey(Scheduler.keyOf({ id: taskId, ownerId, workspaceId: wsId }));
+  }
+
+  /**
+   * Take a requested run out of the queue when this process carries it for that
+   * owner in that workspace and it has not started: recorded skipped (its
+   * batch paused), with no `trigger`. False when it is not queued.
+   */
+  withdrawQueuedRun(wsId: string, ownerId: string, runId: string): boolean {
+    const open = this.openRuns.get(runId);
+    if (!open?.key.startsWith(`${wsId}/${ownerId}/`)) return false;
+    return this.admission.cancel(Scheduler.admissionOf(open.key).key, BATCH_PAUSED);
+  }
+
+  /** Abort the run held under `key` (a task's, or a batch run's own), or take it out of the queue. */
+  private cancelKey(key: string): boolean {
     const controller = this.activeRuns.get(key);
     if (controller) {
       controller.abort();
@@ -1634,8 +1770,9 @@ export class Scheduler {
     lease: AdmissionLease,
     requested?: RequestedRun,
     settles: DispatchSettles = "assessed",
+    batchRun?: { runKey: string; options: BatchRunOptions },
   ): Promise<TaskRun> {
-    const key = Scheduler.keyOf(auto);
+    const key = batchRun?.runKey ?? Scheduler.keyOf(auto);
     const controller = new AbortController();
     this.activeRuns.set(key, controller);
     // Capture real dispatch time so synthesized failure records carry an
@@ -1658,6 +1795,7 @@ export class Scheduler {
         lease,
         firedOnceAt,
         requested,
+        batch: batchRun?.options,
       });
     } finally {
       // The slot is free whether the run's record landed or its write threw.
@@ -1732,6 +1870,9 @@ export class Scheduler {
   private afterAssessed(auto: Task, run: TaskRun): void {
     const assessment = run.assessment;
     if (assessment?.verdict !== "fail") return;
+    // A batch item answers to its batch: the stop rule and `rerun_failed`
+    // stand in for a notice and a retry per item (see `batch.ts`).
+    if (run.batchId) return;
     const policy = auto.onPoorResult ?? DEFAULT_ON_POOR_RESULT;
     if (policy === "record") return;
     if (policy === "retry_once" && !run.retryOf && this.retry(auto, run, assessment)) return;
@@ -1773,9 +1914,10 @@ export class Scheduler {
       lease: AdmissionLease;
       firedOnceAt: string | undefined;
       requested: RequestedRun | undefined;
+      batch?: BatchRunOptions;
     },
   ): Promise<{ run: TaskRun; result: TaskRunResult | null }> {
-    const { startedAt, trigger, input, lease, firedOnceAt, requested } = dispatch;
+    const { startedAt, trigger, input, lease, firedOnceAt, requested, batch } = dispatch;
     const ticket = (run: TaskRun) => {
       if (requested && auto.workspaceId && auto.ownerId) {
         this.writeTicket(auto.workspaceId, auto.ownerId, auto.id, requested, run);
@@ -1793,6 +1935,7 @@ export class Scheduler {
       trigger,
     });
     try {
+      batch?.onStarted?.();
       const executed = await this.executor(
         auto,
         controller.signal,
@@ -1800,6 +1943,7 @@ export class Scheduler {
         input,
         lease,
         requested?.runId,
+        batch?.accounts(),
       );
       const run = requested ? withRequest(executed.run, requested) : executed.run;
       const result =
@@ -1889,7 +2033,10 @@ export class Scheduler {
     auto.cumulativeInputTokens = (auto.cumulativeInputTokens ?? 0) + run.inputTokens;
     auto.cumulativeOutputTokens = (auto.cumulativeOutputTokens ?? 0) + run.outputTokens;
 
-    applyConsecutiveErrors(auto, run, now);
+    // A batch item answers to its batch: its failures are the batch's to count
+    // (the stop rule, `rerun_failed`), never the task's own streak, which
+    // would back off and then disable the task's schedule.
+    if (!run.batchId) applyConsecutiveErrors(auto, run, now);
     if (!isOnceSchedule(auto.schedule)) {
       applyNextRunAt(auto, now, this.config.defaultTimezone);
     } else if ((trigger ?? run.trigger) === "scheduled" && auto.schedule?.at === firedOnceAt) {
