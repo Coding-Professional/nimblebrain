@@ -1,5 +1,5 @@
 /**
- * General-purpose per-key sliding-window rate limiter.
+ * General-purpose per-key fixed-window rate limiter.
  * Records every request unconditionally — no login-specific semantics.
  */
 export class RequestRateLimiter {
@@ -11,7 +11,7 @@ export class RequestRateLimiter {
     private readonly windowMs: number,
   ) {}
 
-  /** Window duration in seconds (for Retry-After headers). */
+  /** Configured window duration in seconds. */
   get windowSeconds(): number {
     return Math.ceil(this.windowMs / 1000);
   }
@@ -35,20 +35,25 @@ export class RequestRateLimiter {
    * Returns true if the request is allowed, false if rate-limited.
    */
   consume(key: string): boolean {
+    return this.consumeWithRetryAfter(key) === null;
+  }
+
+  /** Consume a request, or return the seconds until its fixed window resets. */
+  consumeWithRetryAfter(key: string): number | null {
     const now = Date.now();
     const entry = this.requests.get(key);
 
     if (!entry || now - entry.windowStart >= this.windowMs) {
       this.requests.set(key, { count: 1, windowStart: now });
-      return true;
+      return null;
     }
 
     if (entry.count >= this.maxRequests) {
-      return false;
+      return Math.ceil((entry.windowStart + this.windowMs - now) / 1000);
     }
 
     entry.count++;
-    return true;
+    return null;
   }
 
   /** Remove all entries whose window has expired. */
