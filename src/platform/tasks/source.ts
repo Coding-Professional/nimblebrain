@@ -30,11 +30,14 @@ import {
   handleCancel,
   handleCreate,
   handleDelete,
+  handleJudges,
   handleList,
   handleRun,
   handleRunResult,
   handleRuns,
+  handleStats,
   handleStatus,
+  handleUpcoming,
   handleUpdate,
   runOutputTaskId,
   type ToolContext,
@@ -480,6 +483,8 @@ export async function createTasksSource(
         list: () => listBatches(workDir, wsId, owner),
         maxConcurrentRuns: runtime.getRunAdmission().limits.maxConcurrentRuns,
       },
+      queueView: () => scheduler.queueView(wsId, owner),
+      judgeSources: () => judgePort.sources(wsId),
     };
   }
 
@@ -593,7 +598,7 @@ export async function createTasksSource(
           return handleRun(input, ctx).then((out) =>
             // An inline one-off is saved by the call, so it is warned about
             // like a create; a saved task was warned about when it was written.
-            input.name === undefined
+            input.taskId === undefined
               ? withJudgeWarnings(out, ctx.definitions().get(runOutputTaskId(out)), "run")
               : out,
           );
@@ -611,6 +616,12 @@ export async function createTasksSource(
           return handleBatchControl(input, ctx);
         case "batches":
           return handleBatches(input, ctx);
+        case "upcoming":
+          return handleUpcoming(input, ctx);
+        case "stats":
+          return handleStats(input, ctx);
+        case "judges":
+          return handleJudges(input, ctx);
         case "cancel":
           return handleCancel(input, ctx);
         case "assess":

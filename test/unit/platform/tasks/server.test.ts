@@ -168,7 +168,7 @@ describe("formatSchedule", () => {
         expression: "0 8 * * *",
         timezone: "Pacific/Honolulu",
       }),
-    ).toBe("Daily at 8:00 AM HST");
+    ).toBe("Every day at 8:00 AM HST");
   });
 
   test("weekly cron (Monday)", () => {
@@ -183,6 +183,38 @@ describe("formatSchedule", () => {
 
   test("every N minutes cron", () => {
     expect(formatSchedule({ type: "cron", expression: "*/30 * * * *" })).toBe("Every 30 minutes");
+  });
+
+  test.each([
+    ["0 7 * * 1-5", "Weekdays at 7:00 AM HST"],
+    ["0 7 * * MON-FRI", "Weekdays at 7:00 AM HST"],
+    ["30 10 * * 0,6", "Weekends at 10:30 AM HST"],
+    ["0 9 * * 1,4", "Mondays and Thursdays at 9:00 AM HST"],
+    ["0 9 * * 1,3,5", "Mondays, Wednesdays and Fridays at 9:00 AM HST"],
+    ["0 9 * * 0-6", "Every day at 9:00 AM HST"],
+    ["15 18 * * 7", "Sundays at 6:15 PM HST"],
+    ["0 8 1 * *", "Monthly on the 1st at 8:00 AM HST"],
+    ["0 8 22 * *", "Monthly on the 22nd at 8:00 AM HST"],
+    ["*/5 * * * *", "Every 5 minutes"],
+    ["* * * * *", "Every minute"],
+    ["0 * * * *", "Every hour"],
+    ["15 * * * *", "Every hour at :15"],
+    ["0 */3 * * *", "Every 3 hours"],
+  ])("cron %s reads %s", (expression, words) => {
+    expect(formatSchedule({ type: "cron", expression, timezone: "Pacific/Honolulu" })).toBe(words);
+  });
+
+  test.each([
+    "0 12,17 * * 1-5",
+    "0 9-17 * * *",
+    "0 8 * 6 *",
+    "0 8 1 * 1",
+    "0 8 * * 5-1",
+    "0 0 0 8 * * *",
+  ])("cron %s it cannot put in words reads as itself", (expression) => {
+    expect(formatSchedule({ type: "cron", expression, timezone: "Pacific/Honolulu" })).toBe(
+      expression,
+    );
   });
 
   test("single minute interval", () => {
@@ -836,7 +868,7 @@ describe("handleRun", () => {
     const ctx = makeCtx();
     handleCreate(createArgs("Immediate", "Run now", { type: "interval", intervalMs: 60_000 }), ctx);
 
-    const result = await handleRun({ name: "Immediate" }, ctx);
+    const result = await handleRun({ taskId: "Immediate" }, ctx);
 
     // Narrow the discriminated union explicitly. `as { run }` is the
     // anti-pattern that masked the dispatched-envelope branch — see
@@ -855,7 +887,7 @@ describe("handleRun", () => {
       ctx,
     );
 
-    const result = await handleRun({ name: "Paused" }, ctx);
+    const result = await handleRun({ taskId: "Paused" }, ctx);
 
     if (!("run" in result)) {
       throw new Error(`expected sync run shape, got ${JSON.stringify(result)}`);
@@ -869,7 +901,7 @@ describe("handleRun", () => {
     const ctx = makeCtx();
     handleCreate(createArgs("Live", "Run now", { type: "interval", intervalMs: 60_000 }), ctx);
 
-    const result = await handleRun({ name: "Live" }, ctx);
+    const result = await handleRun({ taskId: "Live" }, ctx);
 
     if (!("run" in result)) {
       throw new Error(`expected sync run shape, got ${JSON.stringify(result)}`);
@@ -893,7 +925,7 @@ describe("handleRun", () => {
     });
     handleCreate(createArgs("Trips", "p", { type: "interval", intervalMs: 60_000 }), ctx);
 
-    const result = await handleRun({ name: "Trips" }, ctx);
+    const result = await handleRun({ taskId: "Trips" }, ctx);
 
     if (!("run" in result)) {
       throw new Error(`expected sync run shape, got ${JSON.stringify(result)}`);
@@ -917,7 +949,7 @@ describe("handleRun", () => {
     );
 
     try {
-      const result = await handleRun({ name: "Slow paused" }, slowCtx);
+      const result = await handleRun({ taskId: "Slow paused" }, slowCtx);
       if (!("status" in result)) {
         throw new Error(`expected dispatched envelope, got ${JSON.stringify(result)}`);
       }
@@ -931,7 +963,7 @@ describe("handleRun", () => {
 
   test("throws for nonexistent task", async () => {
     const ctx = makeCtx();
-    await expect(handleRun({ name: "Nope" }, ctx)).rejects.toThrow("Task not found");
+    await expect(handleRun({ taskId: "Nope" }, ctx)).rejects.toThrow("Task not found");
   });
 
   test("returns 'dispatched' envelope when run outlasts the sync-wait window", async () => {
@@ -959,7 +991,7 @@ describe("handleRun", () => {
     );
 
     try {
-      const result = await handleRun({ name: "Slow" }, slowCtx);
+      const result = await handleRun({ taskId: "Slow" }, slowCtx);
 
       // Narrow to the "dispatched" branch of the union — if the
       // handler ever stops emitting this branch (regression to a
@@ -995,7 +1027,7 @@ describe("handleRun", () => {
     handleCreate(createArgs("Waits", "p", { type: "interval", intervalMs: 60_000 }), ctx);
 
     try {
-      const result = await handleRun({ name: "Waits" }, ctx);
+      const result = await handleRun({ taskId: "Waits" }, ctx);
       if (!("status" in result) || result.status !== "queued") {
         throw new Error(`expected queued envelope, got ${JSON.stringify(result)}`);
       }
@@ -1018,7 +1050,7 @@ describe("handleRun", () => {
     const ctx = makeCtx({ runNow: () => ({ state: "refused", run: skipped }) });
     handleCreate(createArgs("Refused", "p", { type: "interval", intervalMs: 60_000 }), ctx);
 
-    const result = await handleRun({ name: "Refused" }, ctx);
+    const result = await handleRun({ taskId: "Refused" }, ctx);
     if (!("run" in result)) throw new Error(`expected run shape, got ${JSON.stringify(result)}`);
     expect(result.run.status).toBe("skipped");
     expect(result.message).toContain("did not run");
@@ -1602,7 +1634,7 @@ describe("handleRun — inline one-offs, input, idempotency", () => {
     });
     handleCreate(createArgs("Typed", "p", { type: "interval", intervalMs: 60_000 }), ctx);
 
-    await handleRun({ name: "Typed", input: { n: 1 }, idempotencyKey: "k-1" }, ctx);
+    await handleRun({ taskId: "Typed", input: { n: 1 }, idempotencyKey: "k-1" }, ctx);
 
     const requested = seen[0]?.requested as {
       runId: string;
@@ -1630,11 +1662,11 @@ describe("handleRun — inline one-offs, input, idempotency", () => {
   test("refuses both a name and an inline definition", async () => {
     const ctx = makeCtx();
     handleCreate(createArgs("Saved", "p", { type: "interval", intervalMs: 60_000 }), ctx);
-    await expect(handleRun({ name: "Saved", prompt: "other" }, ctx)).rejects.toThrow("not both");
+    await expect(handleRun({ taskId: "Saved", prompt: "other" }, ctx)).rejects.toThrow("not both");
   });
 
   test("refuses a call with neither a name nor a prompt or skill", async () => {
-    await expect(handleRun({ input: { a: 1 } }, makeCtx())).rejects.toThrow("needs `name`");
+    await expect(handleRun({ input: { a: 1 } }, makeCtx())).rejects.toThrow("needs `taskId`");
   });
 
   test("refuses an inline outputSchema that is not a JSON Schema", async () => {
@@ -1646,7 +1678,7 @@ describe("handleRun — inline one-offs, input, idempotency", () => {
   test("refuses an input over the size limit", async () => {
     const ctx = makeCtx();
     handleCreate(createArgs("Big", "p", { type: "interval", intervalMs: 60_000 }), ctx);
-    await expect(handleRun({ name: "Big", input: "x".repeat(70 * 1024) }, ctx)).rejects.toThrow(
+    await expect(handleRun({ taskId: "Big", input: "x".repeat(70 * 1024) }, ctx)).rejects.toThrow(
       "at most",
     );
   });
@@ -1664,7 +1696,7 @@ describe("handleRun — inline one-offs, input, idempotency", () => {
       ),
       ctx,
     );
-    await expect(handleRun({ name: "Needs input" }, ctx)).rejects.toThrow("none was given");
+    await expect(handleRun({ taskId: "Needs input" }, ctx)).rejects.toThrow("none was given");
   });
 
   test("a repeated idempotency key returns the earlier run without asking for another", async () => {
@@ -1687,7 +1719,7 @@ describe("handleRun — inline one-offs, input, idempotency", () => {
     });
     handleCreate(createArgs("Keyed", "p", { type: "interval", intervalMs: 60_000 }), ctx);
 
-    const result = await handleRun({ name: "Keyed", idempotencyKey: "k" }, ctx);
+    const result = await handleRun({ taskId: "Keyed", idempotencyKey: "k" }, ctx);
     if (!("run" in result)) throw new Error(`expected a run, got ${JSON.stringify(result)}`);
     expect(result.run.id).toBe(existing.id);
     expect(result.message).toContain("idempotencyKey");
