@@ -112,12 +112,19 @@ import {
  * verdict and decides what to surface. While a tool is tripped the
  * engine drops it from `modelTools`, rebuilding that set from
  * `snapshot()` every iteration — so a recovery restores it on the next
- * turn with no further coordination. Note the drop makes the tool
- * UNADVERTISED, not unreachable: dispatch reads `toolSchemaMap` only to
- * validate input, and a miss skips validation and still executes. A
- * model that names a dropped tool anyway therefore still runs it, which
- * is the path by which a tripped tool can reach this code at all. The
- * directive below deliberately does not advertise that path.
+ * turn with no further coordination.
+ *
+ * A TRIP WITHDRAWS THE OFFER, NOT THE PERMISSION. The trip is a loop guard,
+ * not an access decision, so dispatch does not refuse a tripped tool: a
+ * model that names one from context gets the same visibility check, input
+ * validation, and `beforeToolCall` gate as any call, and a call that passes
+ * them runs. That call is the tool's probation, and the only route to RECOVERY
+ * above: an advancing success clears the trip, and anything else is replaced
+ * at once (no fresh streak) by the probation directive, which quotes the
+ * call's own output.
+ * Refusing at dispatch would make every trip permanent for the run, and the
+ * trip evidence is often about the caller. Neither directive invites a retry
+ * — see `synthReplacement`.
  */
 
 export interface SupervisorConfig {
@@ -357,6 +364,37 @@ export function createRunSupervisor(config: SupervisorConfig = {}): RunSuperviso
     };
   }
 
+  /**
+   * The replacement for a call to a tool that was ALREADY tripped (its
+   * probation — see the file header). Separate from `synthReplacement` because
+   * that one reports the trip itself. The call may have run or been stopped
+   * before reaching the tool (rejected input, a throw, a dropped transport),
+   * so the text claims neither: it quotes the call's own output, and `isError`
+   * follows that result. A write that landed with the same text the tool
+   * tripped on must not be reported as a refusal, or the model acts on a false
+   * picture of what now exists. The text is a record of this call, since it is
+   * replayed in later runs where the tool may be offered again. Same wording
+   * rules as the trip directive: scoped to this tool, and no invitation to
+   * call it again.
+   */
+  function probationReplacement(
+    toolName: string,
+    result: ToolResult,
+    originalText: string,
+    repeats: number,
+  ): ToolResult {
+    const directive =
+      `[NB supervisor] This call to \`${toolName}\` made no progress, so the tool was still withheld ` +
+      `after it (it had made no progress ${repeats} times in a row earlier in this run).\n\n` +
+      `Underlying output (this call):\n${originalText}\n\n` +
+      `Other tools remain available. Consider an alternative approach or summarize current findings ` +
+      `if no path forward exists.`;
+    return {
+      content: textContent(directive),
+      isError: result.isError === true,
+    };
+  }
+
   function observe(call: ToolCall, result: ToolResult): SupervisorVerdict {
     const state = getState(call.name);
     state.totalCalls += 1;
@@ -382,15 +420,15 @@ export function createRunSupervisor(config: SupervisorConfig = {}): RunSuperviso
         state.lastFingerprint = fingerprint(call, result);
         return { type: "pass" };
       }
-      // Still stuck: every subsequent call keeps getting the synthetic
-      // directive. The engine drops tripped tools from modelTools, so the model
-      // is no longer offered this one — but dispatch does not check that list,
-      // so a model that names it anyway still reaches here.
+      // Still stuck: dispatch does not refuse a tripped tool (see the file
+      // header), and this call did not advance, whether it ran or was stopped
+      // before reaching the tool. It gets the probation directive and the tool
+      // stays withheld.
       const originalText = extractTextForModel(result.content).trim();
       const repeats = state.trippedRepeats ?? state.consecutiveRepeats;
       return {
         type: "synth",
-        replacement: synthReplacement(call.name, originalText, repeats),
+        replacement: probationReplacement(call.name, result, originalText, repeats),
         trippedTool: call.name,
         consecutiveRepeats: repeats,
       };
