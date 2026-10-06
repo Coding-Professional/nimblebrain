@@ -91,7 +91,10 @@ function injectHeaders(dir: string, treeRoot: string, sourceRoot: string): void 
     }
     if (!entry.name.endsWith(".d.ts")) continue;
     // Map output path back to source path for the header.
-    const relFromOutput = full.slice(treeRoot.length + 1).replace(/\.d\.ts$/, ".ts");
+    const relFromOutput = full
+      .slice(treeRoot.length + 1)
+      .replaceAll("\\", "/")
+      .replace(/\.d\.ts$/, ".ts");
     const body = readFileSync(full, "utf-8");
     writeFileSync(full, header(`${sourceRoot}/${relFromOutput}`) + body);
   }
