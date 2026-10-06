@@ -1727,6 +1727,73 @@ describe("Scheduler — cancelRun", () => {
     scheduler.stop();
   });
 
+  it("a scheduled run has its id from dispatch, and is cancelled by it", async () => {
+    const auto = makeTask({
+      nextRunAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    seedDefs(tmpDir, new Map([[auto.id, auto]]));
+
+    let receivedSignal: AbortSignal | null = null;
+    let receivedRunId: string | undefined;
+    const executor: Executor = mock(
+      async (
+        _auto: Task,
+        signal: AbortSignal,
+        _trigger: unknown,
+        _input: unknown,
+        _lease: unknown,
+        runId?: string,
+      ) => {
+        receivedSignal = signal;
+        receivedRunId = runId;
+        return new Promise<never>(() => {});
+      },
+    );
+
+    const scheduler = new Scheduler(executor, { workDir: tmpDir });
+    scheduler.start();
+    scheduler.onTimer();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const [entry] = scheduler.queueView(WS, OWNER);
+    expect(entry?.runId).toMatch(/^run_[a-f0-9]{12}$/);
+    expect(receivedRunId).toBe(entry?.runId);
+    expect(scheduler.cancelRunById(WS, "someone-else", entry!.runId!)).toBe(false);
+    expect(scheduler.cancelRunById(WS, OWNER, entry!.runId!)).toBe(true);
+    expect(receivedSignal!.aborted).toBe(true);
+
+    scheduler.stop();
+  });
+
+  it("a scheduled run whose executor throws is recorded under the id it ran with", async () => {
+    const auto = makeTask({ nextRunAt: new Date(Date.now() - 1000).toISOString() });
+    const defs = new Map<string, Task>();
+    defs.set(auto.id, auto);
+    seedDefs(tmpDir, defs);
+
+    let fail!: (err: Error) => void;
+    const executor: Executor = mock(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    const scheduler = new Scheduler(executor, { workDir: tmpDir });
+    scheduler.start();
+    const done = scheduler.onTimer();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const [entry] = scheduler.queueView(WS, OWNER);
+    expect(entry?.runId).toMatch(/^run_[a-f0-9]{12}$/);
+    fail(new Error("upstream broke"));
+    await done;
+
+    const [recorded] = readRuns(tmpDir, WS, OWNER, auto.id);
+    expect(recorded?.status).toBe("failure");
+    expect(recorded?.id).toBe(entry?.runId);
+    scheduler.stop();
+  });
+
   it("cancelRun on idle task returns false", () => {
     const auto = makeTask({
       nextRunAt: new Date(Date.now() + 999_999).toISOString(), // not due

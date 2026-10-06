@@ -118,14 +118,16 @@ export function TasksUI() {
     setStack((prev) => prev.slice(0, -1));
   };
   /** Open a run under its task's page, so its crumb leads to the task. */
-  const openRun = (runId: string, taskId?: string, run?: TaskRun, batchId?: string) =>
+  const openRun = (runId: string, taskId?: string, run?: TaskRun) => {
+    const name = taskId ? nameOf(taskId) : undefined;
     setStack((prev) =>
       withRun(
         prev,
-        { kind: "result", runId, taskId, run, ...(batchId ? { batchId } : {}) },
-        taskId ? nameOf(taskId) : undefined,
+        { kind: "result", runId, taskId, run },
+        taskId && name ? { id: taskId, name } : undefined,
       ),
     );
+  };
 
   function mark(id: string, what: string | null) {
     setBusy((prev) => {
@@ -172,7 +174,7 @@ export function TasksUI() {
   async function setEnabled(task: TaskRef, enabled: boolean) {
     mark(task.id, enabled ? "resuming" : "pausing");
     try {
-      await updateTool.call({ name: task.id, manifest: { enabled } });
+      await updateTool.call({ taskId: task.id, manifest: { enabled } });
     } catch (err) {
       setNotice(toolErrorText(err));
       throw err;
@@ -186,8 +188,8 @@ export function TasksUI() {
     setConfirmDelete(null);
     mark(task.id, "deleting");
     try {
-      await deleteTool.call({ name: task.id });
-      setStack((prev) => prev.filter((s) => !(s.kind === "task" && s.taskName === task.name)));
+      await deleteTool.call({ taskId: task.id });
+      setStack((prev) => prev.filter((s) => !(s.kind === "task" && s.taskId === task.id)));
     } catch (err) {
       setNotice(toolErrorText(err));
     } finally {
@@ -197,7 +199,7 @@ export function TasksUI() {
   }
 
   const homeActions: HomeActions = {
-    onOpenTask: (t) => push({ kind: "task", taskName: t.name }),
+    onOpenTask: (t) => push({ kind: "task", taskId: t.id, taskName: t.name }),
     onOpenRun: (taskId, runId) => openRun(runId, taskId),
     onCreate: (template) => push({ kind: "editor", template: template ?? null }),
     onSeeUpcoming: () => push({ kind: "upcoming" }),
@@ -206,9 +208,9 @@ export function TasksUI() {
 
   const taskActions: TaskPageActions = {
     onRunNow: (d) => void runNow({ id: d.id, name: d.name, inputSchema: d.inputSchema }),
-    onRunList: (d) => setBatchDialog(d.name),
-    onEdit: (d) => push({ kind: "editor", taskName: d.name }),
-    onDuplicate: (d) => push({ kind: "editor", copyOf: d.name }),
+    onRunList: (d) => setBatchDialog(d.id),
+    onEdit: (d) => push({ kind: "editor", taskId: d.id }),
+    onDuplicate: (d) => push({ kind: "editor", copyOf: d.id }),
     onDelete: (d) => setConfirmDelete({ id: d.id, name: d.name }),
     onSetEnabled: (d, enabled) => setEnabled(d, enabled),
     onOpenRun: (run) => openRun(run.id, run.taskId, run),
@@ -232,7 +234,7 @@ export function TasksUI() {
       )}
       {batchDialog && (
         <BatchDialog
-          taskName={batchDialog}
+          taskId={batchDialog}
           onClose={() => setBatchDialog(null)}
           onCreated={(batch) => {
             setBatchDialog(null);
@@ -259,14 +261,14 @@ export function TasksUI() {
     </>
   );
 
-  const taskSummary = top?.kind === "task" ? tasks.find((t) => t.name === top.taskName) : undefined;
+  const taskSummary = top?.kind === "task" ? tasks.find((t) => t.id === top.taskId) : undefined;
 
   return (
     <HostTrailContext.Provider value={hostShowsTrail}>
       {top?.kind === "task" ? (
         <TaskPage
-          key={top.taskName}
-          taskName={top.taskName}
+          key={top.taskId}
+          taskId={top.taskId}
           summary={taskSummary}
           refreshKey={refreshKey}
           busy={taskSummary ? busy[taskSummary.id] : undefined}
@@ -330,7 +332,7 @@ function ScreenRoute({
   onBack: () => void;
   onPush: (s: Screen) => void;
   onRunLoaded: (runId: string, run: TaskRun) => void;
-  onOpenRun: (runId: string, taskId?: string, run?: TaskRun, batchId?: string) => void;
+  onOpenRun: (runId: string, taskId?: string, run?: TaskRun) => void;
   onReplaceTop: (s: Screen | null) => void;
   onRerun: (task: TaskRef, input: unknown) => void;
   onSaved: (warnings: TaskWarning[]) => void;
@@ -346,7 +348,6 @@ function ScreenRoute({
           taskId={screen.taskId}
           taskName={screen.taskId ? nameOf(screen.taskId) : undefined}
           initialRun={screen.run}
-          batchId={screen.batchId}
           onBack={onBack}
           onRerun={onRerun}
           onOpenRun={openRun}
@@ -362,21 +363,23 @@ function ScreenRoute({
           taskName={nameOf}
           refreshKey={refreshKey}
           onBack={onBack}
-          onOpenRun={(runId, taskId) => openRun(runId, taskId, undefined, screen.batchId)}
+          onOpenRun={openRun}
         />
       );
     case "editor":
       return (
         <TaskEditor
-          key={screen.taskName ?? screen.copyOf ?? "new"}
-          taskName={screen.taskName}
+          key={screen.taskId ?? screen.copyOf ?? "new"}
+          taskId={screen.taskId}
           copyOf={screen.copyOf}
           template={screen.template}
           onCancel={onBack}
-          onSaved={(name, warnings) => {
+          onSaved={(task, warnings) => {
             onSaved(warnings);
             // A new task opens on its page; an edit returns where it came from.
-            onReplaceTop(screen.taskName ? null : { kind: "task", taskName: name });
+            onReplaceTop(
+              screen.taskId ? null : { kind: "task", taskId: task.id, taskName: task.name },
+            );
           }}
         />
       );
@@ -387,8 +390,8 @@ function ScreenRoute({
           <main className="content">
             <UpcomingView
               refreshKey={refreshKey}
-              onOpenRun={(r) => r.runId && openRun(r.runId, r.taskId, undefined, r.batchId)}
-              onOpenTask={(name) => onPush({ kind: "task", taskName: name })}
+              onOpenRun={(r) => r.runId && openRun(r.runId, r.taskId)}
+              onOpenTask={(t) => onPush({ kind: "task", taskId: t.id, taskName: t.name })}
             />
           </main>
         </div>

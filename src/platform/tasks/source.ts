@@ -6,6 +6,7 @@ import { log } from "../../observability/log.ts";
 import { getRequestContext } from "../../runtime/request-context.ts";
 import type { Runtime } from "../../runtime/runtime.ts";
 import type { TaskRequest } from "../../runtime/types.ts";
+import { coreSkillBody } from "../../skills/loader.ts";
 import { isTaskForbiddenIdentityTool } from "../../tools/identity-sources.ts";
 import { defineInProcessApp, type InProcessTool } from "../../tools/in-process-app.ts";
 import type { McpSource } from "../../tools/mcp-source.ts";
@@ -434,7 +435,8 @@ export async function createTasksSource(
         const index = scheduler.getQueuedRunIds().indexOf(`${wsId}/${owner}/${id}`);
         return index >= 0 ? index + 1 : null;
       },
-      cancelRun: (id) => scheduler.cancelRun(wsId, owner, id),
+      cancelRun: (runId) => scheduler.cancelRunById(wsId, owner, runId),
+      isAssessing: (runId) => scheduler.isAssessing(runId),
       readRuns: (id, opts) => readRuns(workDir, wsId, owner, id, opts),
       readRunsPage: (id, opts) => readRunsPage(workDir, wsId, owner, id, opts),
       readAllRuns: (opts) => readAllRuns(workDir, wsId, owner, opts),
@@ -552,11 +554,11 @@ export async function createTasksSource(
     };
   }
 
-  /** A write's answer with warnings about the judge its saved task will find. */
+  /** An answer with warnings about the judge its task's runs will find. */
   async function withJudgeWarnings<T extends { message?: string }>(
     out: T,
     task: Task | undefined,
-    about: "task" | "run" = "task",
+    about: "task" | "run" | "batch" = "task",
   ): Promise<T> {
     return task ? withWarnings(out, await judgeWarnings(task, judgePort, about)) : out;
   }
@@ -594,21 +596,15 @@ export async function createTasksSource(
           return handleRuns(input, ctx);
         case "run_result":
           return handleRunResult(input, ctx);
+        // Every run and batch is warned about, saved task or inline: a judge
+        // disconnected since the task was written fails its runs the same way.
         case "run":
           return handleRun(input, ctx).then((out) =>
-            // An inline one-off is saved by the call, so it is warned about
-            // like a create; a saved task was warned about when it was written.
-            input.taskId === undefined
-              ? withJudgeWarnings(out, ctx.definitions().get(runOutputTaskId(out)), "run")
-              : out,
+            withJudgeWarnings(out, ctx.definitions().get(runOutputTaskId(out)), "run"),
           );
         case "run_batch": {
           const out = handleRunBatch(input, ctx);
-          // An inline definition is saved by the call, so it is warned about
-          // like a create.
-          return input.taskId === undefined
-            ? withJudgeWarnings(out, ctx.definitions().get(out.batch.taskId), "run")
-            : out;
+          return withJudgeWarnings(out, ctx.definitions().get(out.batch.taskId), "batch");
         }
         case "batch":
           return handleBatch(input, ctx);
@@ -638,6 +634,9 @@ export async function createTasksSource(
     {
       name: "tasks",
       version: "1.0.0",
+      // The task-authoring skill, which chat loads by tool affinity, is what a
+      // remote MCP client is told too: one guide, served both ways.
+      instructions: coreSkillBody("task-authoring"),
       tools,
       resources,
       placements: [
