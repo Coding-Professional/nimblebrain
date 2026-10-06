@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { BackArrowIcon } from "../icons.tsx";
-import { renderMarkdown } from "../markdown.ts";
+import { readResult } from "../lib/runResult.ts";
 import type { BatchItemResult, TaskBatch, TaskRunResult } from "../types.ts";
 import { useTool } from "../useTool.ts";
 import { asDict, formatCost, relativeTime } from "../utils.ts";
+import { PageHeader } from "./Chrome.tsx";
 import { RunBadge } from "./RunBadge.tsx";
+import { Section, Sections } from "./Section.tsx";
+import { ResultPreview, readsStructured } from "./StructuredView.tsx";
 
 /** Rows per page of results. */
 const PAGE = 50;
@@ -34,12 +36,15 @@ export function BatchPane({
   taskName,
   onChanged,
   onBack,
+  onOpenRun,
 }: {
   batch: TaskBatch;
   taskName?: string;
   /** Reload the panel after a control changed the batch. */
   onChanged: () => void;
   onBack?: () => void;
+  /** Open an item's run on the result screen. */
+  onOpenRun?: (runId: string) => void;
 }) {
   const batchTool = useTool<string>("batch");
   const controlTool = useTool<string>("batch_control");
@@ -56,7 +61,7 @@ export function BatchPane({
         batchId: batch.id,
         results: true,
         limit: PAGE,
-        ...(failingOnly ? { verdict: "failing" } : {}),
+        ...(failingOnly ? { filter: "failing" } : {}),
         ...(cursor !== undefined ? { cursor } : {}),
       });
       const data = asDict(result.data);
@@ -99,35 +104,42 @@ export function BatchPane({
         onControl={control}
         onBack={onBack}
       />
-      <div className="reader-body">
-        <BatchProgress batch={batch} />
-        {batch.pause && <div className="batch-note">{batch.pause.message}</div>}
-        {error && <div className="error-banner">{error}</div>}
-
-        <label className="batch-filter">
-          <input
-            type="checkbox"
-            checked={failingOnly}
-            onChange={(e) => setFailingOnly(e.target.checked)}
-          />
-          Failing items only
-        </label>
-
-        <BatchResultsTable rows={rows} columns={columns} />
-        {nextCursor !== undefined && (
-          <button
-            type="button"
-            className="btn"
-            style={{ marginTop: 10 }}
-            onClick={() =>
-              loadPage(nextCursor).catch((err) =>
-                setError(err instanceof Error ? err.message : String(err)),
-              )
+      <div className="content page-body">
+        <Sections>
+          <Section title="Progress">
+            <BatchProgress batch={batch} />
+            {batch.pause && <div className="batch-note">{batch.pause.message}</div>}
+          </Section>
+          {error && <div className="error-banner">{error}</div>}
+          <Section
+            title="Items"
+            aside={
+              <label className="batch-filter">
+                <input
+                  type="checkbox"
+                  checked={failingOnly}
+                  onChange={(e) => setFailingOnly(e.target.checked)}
+                />
+                Failing items only
+              </label>
             }
           >
-            Load more
-          </button>
-        )}
+            <BatchResultsTable rows={rows} columns={columns} onOpenRun={onOpenRun} />
+            {nextCursor !== undefined && (
+              <button
+                type="button"
+                className="btn load-more"
+                onClick={() =>
+                  loadPage(nextCursor).catch((err) =>
+                    setError(err instanceof Error ? err.message : String(err)),
+                  )
+                }
+              >
+                Load more
+              </button>
+            )}
+          </Section>
+        </Sections>
       </div>
     </div>
   );
@@ -170,44 +182,37 @@ function BatchHead({
 }) {
   const budget = batch.budgetUsd !== undefined ? ` of ${formatCost(batch.budgetUsd)}` : "";
   return (
-    <div className="reader-head">
-      {onBack && (
-        <button type="button" className="reader-back" onClick={onBack} aria-label="Back to list">
-          <BackArrowIcon />
-        </button>
-      )}
-      <div className="reader-head-meta">
-        <div className="reader-head-title">
-          <span className="reader-head-name">Batch {batch.id.slice(6, 10)}</span>
-          <span className="reader-head-sep">·</span>
+    <PageHeader
+      title={`Batch ${batch.id.slice(6, 10)}`}
+      onBack={onBack ?? (() => {})}
+      status={
+        <>
           <span>{taskName ?? batch.taskId}</span>
-          <span className="reader-head-sep">·</span>
-          <span className="reader-head-status">{STATE_LABEL[batch.state]}</span>
-        </div>
-        <div className="reader-head-sub">
-          {batch.done}/{batch.items} done · {formatCost(batch.costUsd) || "$0.00"}
-          {budget} · started {relativeTime(batch.createdAt)}
-        </div>
-      </div>
-      <div className="reader-actions">
-        {controlsFor(batch).map((action) => (
-          <button
-            key={action}
-            type="button"
-            className={CONTROL_LABEL[action].className}
-            disabled={busy}
-            onClick={() => onControl(action)}
-          >
-            {CONTROL_LABEL[action].text}
-          </button>
-        ))}
-      </div>
-    </div>
+          <span>{STATE_LABEL[batch.state]}</span>
+          <span>
+            {batch.done}/{batch.items} done · {formatCost(batch.costUsd) || "$0.00"}
+            {budget}
+          </span>
+          <span>started {relativeTime(batch.createdAt)}</span>
+        </>
+      }
+      actions={controlsFor(batch).map((action) => (
+        <button
+          key={action}
+          type="button"
+          className={CONTROL_LABEL[action].className}
+          disabled={busy}
+          onClick={() => onControl(action)}
+        >
+          {CONTROL_LABEL[action].text}
+        </button>
+      ))}
+    />
   );
 }
 
 /** The progress bar and the counts under it. */
-function BatchProgress({ batch }: { batch: TaskBatch }) {
+export function BatchProgress({ batch }: { batch: TaskBatch }) {
   const { counts } = batch;
   const pct = batch.items > 0 ? Math.round((batch.done / batch.items) * 100) : 0;
   const stoppedEarly = counts.skipped + counts.cancelled;
@@ -247,7 +252,15 @@ function BatchProgress({ batch }: { batch: TaskBatch }) {
 }
 
 /** The results table: index, output fields, verdict badge, cost, and the run's output on demand. */
-function BatchResultsTable({ rows, columns }: { rows: BatchItemResult[]; columns: string[] }) {
+function BatchResultsTable({
+  rows,
+  columns,
+  onOpenRun,
+}: {
+  rows: BatchItemResult[];
+  columns: string[];
+  onOpenRun?: (runId: string) => void;
+}) {
   const [openRun, setOpenRun] = useState<string | null>(null);
   if (rows.length === 0) return <div className="rail-empty">No items to show.</div>;
   return (
@@ -272,6 +285,7 @@ function BatchResultsTable({ rows, columns }: { rows: BatchItemResult[]; columns
             columns={columns}
             open={openRun === row.runId}
             onToggle={() => setOpenRun(openRun === row.runId ? null : (row.runId ?? null))}
+            onOpenRun={onOpenRun}
           />
         ))}
       </tbody>
@@ -284,16 +298,18 @@ function BatchRow({
   columns,
   open,
   onToggle,
+  onOpenRun,
 }: {
   row: BatchItemResult;
   columns: string[];
   open: boolean;
   onToggle: () => void;
+  onOpenRun?: (runId: string) => void;
 }) {
   return (
     <>
       <tr>
-        <td>{row.index}</td>
+        <td>{row.index + 1}</td>
         {columns.length === 0 && <td className="batch-input">{row.inputSummary}</td>}
         {columns.map((c) => (
           <td key={c}>{row.output?.[c] === undefined ? "" : String(row.output[c])}</td>
@@ -308,16 +324,32 @@ function BatchRow({
         <td>{row.costUsd !== undefined ? formatCost(row.costUsd) : ""}</td>
         <td>
           {row.runId && row.state === "done" ? (
-            <button type="button" className="batch-run-link" onClick={onToggle}>
-              {open ? "Hide" : "Open"}
-            </button>
+            <span className="batch-run-links">
+              <button
+                type="button"
+                className="batch-run-link"
+                aria-expanded={open}
+                onClick={onToggle}
+              >
+                {open ? "Hide" : "Preview"}
+              </button>
+              {onOpenRun && (
+                <button
+                  type="button"
+                  className="batch-run-link"
+                  onClick={() => row.runId && onOpenRun(row.runId)}
+                >
+                  Result
+                </button>
+              )}
+            </span>
           ) : null}
         </td>
       </tr>
       {open && row.runId && (
         <tr>
-          <td colSpan={columns.length + 5}>
-            <BatchRunOutput runId={row.runId} error={row.error} />
+          <td className="batch-expand" colSpan={columns.length + 5}>
+            <BatchRunOutput runId={row.runId} error={row.error} onOpenRun={onOpenRun} />
           </td>
         </tr>
       )}
@@ -325,38 +357,124 @@ function BatchRow({
   );
 }
 
-/** One item's run output, read by its run id. */
-function BatchRunOutput({ runId, error }: { runId: string; error?: string }) {
-  const runResultTool = useTool<TaskRunResult>("run_result");
-  const [output, setOutput] = useState<string | null>(null);
+/**
+ * One item's result, read by its run id: structured output as labelled
+ * values (Show raw for its JSON), text as wrapped prose, the full row wide.
+ */
+function BatchRunOutput({
+  runId,
+  error,
+  onOpenRun,
+}: {
+  runId: string;
+  error?: string;
+  onOpenRun?: (runId: string) => void;
+}) {
+  const runResultTool = useTool<string>("run_result");
+  const [result, setResult] = useState<TaskRunResult | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  const [raw, setRaw] = useState(false);
   // biome-ignore lint/correctness/useExhaustiveDependencies: runResultTool.call is stable
   useEffect(() => {
     let cancelled = false;
-    runResultTool
-      .call({ runId })
-      .then((res) => {
-        if (!cancelled) setOutput(((res.data as TaskRunResult) ?? null)?.output ?? "");
-      })
-      .catch((err) => {
-        if (!cancelled) setFailed(err instanceof Error ? err.message : String(err));
-      });
+    void readResult(runResultTool.call, runId, undefined).then((read) => {
+      if (cancelled) return;
+      if (read.result) setResult(read.result);
+      else setFailed(read.error ?? (read.open ? "This run has not ended." : "No output."));
+    });
     return () => {
       cancelled = true;
     };
   }, [runId]);
+  const structured = !!result && readsStructured(result.structured, result.output);
   return (
     <div className="batch-run-output">
-      <div className="batch-run-id">{runId}</div>
-      {error && <pre className="batch-run-error">{error}</pre>}
-      {failed && !error && <div className="batch-pending">{failed}</div>}
-      {output && (
-        <div
-          className="out-md"
-          // biome-ignore lint/security/noDangerouslySetInnerHtml: sanitized via DOMPurify in renderMarkdown
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(output) }}
-        />
-      )}
+      {error && <pre className="reader-error-body">{error}</pre>}
+      {failed && !error && <p className="muted">{failed}</p>}
+      {result && <ResultPreview structured={result.structured} text={result.output} raw={raw} />}
+      <div className="batch-run-foot">
+        {structured && (
+          <button
+            type="button"
+            className="btn btn-sm"
+            aria-pressed={raw}
+            onClick={() => setRaw(!raw)}
+          >
+            {raw ? "Show values" : "Show raw"}
+          </button>
+        )}
+        {onOpenRun && (
+          <button type="button" className="link-btn muted-link" onClick={() => onOpenRun(runId)}>
+            Open the run
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** A batch on its own screen, read by id and re-read after a control or a data change. */
+export function BatchScreen({
+  batchId,
+  taskName,
+  refreshKey,
+  onBack,
+  onOpenRun,
+}: {
+  batchId: string;
+  taskName?: (taskId: string) => string | undefined;
+  refreshKey: number;
+  onBack: () => void;
+  onOpenRun: (runId: string, taskId: string) => void;
+}) {
+  const batchTool = useTool<string>("batch");
+  const [batch, setBatch] = useState<TaskBatch | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: batchTool.call is stable; refreshKey and tick are signals
+  useEffect(() => {
+    let cancelled = false;
+    batchTool
+      .call({ batchId })
+      .then((res) => {
+        if (!cancelled) setBatch((asDict(res.data).batch as TaskBatch) ?? null);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [batchId, refreshKey, tick]);
+
+  if (!batch) {
+    return (
+      <div className="app">
+        <PageHeader title="Batch" onBack={onBack} />
+        <div className="content">
+          {error ? (
+            <div className="error-banner" role="alert">
+              {error}
+            </div>
+          ) : (
+            <div className="loading-list" aria-busy="true">
+              <div className="skel skel-card" />
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="app batch-screen">
+      <BatchPane
+        batch={batch}
+        taskName={taskName?.(batch.taskId)}
+        onChanged={() => setTick((t) => t + 1)}
+        onBack={onBack}
+        onOpenRun={(runId) => onOpenRun(runId, batch.taskId)}
+      />
     </div>
   );
 }

@@ -124,6 +124,19 @@ export interface RunInput {
   data?: unknown;
 }
 
+/** A run holding a slot or waiting for one, as `Scheduler.queueView` reports it. */
+export interface QueueViewEntry {
+  taskId: string;
+  runId?: string;
+  state: "running" | "queued";
+  /** Queued only: the place among this scheduler's queued runs, 1 next. */
+  position?: number;
+  /** Running only. */
+  startedAt?: string;
+  /** Running only: what started it. */
+  trigger?: TaskRunTrigger;
+}
+
 /**
  * A run asked for by id (`tasks__run`): the id it was given before it
  * was asked for, and what it was asked with. A requested run has a ticket from
@@ -487,17 +500,16 @@ function getTimezoneOffsetMs(tz: string, date: Date): number {
 
 /**
  * How a thrown run maps to a persisted failure record. One guard-clause row per
- * outcome keeps `status`, the id `suffix`, the `error` text, and the `transient`
- * flag together so they can't drift apart.
+ * outcome keeps `status`, the `error` text, and the `transient` flag together
+ * so they can't drift apart.
  */
 function classifyRunFailure(err: unknown): {
   status: TaskRun["status"];
-  suffix: string;
   error: string;
   transient: boolean;
 } {
   if (err instanceof DOMException && err.name === "AbortError") {
-    return { status: "cancelled", suffix: "cancel", error: "Cancelled by user", transient: false };
+    return { status: "cancelled", error: "Cancelled by user", transient: false };
   }
   const errorMsg = err instanceof Error ? err.message : String(err);
   // Owner removed from the task's provenance workspace: the runtime denied
@@ -506,7 +518,7 @@ function classifyRunFailure(err: unknown): {
   // so the task self-heals the moment the owner is re-added. Matched by the
   // error's stable `code`, which crosses the in-process runtime→app boundary.
   if ((err as { code?: string })?.code === "workspace_membership_revoked") {
-    return { status: "skipped", suffix: "skip", error: errorMsg, transient: false };
+    return { status: "skipped", error: errorMsg, transient: false };
   }
   // A tool in the task's `allowedTools` matches nothing the run can reach
   // (`DeclaredToolsUnavailableError`, thrown before the first model call). A
@@ -514,19 +526,17 @@ function classifyRunFailure(err: unknown): {
   // stays gone backs the task off and disables it, saying why. Not transient:
   // a retry minutes later meets the same missing connector.
   if ((err as { code?: string })?.code === "declared_tools_unavailable") {
-    return { status: "failure", suffix: "err", error: errorMsg, transient: false };
+    return { status: "failure", error: errorMsg, transient: false };
   }
   if (errorMsg.includes("timed out")) {
     return {
       status: "timeout",
-      suffix: "timeout",
       error: errorMsg,
       transient: isTransientError(errorMsg),
     };
   }
   return {
     status: "failure",
-    suffix: "err",
     error: errorMsg,
     transient: isTransientError(errorMsg),
   };
@@ -808,6 +818,11 @@ function notStartedRun(
   return { run: requested ? withRequest(run, requested) : run, started: false };
 }
 
+/** A fresh run id, in the runtime's shape (`run_<12 hex>`). */
+export function newRunId(): string {
+  return `run_${randomBytes(6).toString("hex")}`;
+}
+
 /** A requested run's record, carrying its id and what it was asked with. */
 function withRequest(run: TaskRun, requested: RequestedRun): TaskRun {
   return {
@@ -869,6 +884,11 @@ export class Scheduler {
   private definitions: Map<string, Task> = new Map();
   /** In-flight runs' abort controllers, for cancel and stop. Slots are admission's. */
   private readonly activeRuns: Map<string, AbortController> = new Map();
+  /** When each in-flight run started and what started it, by the same key, for `queueView`. */
+  private readonly activeInfo: Map<
+    string,
+    { startedAt: string; trigger: TaskRunTrigger; runId: string }
+  > = new Map();
   /**
    * Requested runs this process is carrying, by run id: queued or in flight,
    * with the task key and the promise of the run's record. A ticket that
@@ -878,8 +898,11 @@ export class Scheduler {
   private readonly openRuns: Map<string, { key: string; ended: Promise<TaskRun> }> = new Map();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
-  /** Assessments in flight, so a test (or a caller) can wait for them. */
-  private readonly pendingAssessments = new Set<Promise<TaskRun>>();
+  /**
+   * Assessments in flight by run id, so a caller can wait for them and a run
+   * whose record has landed reads as not yet ended until its verdict has.
+   */
+  private readonly pendingAssessments = new Map<string, Promise<TaskRun>>();
 
   private readonly executor: Executor;
   private config: SchedulerConfig;
@@ -1025,6 +1048,7 @@ export class Scheduler {
     for (const [id, controller] of this.activeRuns) {
       controller.abort();
       this.activeRuns.delete(id);
+      this.activeInfo.delete(id);
     }
   }
 
@@ -1292,14 +1316,19 @@ export class Scheduler {
   }
 
   /**
-   * Cancel a requested run by its id, when this process is carrying it for
-   * that owner in that workspace: abort it in flight, or take it out of the
-   * queue. False when it carries no such run.
+   * Cancel a run by its id, when this process is carrying it for that owner
+   * in that workspace: abort it in flight (a requested run, or a scheduled or
+   * event run by the id minted at dispatch), or take a requested run out of
+   * the queue. False when it carries no such run.
    */
   cancelRunById(wsId: string, ownerId: string, runId: string): boolean {
+    const prefix = `${wsId}/${ownerId}/`;
     const open = this.openRuns.get(runId);
-    if (!open?.key.startsWith(`${wsId}/${ownerId}/`)) return false;
-    return this.cancelKey(open.key);
+    if (open) return open.key.startsWith(prefix) && this.cancelKey(open.key);
+    for (const [key, info] of this.activeInfo) {
+      if (info.runId === runId && key.startsWith(prefix)) return this.cancelKey(key);
+    }
+    return false;
   }
 
   /**
@@ -1617,6 +1646,45 @@ export class Scheduler {
   }
 
   /**
+   * One owner's runs in one workspace that hold a slot or wait for one, read
+   * from this scheduler's own admission keys (the door knows nothing of tasks).
+   * A key is `<ws>/<owner>/<taskId>`, or `<ws>/<owner>/<taskId>#<runId>` for a
+   * batch run. `position` numbers the queued runs as `tasks__run` does: the
+   * place among this scheduler's queued runs, 1 next.
+   */
+  queueView(wsId: string, ownerId: string): QueueViewEntry[] {
+    const prefix = `${wsId}/${ownerId}/`;
+    const parse = (key: string): { taskId: string; runId?: string } => {
+      const rest = key.slice(prefix.length);
+      const hash = rest.indexOf("#");
+      return hash >= 0
+        ? { taskId: rest.slice(0, hash), runId: rest.slice(hash + 1) }
+        : { taskId: rest };
+    };
+    const runIdByKey = new Map<string, string>();
+    for (const [runId, open] of this.openRuns) runIdByKey.set(open.key, runId);
+    const out: QueueViewEntry[] = [];
+    for (const [key, info] of this.activeInfo) {
+      if (!key.startsWith(prefix)) continue;
+      const { taskId } = parse(key);
+      out.push({
+        taskId,
+        state: "running",
+        startedAt: info.startedAt,
+        trigger: info.trigger,
+        runId: info.runId,
+      });
+    }
+    this.getQueuedRunIds().forEach((key, index) => {
+      if (!key.startsWith(prefix)) return;
+      const { taskId, runId } = parse(key);
+      const id = runId ?? runIdByKey.get(key);
+      out.push({ taskId, state: "queued", position: index + 1, ...(id ? { runId: id } : {}) });
+    });
+    return out;
+  }
+
+  /**
    * Check if the scheduler is currently running.
    */
   isRunning(): boolean {
@@ -1789,6 +1857,10 @@ export class Scheduler {
     // to the millisecond — operators can't tell the failure modes apart
     // from the run record alone.
     const startedAt = new Date().toISOString();
+    // Every run has its id from dispatch, so one in flight is found (and
+    // cancelled) by it whatever started it; a requested run brings its own.
+    const runId = requested?.runId ?? newRunId();
+    this.activeInfo.set(key, { startedAt, trigger, runId });
     // The once occurrence this run is, if any: an `at` edited while it runs is
     // a new occurrence, which the run must not retire.
     const firedOnceAt =
@@ -1797,6 +1869,7 @@ export class Scheduler {
     let recorded: { run: TaskRun; result: TaskRunResult | null };
     try {
       recorded = await this.executeAndRecord(auto, controller, {
+        runId,
         startedAt,
         trigger,
         input,
@@ -1810,6 +1883,7 @@ export class Scheduler {
       // Releasing it admits the next queued run. `executeTask` releases it as
       // the run ends; this covers an executor that never reached it.
       this.activeRuns.delete(key);
+      this.activeInfo.delete(key);
       lease.release();
     }
     // After the slot is free and the task is no longer running, so a retry
@@ -1842,8 +1916,8 @@ export class Scheduler {
       });
       return run;
     });
-    this.pendingAssessments.add(pending);
-    pending.finally(() => this.pendingAssessments.delete(pending));
+    this.pendingAssessments.set(run.id, pending);
+    pending.finally(() => this.pendingAssessments.delete(run.id));
     return pending;
   }
 
@@ -1892,7 +1966,7 @@ export class Scheduler {
     const { workspaceId: wsId, ownerId } = auto;
     if (!wsId || !ownerId) return false;
     const requested: RequestedRun = {
-      runId: `run_${randomBytes(6).toString("hex")}`,
+      runId: newRunId(),
       requestedAt: new Date().toISOString(),
       ...(run.input !== undefined ? { input: run.input } : {}),
       retryOf: run.id,
@@ -1907,8 +1981,13 @@ export class Scheduler {
   /** Resolves once every assessment in flight has been recorded. */
   async assessmentsSettled(): Promise<void> {
     while (this.pendingAssessments.size > 0) {
-      await Promise.allSettled([...this.pendingAssessments]);
+      await Promise.allSettled([...this.pendingAssessments.values()]);
     }
+  }
+
+  /** Whether a recorded run is still being assessed, so its verdict is not yet on its record. */
+  isAssessing(runId: string): boolean {
+    return this.pendingAssessments.has(runId);
   }
 
   /** Run the executor and record the outcome; the slot is released by the caller. */
@@ -1916,6 +1995,7 @@ export class Scheduler {
     auto: Task,
     controller: AbortController,
     dispatch: {
+      runId: string;
       startedAt: string;
       trigger: TaskRunTrigger;
       input: RunInput | undefined;
@@ -1925,7 +2005,7 @@ export class Scheduler {
       batch?: BatchRunOptions;
     },
   ): Promise<{ run: TaskRun; result: TaskRunResult | null }> {
-    const { startedAt, trigger, input, lease, firedOnceAt, requested, batch } = dispatch;
+    const { runId, startedAt, trigger, input, lease, firedOnceAt, requested, batch } = dispatch;
     const ticket = (run: TaskRun) => {
       if (requested && auto.workspaceId && auto.ownerId) {
         this.writeTicket(auto.workspaceId, auto.ownerId, auto.id, requested, run);
@@ -1950,7 +2030,7 @@ export class Scheduler {
         trigger,
         input,
         lease,
-        requested?.runId,
+        runId,
         batch?.accounts(),
       );
       const run = requested ? withRequest(executed.run, requested) : executed.run;
@@ -1965,9 +2045,9 @@ export class Scheduler {
       this.runRecorded(auto);
       return { run, result };
     } catch (err) {
-      const { status, suffix, error, transient } = classifyRunFailure(err);
+      const { status, error, transient } = classifyRunFailure(err);
       const failed: TaskRun = {
-        id: `run_${Date.now()}_${suffix}`,
+        id: runId,
         taskId: auto.id,
         startedAt,
         completedAt: new Date().toISOString(),

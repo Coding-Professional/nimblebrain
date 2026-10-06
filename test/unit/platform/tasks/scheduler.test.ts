@@ -1727,6 +1727,73 @@ describe("Scheduler — cancelRun", () => {
     scheduler.stop();
   });
 
+  it("a scheduled run has its id from dispatch, and is cancelled by it", async () => {
+    const auto = makeTask({
+      nextRunAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    seedDefs(tmpDir, new Map([[auto.id, auto]]));
+
+    let receivedSignal: AbortSignal | null = null;
+    let receivedRunId: string | undefined;
+    const executor: Executor = mock(
+      async (
+        _auto: Task,
+        signal: AbortSignal,
+        _trigger: unknown,
+        _input: unknown,
+        _lease: unknown,
+        runId?: string,
+      ) => {
+        receivedSignal = signal;
+        receivedRunId = runId;
+        return new Promise<never>(() => {});
+      },
+    );
+
+    const scheduler = new Scheduler(executor, { workDir: tmpDir });
+    scheduler.start();
+    scheduler.onTimer();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const [entry] = scheduler.queueView(WS, OWNER);
+    expect(entry?.runId).toMatch(/^run_[a-f0-9]{12}$/);
+    expect(receivedRunId).toBe(entry?.runId);
+    expect(scheduler.cancelRunById(WS, "someone-else", entry!.runId!)).toBe(false);
+    expect(scheduler.cancelRunById(WS, OWNER, entry!.runId!)).toBe(true);
+    expect(receivedSignal!.aborted).toBe(true);
+
+    scheduler.stop();
+  });
+
+  it("a scheduled run whose executor throws is recorded under the id it ran with", async () => {
+    const auto = makeTask({ nextRunAt: new Date(Date.now() - 1000).toISOString() });
+    const defs = new Map<string, Task>();
+    defs.set(auto.id, auto);
+    seedDefs(tmpDir, defs);
+
+    let fail!: (err: Error) => void;
+    const executor: Executor = mock(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    const scheduler = new Scheduler(executor, { workDir: tmpDir });
+    scheduler.start();
+    const done = scheduler.onTimer();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const [entry] = scheduler.queueView(WS, OWNER);
+    expect(entry?.runId).toMatch(/^run_[a-f0-9]{12}$/);
+    fail(new Error("upstream broke"));
+    await done;
+
+    const [recorded] = readRuns(tmpDir, WS, OWNER, auto.id);
+    expect(recorded?.status).toBe("failure");
+    expect(recorded?.id).toBe(entry?.runId);
+    scheduler.stop();
+  });
+
   it("cancelRun on idle task returns false", () => {
     const auto = makeTask({
       nextRunAt: new Date(Date.now() + 999_999).toISOString(), // not due
@@ -2337,6 +2404,52 @@ describe("Scheduler — run queue", () => {
     expect(readRuns(tmpDir, WS, OWNER, "c")).toEqual([]);
 
     releaseAll();
+    scheduler.stop();
+  });
+
+  it("queueView reports one owner's running and queued runs, from its own admission keys", async () => {
+    seedIdle(["a", "b", "c"]);
+    seedDefs(
+      tmpDir,
+      new Map([["x", makeTask({ id: "x", name: "x", enabled: false, ownerId: "usr_other" })]]),
+      "usr_other",
+    );
+    const { executor, releaseAll } = createSlotExecutor();
+    const scheduler = new Scheduler(executor, {
+      workDir: tmpDir,
+      admission: createRunAdmission({ maxConcurrentRuns: 2 }),
+    });
+    scheduler.start();
+    const requested = { runId: "run_aaaaaaaaaaaa", requestedAt: new Date().toISOString() };
+    scheduler.requestRunNow(WS, OWNER, "a", requested);
+    scheduler.requestRunNow(WS, "usr_other", "x");
+    scheduler.requestRunNow(WS, "usr_other", "x"); // a duplicate: refused, not queued
+    scheduler.requestRunNow(WS, OWNER, "b");
+    scheduler.requestRunNow(WS, OWNER, "c", { ...requested, runId: "run_cccccccccccc" });
+    await tick();
+
+    const view = scheduler.queueView(WS, OWNER);
+    expect(view.find((e) => e.state === "running")).toMatchObject({
+      taskId: "a",
+      runId: "run_aaaaaaaaaaaa",
+      trigger: "manual",
+    });
+    expect(view.filter((e) => e.state === "running")).toHaveLength(1);
+    // Positions count this scheduler's whole queue, as tasks__run's do.
+    expect(view.filter((e) => e.state === "queued")).toEqual([
+      { taskId: "b", state: "queued", position: 1 },
+      { taskId: "c", state: "queued", position: 2, runId: "run_cccccccccccc" },
+    ]);
+    expect(scheduler.queueView(WS, "usr_other").map((e) => [e.taskId, e.state])).toEqual([
+      ["x", "running"],
+    ]);
+    expect(scheduler.queueView("ws_ffffffffffffffff", OWNER)).toEqual([]);
+
+    releaseAll();
+    await tick();
+    releaseAll();
+    await tick();
+    expect(scheduler.queueView(WS, OWNER)).toEqual([]);
     scheduler.stop();
   });
 

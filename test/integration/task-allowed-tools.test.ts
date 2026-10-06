@@ -14,7 +14,9 @@ import type { ToolResult } from "../../src/engine/types.ts";
 import { IdentityConnectorStore } from "../../src/identity/connector-store.ts";
 import { DEV_IDENTITY } from "../../src/identity/providers/dev.ts";
 import type {
+  TasksBatchOutput,
   TasksCreateOutput,
+  TasksRunBatchOutput,
   TasksRunOutput,
   TasksUpdateOutput,
 } from "../../src/platform/schemas/tasks.ts";
@@ -314,7 +316,7 @@ describe("an unattended run whose declared tools are unavailable", () => {
       body: "Summarize contacts.",
     });
 
-    expect(out.created).toBe(true);
+    expect(out.task.id).toBe("warn-missing-tools");
     expect(out.warnings?.map((warning) => warning.code)).toEqual([
       "allowed_tool_unavailable",
       "allowed_tool_unavailable",
@@ -329,7 +331,7 @@ describe("an unattended run whose declared tools are unavailable", () => {
 
   it("checks the updated task's full list, including a granted personal connector", async () => {
     const out = await callTask<TasksUpdateOutput>("update", {
-      name: "warn-missing-tools",
+      taskId: "warn-missing-tools",
       manifest: { allowedTools: ["files__*", "my_granola__*", "nb__search"] },
     });
     expect(out.updated).toBe(true);
@@ -338,7 +340,7 @@ describe("an unattended run whose declared tools are unavailable", () => {
 
   it("warns on update when a newly declared tool is unavailable", async () => {
     const out = await callTask<TasksUpdateOutput>("update", {
-      name: "warn-missing-tools",
+      taskId: "warn-missing-tools",
       manifest: { allowedTools: ["files__*", "mail__send"] },
     });
     expect(out.updated).toBe(true);
@@ -349,8 +351,10 @@ describe("an unattended run whose declared tools are unavailable", () => {
   it("warns on an inline run even when the missing tool makes the run fail", async () => {
     recorded.calls.length = 0;
     const out = await callTask<TasksRunOutput>("run", {
-      prompt: "Summarize contacts.",
-      allowedTools: ["crm__*", "my_granola__*"],
+      definition: {
+        body: "Summarize contacts.",
+        manifest: { allowedTools: ["crm__*", "my_granola__*"] },
+      },
       idempotencyKey: "warn-inline-missing-tools",
     });
     if (!("run" in out)) throw new Error(`expected a finished run, got ${JSON.stringify(out)}`);
@@ -358,5 +362,29 @@ describe("an unattended run whose declared tools are unavailable", () => {
     expect(out.warnings?.map((warning) => warning.code)).toEqual(["allowed_tool_unavailable"]);
     expect(out.warnings?.[0]?.message).toContain('"crm__*"');
     expect(recorded.calls).toHaveLength(0);
+  });
+
+  it("warns when running a saved task whose declared tool is unavailable", async () => {
+    const out = await callTask<TasksRunOutput>("run", { taskId: "warn-missing-tools" });
+    expect(out.warnings?.map((warning) => warning.code)).toEqual(["allowed_tool_unavailable"]);
+    expect(out.warnings?.[0]?.message).toStartWith("This run's allowedTools");
+  });
+
+  it("warns for both saved and inline batches with unavailable tools", async () => {
+    for (const args of [
+      { taskId: "warn-missing-tools" },
+      { definition: { body: "Summarize contacts.", manifest: { allowedTools: ["mail__send"] } } },
+    ]) {
+      const out = await callTask<TasksRunBatchOutput>("run_batch", { ...args, items: [1] });
+      expect(out.warnings?.map((warning) => warning.code)).toEqual(["allowed_tool_unavailable"]);
+      expect(out.warnings?.[0]?.message).toStartWith("This batch's allowedTools");
+      const deadline = Date.now() + 5_000;
+      for (;;) {
+        const settled = await callTask<TasksBatchOutput>("batch", { batchId: out.batch.id });
+        if (settled.batch.state === "completed") break;
+        if (Date.now() > deadline) throw new Error(`batch never settled: ${out.batch.id}`);
+        await Bun.sleep(25);
+      }
+    }
   });
 });
