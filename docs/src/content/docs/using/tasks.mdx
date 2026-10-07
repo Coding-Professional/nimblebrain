@@ -206,6 +206,8 @@ Every tool names a task by its id (`taskId`, as `tasks__list` returns it) and a 
 
 </Steps>
 
+When you create or update a task with `allowedTools`, the response warns if an entry matches no tool currently available to the task's owner in that workspace. The warning appears in the message and as `warnings` with code `allowed_tool_unavailable`, one per unmatched entry. The task is saved: you can connect or grant a tool later, or correct the entry. A run with an unmatched entry fails before its first model call. `tasks__run` and `tasks__run_batch` responses also carry the warning for saved tasks and inline one-off definitions. Granted personal connectors use `my_` names, such as `my_granola__*`.
+
 ### As an MCP task
 
 On the `2026-07-28` protocol, a client that declares the MCP tasks extension (`io.modelcontextprotocol/tasks`) on its call gets a task handle back at once instead of an answer. The handle names the run, and the run's record is written before the handle is returned, so a lost connection or a restart of the runtime does not lose it. Poll it with `tasks/get` and stop it with `tasks/cancel`; only the identity that started the run, in the workspace it started in, can read or cancel it, and anyone else gets "task not found".
