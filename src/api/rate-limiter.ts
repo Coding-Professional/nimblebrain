@@ -11,11 +11,6 @@ export class RequestRateLimiter {
     private readonly windowMs: number,
   ) {}
 
-  /** Configured window duration in seconds. */
-  get windowSeconds(): number {
-    return Math.ceil(this.windowMs / 1000);
-  }
-
   /** Start periodic cleanup of expired windows. */
   start(): void {
     if (this.cleanupTimer) return;

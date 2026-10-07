@@ -46,11 +46,6 @@ describe("RequestRateLimiter", () => {
     expect(limiter.consume("user-1")).toBe(true);
   });
 
-  it("exposes windowSeconds", () => {
-    expect(new RequestRateLimiter(10, 60_000).windowSeconds).toBe(60);
-    expect(new RequestRateLimiter(10, 30_000).windowSeconds).toBe(30);
-  });
-
   it("returns the remaining fixed-window time without extending it on rejection", () => {
     const now = spyOn(Date, "now").mockReturnValue(1_000);
     try {
