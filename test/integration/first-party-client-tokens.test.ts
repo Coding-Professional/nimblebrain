@@ -21,6 +21,7 @@ import type { webcrypto } from "node:crypto";
 import { cpSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { WorkOS } from "@workos-inc/node";
 import { mcpResourceUrl } from "../../src/api/mcp-resource.ts";
 import type { ChatStartResponse } from "../../src/api/schemas/responses.ts";
 import { type ServerHandle, startServer } from "../../src/api/server.ts";
@@ -28,9 +29,11 @@ import type { WorkosAuth } from "../../src/identity/instance.ts";
 import { WorkosIdentityProvider } from "../../src/identity/providers/workos.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
+import { buildMcpRequest } from "../../web/src/mcp-bridge-client.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 import { fakeFetch } from "../helpers/fake-fetch.ts";
 import { readJson } from "../helpers/http.ts";
+import { stub } from "../helpers/stub.ts";
 
 /** What `POST …/chat/start` answers: the turn runs on, the id comes back now. */
 
@@ -96,12 +99,14 @@ function channelsLike(clientId: string): Promise<string> {
 
 // ── A runtime and server per configuration ────────────────────────
 
+/** The WorkOS user-management client, of which sign-in calls `getUser` and `listOrganizationMemberships`. */
+type UserManagement = WorkOS["userManagement"];
+
 function workosProvider(config: Partial<WorkosAuth>): WorkosIdentityProvider {
   const provider = new WorkosIdentityProvider(
     {
       adapter: "workos",
       clientId: ENV_CLIENT_ID,
-      redirectUri: "http://localhost/callback",
       organizationId: "org_test",
       apiKey: "sk_test_fake",
       authkitDomain: AUTHKIT_DOMAIN,
@@ -109,28 +114,45 @@ function workosProvider(config: Partial<WorkosAuth>): WorkosIdentityProvider {
     },
     undefined,
   );
-  const workos = (provider as unknown as { workos: Record<string, unknown> }).workos;
-  workos.userManagement = {
-    getUser: async (id: string) => ({
+  const now = new Date().toISOString();
+  const userManagement = stub<UserManagement>({
+    getUser: async (id) => ({
+      object: "user",
       id,
       email: `${id}@example.com`,
+      emailVerified: true,
+      profilePictureUrl: null,
+      name: "Test User",
       firstName: "Test",
       lastName: "User",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      lastSignInAt: null,
+      locale: null,
+      createdAt: now,
+      updatedAt: now,
+      externalId: null,
+      metadata: {},
     }),
-    listOrganizationMemberships: async (opts: { userId: string; organizationId: string }) => ({
-      data: [
-        {
-          id: "om_test",
-          userId: opts.userId,
-          organizationId: opts.organizationId,
-          role: { slug: "member" },
-          status: "active",
-        },
-      ],
-    }),
-  };
+    listOrganizationMemberships: async (opts) =>
+      stub<Awaited<ReturnType<UserManagement["listOrganizationMemberships"]>>>({
+        data: [
+          {
+            object: "organization_membership",
+            id: "om_test",
+            userId: "userId" in opts ? opts.userId : "",
+            organizationId: "organizationId" in opts ? opts.organizationId : "",
+            organizationName: "Test Org",
+            role: { slug: "member" },
+            status: "active",
+            directoryManaged: false,
+            createdAt: now,
+            updatedAt: now,
+            customAttributes: {},
+          },
+        ],
+      }),
+  });
+  // biome-ignore lint/complexity/useLiteralKeys: workos is private; bracket access is TypeScript's typed path to it
+  provider["workos"] = stub<WorkOS>({ userManagement });
   provider.fetcher = fakeFetch(async (input) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (url !== `${AUTHKIT_ISSUER}/oauth2/jwks`) return new Response("Not Found", { status: 404 });
@@ -211,24 +233,13 @@ function bootstrap(base: string, token: string): Promise<Response> {
   return fetch(`${base}/v1/bootstrap`, { headers: { Authorization: `Bearer ${token}` } });
 }
 
-function mcpInitialize(base: string, wsId: string, token: string): Promise<Response> {
+/** The 2026-07-28 `server/discover` an MCP client opens with, under `token`. */
+function mcpDiscover(base: string, wsId: string, token: string): Promise<Response> {
+  const { headers, body } = buildMcpRequest("1", "server/discover", {});
   return fetch(`${base}/mcp/${wsId}`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "first-party-client-test", version: "1.0.0" },
-      },
-    }),
+    headers: { ...headers, Authorization: `Bearer ${token}` },
+    body,
   });
 }
 
@@ -247,7 +258,7 @@ describe("a channels-like token whose client_id is listed", () => {
   });
 
   it("is admitted at /mcp/<member ws>, though its aud names no resource", async () => {
-    const res = await mcpInitialize(configured, wsMember, await channelsLike(CHANNELS_CLIENT_ID));
+    const res = await mcpDiscover(configured, wsMember, await channelsLike(CHANNELS_CLIENT_ID));
     expect(res.status).toBe(200);
   });
 
@@ -259,14 +270,14 @@ describe("a channels-like token whose client_id is listed", () => {
     });
     expect((await chatStart(configured, wsMember, token)).status).toBe(401);
     expect((await bootstrap(configured, token)).status).toBe(401);
-    expect((await mcpInitialize(configured, wsMember, token)).status).toBe(401);
+    expect((await mcpDiscover(configured, wsMember, token)).status).toBe(401);
   });
 
   it("gets the unknown-workspace 404 for a workspace its user does not belong to", async () => {
     const token = await channelsLike(CHANNELS_CLIENT_ID);
     for (const [label, send] of [
       ["chat/start", (ws: string) => chatStart(configured, ws, token)],
-      ["/mcp", (ws: string) => mcpInitialize(configured, ws, token)],
+      ["/mcp", (ws: string) => mcpDiscover(configured, ws, token)],
     ] as const) {
       const foreign = await send(wsForeign);
       const unknown = await send("ws_0000000000000000");
@@ -287,14 +298,14 @@ describe("an AuthKit token whose client_id is not listed", () => {
     const token = await channelsLike(MCP_CLIENT_ID);
     expect((await chatStart(configured, wsMember, token)).status).toBe(401);
     expect((await bootstrap(configured, token)).status).toBe(401);
-    expect((await mcpInitialize(configured, wsMember, token)).status).toBe(401);
+    expect((await mcpDiscover(configured, wsMember, token)).status).toBe(401);
   });
 
   it("is refused when its aud is a first-party client ID", async () => {
     const token = await authkitToken({ client_id: MCP_CLIENT_ID, aud: CHANNELS_CLIENT_ID });
     expect((await chatStart(configured, wsMember, token)).status).toBe(401);
     expect((await bootstrap(configured, token)).status).toBe(401);
-    expect((await mcpInitialize(configured, wsMember, token)).status).toBe(401);
+    expect((await mcpDiscover(configured, wsMember, token)).status).toBe(401);
   });
 
   it("is refused when it carries no client_id", async () => {
@@ -308,12 +319,12 @@ describe("an AuthKit token whose client_id is not listed", () => {
       aud: mcpResourceUrl(wsMember),
       org_id: "org_other",
     });
-    expect((await mcpInitialize(configured, wsMember, token)).status).toBe(401);
+    expect((await mcpDiscover(configured, wsMember, token)).status).toBe(401);
   });
 
   it("is still admitted at the /mcp/<ws> its aud names, and nowhere on /v1/*", async () => {
     const token = await authkitToken({ client_id: MCP_CLIENT_ID, aud: mcpResourceUrl(wsMember) });
-    expect((await mcpInitialize(configured, wsMember, token)).status).toBe(200);
+    expect((await mcpDiscover(configured, wsMember, token)).status).toBe(200);
     expect((await chatStart(configured, wsMember, token)).status).toBe(401);
     expect((await bootstrap(configured, token)).status).toBe(401);
   });
@@ -326,7 +337,7 @@ describe("with no first-party client IDs configured", () => {
     const token = await channelsLike(CHANNELS_CLIENT_ID);
     expect((await chatStart(unconfigured, wsMember, token)).status).toBe(401);
     expect((await bootstrap(unconfigured, token)).status).toBe(401);
-    expect((await mcpInitialize(unconfigured, wsMember, token)).status).toBe(401);
+    expect((await mcpDiscover(unconfigured, wsMember, token)).status).toBe(401);
   });
 
   it("refuses it with an empty list too", async () => {

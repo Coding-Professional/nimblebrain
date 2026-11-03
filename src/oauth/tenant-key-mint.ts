@@ -1,6 +1,6 @@
 import { injectTraceparent } from "../observability/index.ts";
 import { WORKSPACE_ID_RE } from "../workspace/workspace-id-pattern.ts";
-import { ALLOWED_TID_PATTERN, EnvelopeError, signMacEnvelope } from "./envelope.ts";
+import { ALLOWED_TID_PATTERN, EnvelopeError, isUniformByte, signMacEnvelope } from "./envelope.ts";
 
 /**
  * Tenant-key MINT grant — the machine plane.
@@ -15,14 +15,12 @@ import { ALLOWED_TID_PATTERN, EnvelopeError, signMacEnvelope } from "./envelope.
  * token (`aud=<service>`, `workspace_id=<workspace>`). RLS in the service fences
  * the data by `(tenant_id, workspace_id)`.
  *
- * The request rides the SAME MAC envelope as the OAuth login assertion
- * (`signEnvelope`) — one crypto construction, `signMacEnvelope` — but its
- * payload carries `(workspace, audience, scope)` instead of a PKCE `inner`. The
- * authorizer mirrors this with a single `verifyMac` feeding either
- * `verifyAssertion` (login) or `verifyMintRequest` (mint).
+ * The request rides the SAME MAC envelope as the OAuth callback state
+ * (`signEnvelope`) — one crypto construction, `signMacEnvelope` — with a payload
+ * of `(workspace, audience, scope)`. The authorizer verifies it with
+ * `verifyMintRequest`.
  *
- * Unlike the login assertion, a missing key here is a HARD error, not a graceful
- * no-op: a service configured for tenant-key auth cannot be reached without it,
+ * A missing key here is a HARD error, not a graceful no-op: a service configured for tenant-key auth cannot be reached without it,
  * and silently falling back would surface as an opaque downstream 401. Fail at
  * the signer with a message that names the missing env var.
  */
@@ -171,6 +169,12 @@ export function readTenantIdentityFromEnv(env: NodeJS.ProcessEnv = process.env):
       "NB_MCP_AUTHORIZER_TENANT_KEY is not set; cannot mint service tokens (run `make derive-authorizer-tenant-key`)",
     );
   }
+  if (!ALLOWED_TID_PATTERN.test(tid)) {
+    throw new MintError(
+      "unprovisioned",
+      `NB_TENANT_ID="${tid}" does not match the DNS-label grammar required for tenant ids`,
+    );
+  }
   const tenantKey = Buffer.from(keyB64, "base64");
   if (tenantKey.length < MIN_TENANT_KEY_BYTES) {
     throw new MintError(
@@ -178,33 +182,38 @@ export function readTenantIdentityFromEnv(env: NodeJS.ProcessEnv = process.env):
       `NB_MCP_AUTHORIZER_TENANT_KEY must decode to >= ${MIN_TENANT_KEY_BYTES} bytes (got ${tenantKey.length})`,
     );
   }
+  // A placeholder would sign mint requests the authorizer rejects with no clear cause.
+  if (isUniformByte(tenantKey, 0) || isUniformByte(tenantKey, 0xff)) {
+    throw new MintError(
+      "invalid_key",
+      "NB_MCP_AUTHORIZER_TENANT_KEY is a placeholder pattern (all 0x00 or all 0xff); ensure HKDF derivation ran during onboarding",
+    );
+  }
   return { tid, tenantKey };
 }
 
 /**
- * Resolve the authorizer's token endpoint (the POST target) — decoupled from the
- * `iss` identity. An explicit `tokenUrl` wins (a per-connection override, or
- * `NB_FLEET_AUTHORIZER_TOKEN_URL`); otherwise it is derived from the legacy,
- * identity-overloaded issuer as `${issuer}/token` for backward-compat. Because the
- * mint never inspects `iss` (only verifiers do), the endpoint can move
- * (namespace/cluster) with ZERO token-contract change — set the new var and the
- * POST target moves while `iss` stays put. Returns `undefined` when neither is
- * configured; the caller decides whether that is an error.
+ * Refuse a deployment that names a fleet authorizer but cannot sign to it, at
+ * server start rather than at the first connect. `NB_FLEET_AUTHORIZER_TOKEN_URL`
+ * is the signal: a tenant is on the fleet when it has a token endpoint to mint at.
+ * With it unset, nothing here runs and the deployment has no fleet path.
  */
-export function resolveAuthorizerTokenUrl(
-  opts: { tokenUrl?: string; issuer?: string } = {},
-): string | undefined {
-  // Per-connection config (opts) is more specific than global env, so it wins
-  // OUTRIGHT — a connection pinned to its own authorizer via `config.issuer` /
-  // `config.tokenUrl` is never silently redirected to the global endpoint once
-  // Item 2 sets NB_FLEET_AUTHORIZER_TOKEN_URL. Within each tier, an explicit
-  // endpoint beats the issuer-derived one.
-  if (opts.tokenUrl) return opts.tokenUrl;
-  if (opts.issuer) return new URL("/token", opts.issuer).toString();
-  const envTokenUrl = process.env.NB_FLEET_AUTHORIZER_TOKEN_URL;
-  if (envTokenUrl) return envTokenUrl;
-  const envIssuer = process.env.NB_FLEET_AUTHORIZER_ISSUER;
-  return envIssuer ? new URL("/token", envIssuer).toString() : undefined;
+export function assertFleetIdentityProvisioned(env: NodeJS.ProcessEnv = process.env): void {
+  if (!env.NB_FLEET_AUTHORIZER_TOKEN_URL) return;
+  readTenantIdentityFromEnv(env);
+}
+
+/**
+ * Resolve the authorizer's token endpoint (the POST target), which is separate
+ * from the `iss` identity. A per-connection `tokenUrl` wins over the global
+ * `NB_FLEET_AUTHORIZER_TOKEN_URL`, so a connection pinned to its own authorizer
+ * is never redirected to the global one. The mint never inspects `iss` (only
+ * verifiers do), so the endpoint can move (namespace/cluster) with no
+ * token-contract change. Nothing is derived from the issuer. Returns `undefined`
+ * when neither is set; the caller decides whether that is an error.
+ */
+export function resolveAuthorizerTokenUrl(tokenUrl?: string): string | undefined {
+  return tokenUrl || process.env.NB_FLEET_AUTHORIZER_TOKEN_URL || undefined;
 }
 
 export interface MintServiceTokenOptions {

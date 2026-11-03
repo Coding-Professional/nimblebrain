@@ -3,7 +3,7 @@
  * Sync model catalog from models.dev.
  *
  * Fetches the full API, filters to supported providers (anthropic, openai,
- * google, xai), normalizes the data, and writes catalog-data.json.
+ * google, xai, greenpt), normalizes the data, and writes catalog-data.json.
  *
  * Run: bun run sync-models
  */
@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { DEFAULT_MAX_OUTPUT_TOKENS } from "../limits.ts";
 
 const API_URL = "https://models.dev/api.json";
-const SUPPORTED_PROVIDERS = ["anthropic", "openai", "google", "xai"];
+const SUPPORTED_PROVIDERS = ["anthropic", "openai", "google", "xai", "greenpt"];
 const OUTPUT_PATH = join(dirname(new URL(import.meta.url).pathname), "catalog-data.json");
 
 // Models present upstream that the platform deliberately does not surface —
@@ -35,6 +35,28 @@ const MANUAL_EXCLUSIONS = new Set<string>([
   // to xAI, so this model is unreachable rather than merely limited — upstream's
   // `tool_call: false` understates it.
   "xai:grok-4.20-multi-agent-0309",
+  // GreenPT's response-style variants of glm-5.2: the same model and price under
+  // a house writing style. A style is a prompt concern, not a model choice, and
+  // nine of them would crowd the picker around the one model they share.
+  "greenpt:glm-5.2-caveman",
+  "greenpt:glm-5.2-caveman-lite",
+  "greenpt:glm-5.2-caveman-ultra",
+  "greenpt:glm-5.2-honey",
+  "greenpt:glm-5.2-honey-lite",
+  "greenpt:glm-5.2-honey-ultra",
+  "greenpt:glm-5.2-ponytail",
+  "greenpt:glm-5.2-ponytail-lite",
+  "greenpt:glm-5.2-ponytail-ultra",
+  // Listed and priced upstream, but GreenPT's Chat Completions endpoint answers
+  // `400 Unsupported model` for each, and none is in its `/v1/models` listing.
+  "greenpt:devstral-2-123b-instruct-2512",
+  "greenpt:gemma-3-27b-it",
+  "greenpt:glm-5.1",
+  "greenpt:holo2-30b-a3b",
+  "greenpt:kimi-k2.6-fast",
+  "greenpt:pixtral-12b-2409",
+  "greenpt:qwen3-coder-30b-a3b-instruct",
+  "greenpt:voxtral-small-24b-2507",
 ]);
 
 // Upstream reports each model's maximum limits, but some maxima are only
@@ -49,15 +71,22 @@ const MANUAL_LIMIT_OVERRIDES: Record<string, { context?: number; output?: number
   "anthropic:claude-sonnet-4-5-20250929": { context: 200000 },
 };
 
-// Models the upstream API hasn't flagged yet but we know are scheduled for shutdown.
+// Upstream carries one rate card per model, so an introductory price that ends
+// on a published date is either right before that date or right after it. A
+// usage line stores the rates current when its call is made, and a spend
+// account reserves at catalog rates, so the catalog carries the price that
+// holds once the promotion ends: it over-records during the promotion rather
+// than under-recording, and under-reserving, after it. Each entry replaces the
+// rates named. Delete one once upstream carries the same rates.
 // Format: "<provider>:<modelId>".
-//
-// Remove an entry once models.dev catches up — either by flagging the model
-// deprecated itself, or by dropping it from the API entirely once it shuts
-// down. The second case is easy to miss and leaves a permanently dead entry:
-// `buildProviderModels` iterates only models still present upstream, so an id
-// that no longer exists there can never match again.
-const MANUAL_DEPRECATIONS = new Set<string>([]);
+const MANUAL_COST_OVERRIDES: Record<
+  string,
+  { input?: number; output?: number; cacheRead?: number }
+> = {
+  // $2 / $10 / $0.10 through 2026-11-30, then $4 / $20 / $0.20 (cache hits are
+  // 95% off input). https://ai.google.dev/gemini-api/docs/pricing
+  "google:gemini-4-argon": { input: 4, output: 20, cacheRead: 0.2 },
+};
 
 export interface RawModel {
   id: string;
@@ -69,6 +98,7 @@ export interface RawModel {
     cache_read?: number;
     cache_write?: number;
     reasoning?: number;
+    tiers?: RawCostTier[];
   };
   limit?: {
     context?: number;
@@ -87,10 +117,29 @@ export interface RawModel {
   status?: string;
 }
 
+/** A prompt-length rate card; `tier.size` is the prompt length it applies above. */
+export interface RawCostTier {
+  input?: number;
+  output?: number;
+  cache_read?: number;
+  cache_write?: number;
+  reasoning?: number;
+  tier?: { type?: string; size?: number };
+}
+
 export interface RawProvider {
   id: string;
   name: string;
   models: Record<string, RawModel>;
+}
+
+interface CatalogCostTier {
+  aboveInputTokens: number;
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  reasoning?: number;
 }
 
 interface CatalogModel {
@@ -103,6 +152,7 @@ interface CatalogModel {
     cacheRead?: number;
     cacheWrite?: number;
     reasoning?: number;
+    tiers?: CatalogCostTier[];
   };
   limits: {
     context: number;
@@ -122,24 +172,51 @@ interface CatalogModel {
   deprecated?: boolean;
 }
 
-/** Normalize a raw cost block into the catalog cost shape; optional rates are spread only when present. */
-function toCatalogCost(cost: RawModel["cost"]): CatalogModel["cost"] {
+/** The optional per-bucket rates of a raw rate card, spread only when present. */
+function optionalRates(cost: RawCostTier | undefined) {
   return {
-    input: cost?.input ?? 0,
-    output: cost?.output ?? 0,
     ...(cost?.cache_read != null ? { cacheRead: cost.cache_read } : {}),
     ...(cost?.cache_write != null ? { cacheWrite: cost.cache_write } : {}),
     ...(cost?.reasoning != null ? { reasoning: cost.reasoning } : {}),
   };
 }
 
-/** Whether a model is deprecated per upstream status or our manual shutdown list. */
-function isModelDeprecated(providerId: string, modelId: string, raw: RawModel): boolean {
-  return raw.status === "deprecated" || MANUAL_DEPRECATIONS.has(`${providerId}:${modelId}`);
+/**
+ * The prompt-length rate cards, ascending. Only `context` tiers are kept: a
+ * `context` tier's `size` is the prompt length above which the whole call bills
+ * at that card, which is the one shape `costBreakdown` prices. Any other tier
+ * type is dropped rather than misread as one.
+ */
+function toCatalogTiers(tiers: RawCostTier[] | undefined): CatalogCostTier[] {
+  return (tiers ?? [])
+    .filter((t) => t.tier?.type === "context" && typeof t.tier.size === "number")
+    .map((t) => ({
+      aboveInputTokens: t.tier?.size ?? 0,
+      input: t.input ?? 0,
+      output: t.output ?? 0,
+      ...optionalRates(t),
+    }))
+    .sort((a, b) => a.aboveInputTokens - b.aboveInputTokens);
+}
+
+/** Normalize a raw cost block into the catalog cost shape; optional rates are spread only when present. */
+function toCatalogCost(cost: RawModel["cost"]): CatalogModel["cost"] {
+  const tiers = toCatalogTiers(cost?.tiers);
+  return {
+    input: cost?.input ?? 0,
+    output: cost?.output ?? 0,
+    ...optionalRates(cost),
+    ...(tiers.length ? { tiers } : {}),
+  };
+}
+
+/** Whether upstream flags a model deprecated. */
+function isModelDeprecated(raw: RawModel): boolean {
+  return raw.status === "deprecated";
 }
 
 /** Normalize one raw model into a catalog entry; optional fields are spread only when present. */
-function toCatalogModel(providerId: string, modelId: string, raw: RawModel): CatalogModel {
+function toCatalogModel(modelId: string, raw: RawModel): CatalogModel {
   return {
     id: modelId,
     name: raw.name || modelId,
@@ -160,7 +237,7 @@ function toCatalogModel(providerId: string, modelId: string, raw: RawModel): Cat
     },
     ...(raw.knowledge ? { knowledgeCutoff: raw.knowledge } : {}),
     ...(raw.release_date ? { releaseDate: raw.release_date } : {}),
-    ...(isModelDeprecated(providerId, modelId, raw) ? { deprecated: true } : {}),
+    ...(isModelDeprecated(raw) ? { deprecated: true } : {}),
   };
 }
 
@@ -178,7 +255,7 @@ export function buildProviderModels(
     if (!raw.cost?.input && !raw.cost?.output) continue;
     // Skip models the platform deliberately does not surface.
     if (MANUAL_EXCLUSIONS.has(`${providerId}:${modelId}`)) continue;
-    const model = toCatalogModel(providerId, modelId, raw);
+    const model = toCatalogModel(modelId, raw);
     // Skip a model upstream reports no context window for. Every budget the
     // runtime computes is `context - …`, so a zero window has no arithmetic
     // that yields a usable answer, and the cap below cannot supply one either:
@@ -231,6 +308,8 @@ export function buildProviderModels(
     }
     const limitOverride = MANUAL_LIMIT_OVERRIDES[`${providerId}:${modelId}`];
     if (limitOverride) model.limits = { ...model.limits, ...limitOverride };
+    const costOverride = MANUAL_COST_OVERRIDES[`${providerId}:${modelId}`];
+    if (costOverride) model.cost = { ...model.cost, ...costOverride };
     models[modelId] = model;
   }
 

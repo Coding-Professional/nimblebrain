@@ -16,7 +16,7 @@ import { readJson } from "../../helpers/http.ts";
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import type { McpSessionContext } from "../../../src/api/mcp-server.ts";
+import type { McpRequestContext, McpServerHost } from "../../../src/api/mcp-server.ts";
 import { requireAuth } from "../../../src/api/middleware/auth.ts";
 import { RequestRateLimiter } from "../../../src/api/rate-limiter.ts";
 import { mcpRoutes } from "../../../src/api/routes/mcp.ts";
@@ -28,6 +28,10 @@ import {
   type UserIdentity,
   type VerifiedIdentity,
 } from "../../../src/identity/provider.ts";
+import type { Runtime } from "../../../src/runtime/runtime.ts";
+import type { WorkspaceStore } from "../../../src/workspace/workspace-store.ts";
+import { stub } from "../../helpers/stub.ts";
+import { makeWorkspace } from "../../helpers/test-workspace.ts";
 
 const ORIGIN = "https://nb.example.com";
 const WS_A = "ws_00079598e311c160";
@@ -64,12 +68,12 @@ const TOKENS: Record<string, VerifiedIdentity> = {
 };
 
 const WORKSPACES = new Map([
-  [WS_A, { id: WS_A, members: [{ userId: ALICE.id, role: "member" }] }],
-  [WS_B, { id: WS_B, members: [{ userId: ALICE.id, role: "member" }] }],
+  [WS_A, makeWorkspace({ id: WS_A, members: [{ userId: ALICE.id, role: "member" }] })],
+  [WS_B, makeWorkspace({ id: WS_B, members: [{ userId: ALICE.id, role: "member" }] })],
 ]);
 
 /** What reached the MCP host, if anything. */
-let reached: McpSessionContext[] = [];
+let reached: McpRequestContext[] = [];
 
 function makeCtx(mcpLimiter = new RequestRateLimiter(10_000, 60_000)): AppContext {
   const provider = {
@@ -90,29 +94,29 @@ function makeCtx(mcpLimiter = new RequestRateLimiter(10_000, 60_000)): AppContex
     },
     deleteUser: async () => false,
   };
-  return {
+  return stub<AppContext>({
     provider,
     authOptions: {
       provider,
       eventSink: { emit: () => {} },
     },
-    runtime: { getFeatures: () => resolveFeatures() },
-    workspaceStore: { get: async (id: string) => WORKSPACES.get(id) ?? null },
-    mcpHost: {
-      handle: async (_req: Request, _features: unknown, sessionCtx: McpSessionContext) => {
+    runtime: stub<Runtime>({ getFeatures: () => resolveFeatures() }),
+    workspaceStore: stub<WorkspaceStore>({ get: async (id: string) => WORKSPACES.get(id) ?? null }),
+    mcpHost: stub<McpServerHost>({
+      handle: async (_req: Request, _features: unknown, sessionCtx: McpRequestContext) => {
         reached.push(sessionCtx);
         return Response.json({ ok: true });
       },
-    },
+    }),
     // Generous by default, so no test here meets the limit unless it asks to.
     mcpLimiter,
-  } as unknown as AppContext;
+  });
 }
 
 function makeApp(mcpLimiter?: RequestRateLimiter): Hono {
   const ctx = makeCtx(mcpLimiter);
   const app = new Hono();
-  app.route("/", mcpRoutes(ctx));
+  app.route("/", mcpRoutes(ctx, null));
   // A REST route behind the same middleware every `/v1/*` group uses.
   app.post(`/v1/workspaces/${WS_A}/tools/call`, requireAuth(ctx.authOptions), (c) =>
     c.json({ ok: true }),
@@ -275,5 +279,32 @@ describe("/mcp/<wsId> rate limit", () => {
     expect((await post(app, `/mcp/${WS_A}`, "alice-first-party")).status).toBe(200);
     expect((await post(app, `/mcp/${WS_A}`, "alice-first-party")).status).toBe(200);
     expect((await post(app, `/mcp/${WS_A}`, "alice-first-party")).status).toBe(429);
+  });
+});
+
+describe("/mcp/<wsId> browser origin", () => {
+  async function postFrom(origin: string, token?: string): Promise<Response> {
+    return makeApp().request(`${ORIGIN}/mcp/${WS_A}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: origin,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+  }
+
+  it("refuses an untrusted origin with 403 before authentication", async () => {
+    const res = await postFrom("https://evil.example.com");
+    expect(res.status).toBe(403);
+    expect(res.headers.get("WWW-Authenticate")).toBeNull();
+    expect((await postFrom("https://evil.example.com", "alice-first-party")).status).toBe(403);
+    expect(reached).toEqual([]);
+  });
+
+  it("serves the deployment's own origin", async () => {
+    const res = await postFrom(ORIGIN, "alice-first-party");
+    expect(res.status).toBe(200);
   });
 });

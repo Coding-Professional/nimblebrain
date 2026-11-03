@@ -19,8 +19,8 @@ import { recordingModel } from "../helpers/recording-model.ts";
  * This is the engine-level proof of the centerpiece: a connector overlay is
  * surfaced into the conversation history exactly once on the first matching
  * tool call (never into the system prefix), persisted as a
- * `connector.skill.injected` event, reconstructed into a synthetic history
- * message, and NOT re-injected on a subsequent turn whose history already
+ * `connector.skill.injected` event, reconstructed into the tool result that
+ * carried it live, and NOT re-injected on a subsequent turn whose history already
  * carries it. The full install → materialize → uninstall path is exercised by
  * the lifecycle integration test that drives `Runtime.chat`.
  */
@@ -111,12 +111,30 @@ function systemContent(prompt: LanguageModelV4Message[]): string {
   return sys && typeof sys.content === "string" ? sys.content : "";
 }
 
-function containsOverlay(m: LanguageModelV4Message): boolean {
+/** Whether a message carries `body`, as a text part or inside a tool result. */
+function carries(m: LanguageModelV4Message, body: string): boolean {
   return (
     m.role !== "system" &&
     Array.isArray(m.content) &&
-    m.content.some((p) => p.type === "text" && p.text.includes(OVERLAY_BODY))
+    m.content.some(
+      (p) =>
+        (p.type === "text" && p.text.includes(body)) ||
+        (p.type === "tool-result" && "value" in p.output && String(p.output.value).includes(body)),
+    )
   );
+}
+
+function containsOverlay(m: LanguageModelV4Message): boolean {
+  return carries(m, OVERLAY_BODY);
+}
+
+/**
+ * The index of a `user` message directly after a `tool` message, or -1. Some
+ * Chat Completions APIs reject that order with a 400 ("Unexpected role 'user'
+ * after role 'tool'"), so neither a live prompt nor a replayed history may hold it.
+ */
+function userAfterTool(messages: readonly { role: string }[]): number {
+  return messages.findIndex((m, i) => m.role === "user" && messages[i - 1]?.role === "tool");
 }
 
 function messagesContainOverlay(prompt: LanguageModelV4Message[]): boolean {
@@ -126,12 +144,11 @@ function messagesContainOverlay(prompt: LanguageModelV4Message[]): boolean {
 describe("connector-skill surface-once (engine + event store)", () => {
   it("delivers the overlay in the SAME run, before the model's next action", async () => {
     // The point of surfacing on first use: the guidance has to arrive before
-    // the calls it governs. It used to be emitted as an event only, so the
-    // body first appeared on the NEXT turn's rehydration — after the writes it
-    // was meant to govern, and never at all for a conversation that ends in
-    // one run.
+    // the calls it governs. Emitted as an event only, the body would first
+    // appear on the NEXT turn's rehydration — after the writes it is meant to
+    // govern, and never at all for a conversation that ends in one run.
     const store = freshStore();
-    const conv = await store.create({ ownerId: "u1" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "u1" });
     store.setActiveConversation(conv.id);
 
     await appendUser(store, conv, "send an email to a@b.com");
@@ -158,7 +175,7 @@ describe("connector-skill surface-once (engine + event store)", () => {
     // turn would rebuild a history the model never actually ran against — a
     // silent prefix divergence, not a visible failure.
     const store = freshStore();
-    const conv = await store.create({ ownerId: "u1" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "u1" });
     store.setActiveConversation(conv.id);
 
     await appendUser(store, conv, "send an email to a@b.com");
@@ -175,13 +192,18 @@ describe("connector-skill surface-once (engine + event store)", () => {
     // produced yet when that last call was sent — so the live shape is a
     // PREFIX of it. Prefix equality is also the property that matters: it is
     // the cached span the next turn reuses.
-    const replayShape = (await store.history(conv)).map((m) =>
-      containsOverlay(m as unknown as LanguageModelV4Message) ? "OVERLAY" : m.role,
+    const replayShape = asEngineInput(await store.history(conv)).map((m) =>
+      containsOverlay(m) ? "OVERLAY" : m.role,
     );
 
     expect(liveShape).toContain("OVERLAY");
     expect(replayShape.slice(0, liveShape.length)).toEqual(liveShape);
     expect(replayShape.length).toBe(liveShape.length + 1);
+    // Valid on an API that rejects a user message after a tool message, live
+    // and once the conversation is resumed from its events.
+    for (const call of rec.calls) expect(userAfterTool(call.prompt)).toBe(-1);
+    await appendUser(store, conv, "and another");
+    expect(userAfterTool(await store.history(conv))).toBe(-1);
   });
 
   it("never ends a model call on an assistant message it would be asked to continue", async () => {
@@ -190,7 +212,7 @@ describe("connector-skill surface-once (engine + event store)", () => {
     // user-visible output. The overlay lands last in the run that triggers it,
     // so its role decides whether that happens.
     const store = freshStore();
-    const conv = await store.create({ ownerId: "u1" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "u1" });
     store.setActiveConversation(conv.id);
 
     await appendUser(store, conv, "send an email to a@b.com");
@@ -210,10 +232,10 @@ describe("connector-skill surface-once (engine + event store)", () => {
 
   it("agrees live-vs-replay when two overlays fire in one iteration", async () => {
     // Two candidates match the same tool, so both surface in one iteration and
-    // land adjacent. Replay runs a role-alternation repair pass that the live
-    // path does not, so this is where the two could silently drift apart.
+    // ride the same tool result. Replay runs a role-alternation repair pass
+    // that the live path does not, so this is where the two could drift apart.
     const store = freshStore();
-    const conv = await store.create({ ownerId: "u1" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "u1" });
     store.setActiveConversation(conv.id);
 
     const twoCandidates: EngineConfig = {
@@ -247,18 +269,13 @@ describe("connector-skill surface-once (engine + event store)", () => {
     // Both bodies actually reached the model.
     const lastPrompt = rec.calls[rec.calls.length - 1]!.prompt;
     expect(messagesContainOverlay(lastPrompt)).toBe(true);
-    expect(
-      lastPrompt.some(
-        (m) =>
-          Array.isArray(m.content) &&
-          m.content.some((p) => p.type === "text" && p.text.includes(SECOND_BODY)),
-      ),
-    ).toBe(true);
+    expect(lastPrompt.some((m) => carries(m, SECOND_BODY))).toBe(true);
+    expect(userAfterTool(lastPrompt)).toBe(-1);
   });
 
   it("surfaces the overlay into history once, never into the system prefix, and holds across turns", async () => {
     const store = freshStore();
-    const conv = await store.create({ ownerId: "u1" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "u1" });
     store.setActiveConversation(conv.id);
 
     // --- Turn 1: user asks; model calls gmail__send then answers. ---
@@ -267,13 +284,13 @@ describe("connector-skill surface-once (engine + event store)", () => {
     const engine1 = new AgentEngine(rec1.model, router(), store);
     await engine1.run(config(), SYSTEM, asEngineInput(await store.history(conv)), [SEND_TOOL]);
 
-    // The overlay was surfaced into the conversation history as a synthetic
-    // assistant message — reconstructed from the persisted event.
+    // The overlay was surfaced into the conversation history inside the tool
+    // result that carried it — reconstructed from the persisted event.
     const afterTurn1 = await store.history(conv);
-    const synthetic = afterTurn1.find((m) => m.metadata?.synthetic === "connector_skill_injected");
-    expect(synthetic).toBeDefined();
-    expect(synthetic!.role).toBe("user");
-    expect(synthetic!.metadata?.skill).toBe("gmail");
+    const carrier = afterTurn1.find((m) => m.metadata?.connectorSkills?.includes("gmail"));
+    expect(carrier).toBeDefined();
+    expect(carrier!.role).toBe("tool");
+    expect(containsOverlay(carrier as LanguageModelV4Message)).toBe(true);
 
     // It NEVER entered the cached system prefix on any turn-1 model call.
     for (const call of rec1.calls) {
@@ -308,7 +325,7 @@ describe("connector-skill surface-once (engine + event store)", () => {
 
   it("never surfaces a connector overlay when no candidate's affinity matches the called tool", async () => {
     const store = freshStore();
-    const conv = await store.create({ ownerId: "u1" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "u1" });
     store.setActiveConversation(conv.id);
 
     const calendarTool: ToolSchema = {

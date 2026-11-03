@@ -31,10 +31,10 @@ afterEach(() => {
 describe("readConversation", () => {
   test("parses a well-formed JSONL file with 5 messages", async () => {
     const meta = {
+      model: "anthropic:claude-sonnet-4-6",
       id: "conv_abc123",
       createdAt: "2025-01-01T00:00:00.000Z",
       updatedAt: "2025-01-01T00:05:00.000Z",
-      title: "Test conversation",
       totalInputTokens: 500,
       totalOutputTokens: 300,
       totalCostUsd: 0.02,
@@ -64,7 +64,11 @@ describe("readConversation", () => {
       { role: "user", content: "Thanks!", timestamp: "2025-01-01T00:05:00.000Z" },
     ];
 
-    const lines = [JSON.stringify(meta), ...conversationEventLines(messages as FixtureTurn[])];
+    const lines = [
+      JSON.stringify(meta),
+      JSON.stringify({ type: "metadata.title", ts: meta.createdAt, title: "Test conversation" }),
+      ...conversationEventLines(messages as FixtureTurn[]),
+    ];
     const path = writeTmpFile("conv_abc123.jsonl", lines);
 
     const result = await readConversation(path);
@@ -81,7 +85,11 @@ describe("readConversation", () => {
   });
 
   test("applies defaults for a minimal header (only id + createdAt)", async () => {
-    const meta = { id: "conv_old001", createdAt: "2024-06-15T12:00:00.000Z" };
+    const meta = {
+      model: "anthropic:claude-sonnet-4-6",
+      id: "conv_old001",
+      createdAt: "2024-06-15T12:00:00.000Z",
+    };
     const msg: FixtureTurn = {
       role: "user",
       content: "Old message",
@@ -99,14 +107,17 @@ describe("readConversation", () => {
     expect(result!.meta.title).toBeNull();
     expect(result!.meta.totalInputTokens).toBe(0);
     expect(result!.meta.totalOutputTokens).toBe(0);
-    expect(result!.meta.totalCostUsd).toBe(0);
     expect(result!.meta.lastModel).toBeNull();
     expect(result!.messageCount).toBe(1);
     expect(result!.preview).toBe("Old message");
   });
 
   test("skips malformed lines and parses the rest", async () => {
-    const meta = { id: "conv_bad001", createdAt: "2025-02-01T00:00:00.000Z" };
+    const meta = {
+      model: "anthropic:claude-sonnet-4-6",
+      id: "conv_bad001",
+      createdAt: "2025-02-01T00:00:00.000Z",
+    };
     const [first] = conversationEventLines([
       { role: "user", content: "First", timestamp: "2025-02-01T00:01:00.000Z" },
     ]);
@@ -141,6 +152,7 @@ describe("readConversation", () => {
 
   test("handles file with only metadata line (no messages)", async () => {
     const meta = {
+      model: "anthropic:claude-sonnet-4-6",
       id: "conv_nomsg",
       createdAt: "2025-03-01T00:00:00.000Z",
       updatedAt: "2025-03-01T00:00:00.000Z",
@@ -161,7 +173,11 @@ describe("readConversation", () => {
   });
 
   test("preview is empty string when no user message exists", async () => {
-    const meta = { id: "conv_nouser", createdAt: "2025-04-01T00:00:00.000Z" };
+    const meta = {
+      model: "anthropic:claude-sonnet-4-6",
+      id: "conv_nouser",
+      createdAt: "2025-04-01T00:00:00.000Z",
+    };
     const path = writeTmpFile("conv_nouser.jsonl", [
       JSON.stringify(meta),
       ...conversationEventLines([
@@ -187,6 +203,7 @@ describe("readConversation", () => {
 describe("readConversation (event format)", () => {
   function eventMeta(id = "conv_evt001") {
     return {
+      model: "anthropic:claude-sonnet-4-6",
       id,
       createdAt: "2025-06-01T00:00:00.000Z",
       updatedAt: "2025-06-01T00:00:00.000Z",
@@ -322,66 +339,6 @@ describe("readConversation (event format)", () => {
   // Every connector skill's id is its `skill://…/SKILL.md` entrypoint, so a
   // reader taking the last path segment names them all `SKILL`. Runs recorded
   // before `name` was on the event still have to render.
-  test("derives a name for entries recorded before the field existed", async () => {
-    const runId = "run_legacy";
-    const lines = [
-      JSON.stringify(eventMeta("conv_legacy")),
-      JSON.stringify({
-        ts: "2025-06-01T00:00:00.000Z",
-        type: "user.message",
-        content: [{ type: "text", text: "hi" }],
-      }),
-      JSON.stringify({ ts: "2025-06-01T00:00:01.000Z", type: "run.start", runId }),
-      JSON.stringify({
-        ts: "2025-06-01T00:00:01.500Z",
-        type: "skills.loaded",
-        runId,
-        skills: [
-          {
-            id: "skill://acme/billing/refunds/SKILL.md",
-            layer: 3,
-            scope: "provided",
-            version: "",
-            tokens: 900,
-            contentHash: "d1",
-            loadedBy: "tool_affinity",
-            reason: "tool-affinity matched acme__*",
-          },
-          {
-            id: "/work/skills/release-notes.md",
-            layer: 0,
-            scope: "org",
-            version: "v1",
-            tokens: 300,
-            contentHash: "d2",
-            loadedBy: "always",
-            reason: "always-on",
-          },
-        ],
-        totalTokens: 1200,
-      }),
-      JSON.stringify({
-        ts: "2025-06-01T00:00:02.000Z",
-        type: "llm.response",
-        runId,
-        model: "m1",
-        content: [{ type: "text", text: "answer" }],
-        usage: { inputTokens: 10, outputTokens: 5 },
-        llmMs: 100,
-      }),
-      JSON.stringify({
-        ts: "2025-06-01T00:00:03.000Z",
-        type: "run.done",
-        runId,
-        stopReason: "complete",
-      }),
-    ];
-    const result = await readConversation(writeTmpFile("conv_legacy.jsonl", lines));
-    const skills = result!.messages[1]!.skillsLoaded!.skills;
-    expect(skills.map((s) => s.name)).toEqual(["refunds", "release-notes"]);
-    expect(skills.every((s) => s.connector === undefined)).toBe(true);
-  });
-
   test("a zero-skill turn yields no ledger metadata (old-shape events still parse)", async () => {
     const runId = "run_none";
     const lines = [
@@ -973,10 +930,10 @@ describe("readConversation (event format)", () => {
 describe("readConversationHeader", () => {
   test("reads metadata + preview + count without full message parse", async () => {
     const meta = {
+      model: "anthropic:claude-sonnet-4-6",
       id: "conv_hdr001",
       createdAt: "2025-01-01T00:00:00.000Z",
       updatedAt: "2025-01-01T00:05:00.000Z",
-      title: "Header test",
       totalInputTokens: 100,
       totalOutputTokens: 50,
       totalCostUsd: 0.01,
@@ -987,7 +944,11 @@ describe("readConversationHeader", () => {
       { role: "assistant", content: "Reply", timestamp: "2025-01-01T00:02:00.000Z" },
       { role: "user", content: "Follow up", timestamp: "2025-01-01T00:03:00.000Z" },
     ];
-    const lines = [JSON.stringify(meta), ...conversationEventLines(messages as FixtureTurn[])];
+    const lines = [
+      JSON.stringify(meta),
+      JSON.stringify({ type: "metadata.title", ts: meta.createdAt, title: "Header test" }),
+      ...conversationEventLines(messages as FixtureTurn[]),
+    ];
     const path = writeTmpFile("conv_hdr001.jsonl", lines);
 
     const result = await readConversationHeader(path);
@@ -1011,7 +972,11 @@ describe("readConversationHeader", () => {
   });
 
   test("applies backward-compat defaults", async () => {
-    const meta = { id: "conv_oldhdr", createdAt: "2024-01-01T00:00:00.000Z" };
+    const meta = {
+      model: "anthropic:claude-sonnet-4-6",
+      id: "conv_oldhdr",
+      createdAt: "2024-01-01T00:00:00.000Z",
+    };
     const path = writeTmpFile("conv_oldhdr.jsonl", [JSON.stringify(meta)]);
 
     const result = await readConversationHeader(path);
@@ -1025,7 +990,11 @@ describe("readConversationHeader", () => {
   });
 
   test("skips malformed message lines in count", async () => {
-    const meta = { id: "conv_badhdr", createdAt: "2025-01-01T00:00:00.000Z" };
+    const meta = {
+      model: "anthropic:claude-sonnet-4-6",
+      id: "conv_badhdr",
+      createdAt: "2025-01-01T00:00:00.000Z",
+    };
     const lines = [
       JSON.stringify(meta),
       ...conversationEventLines([
@@ -1044,7 +1013,12 @@ describe("readConversationHeader", () => {
   test("an empty first user message does not end the preview search", async () => {
     // The scan stops at the first user line that HAS text, not at the first
     // user line — an uploaded picture with no caption carries no preview.
-    const meta = { id: "conv_hdrnocap", createdAt: "2025-01-01T00:00:00.000Z", format: "events" };
+    const meta = {
+      model: "anthropic:claude-sonnet-4-6",
+      id: "conv_hdrnocap",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      format: "events",
+    };
     const path = writeTmpFile("conv_hdrnocap.jsonl", [
       JSON.stringify(meta),
       JSON.stringify({
@@ -1076,6 +1050,7 @@ describe("readConversationHeader", () => {
 
   function hdrEventMeta(id: string) {
     return {
+      model: "anthropic:claude-sonnet-4-6",
       id,
       createdAt: "2025-06-01T00:00:00.000Z",
       updatedAt: "2025-06-01T00:00:00.000Z",

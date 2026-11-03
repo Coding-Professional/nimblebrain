@@ -1,10 +1,13 @@
 import type { LanguageModelV4 } from "@ai-sdk/provider";
+import type { Brand } from "../brand/index.ts";
+import type { ExecutionConfig } from "../config/execution.ts";
 import type { FeatureFlags } from "../config/features.ts";
 import type { ConfirmationGate } from "../config/privilege.ts";
 import type { SecretsConfig } from "../config/secrets.ts";
 import type { TasksConfig } from "../config/tasks.ts";
 import type { ConnectorsConfig } from "../connectors/providers/config.ts";
-import type { EventSink, ThinkingEffort } from "../engine/types.ts";
+import type { EventSink, ThinkingEffort, WrapUpLimit } from "../engine/types.ts";
+import type { AgentRuntime } from "../execution/types.ts";
 import type { ContentPart, FileReference } from "../files/types.ts";
 import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
 import type { UserStore } from "../identity/user.ts";
@@ -172,23 +175,6 @@ export interface RuntimeConfig {
   confirmationGate?: ConfirmationGate;
 
   /**
-   * MCP session metadata store. Controls how sessions for `/mcp` are tracked
-   * across the cluster. Defaults to `memory` (process-local) — fine for any
-   * single-replica deploy. Set `type: "redis"` with a `redis.url` for
-   * multi-replica deploys; the registry shares session metadata across
-   * processes. See `src/api/session-store/`.
-   */
-  sessionStore?: {
-    type?: "memory" | "redis";
-    /** Idle TTL in seconds. Default: 28800 (8 h). */
-    ttlSeconds?: number;
-    redis?: {
-      url?: string;
-      keyPrefix?: string;
-    };
-  };
-
-  /**
    * Durable usage ledger — one JSONL line per priced LLM call, under
    * `{workDir}/usage/`. See `src/usage/ledger.ts`.
    */
@@ -236,18 +222,16 @@ export interface RuntimeConfig {
    */
   secrets?: SecretsConfig;
 
+  /**
+   * White-label branding: name, logos, accent colour, fonts. Absent is
+   * NimbleBrain. Validated and installed by `loadBrand` (`src/brand/`).
+   */
+  brand?: Brand;
+
   /** Anonymous telemetry configuration. */
   telemetry?: {
     /** Enable anonymous telemetry. Default: true. */
     enabled?: boolean;
-  };
-
-  /** Legacy tenant defaults; `preferences` takes precedence over both. */
-  home?: {
-    /** Legacy fallback for `preferences.displayName`. */
-    userName?: string;
-    /** IANA timezone (e.g., "Pacific/Honolulu"). Empty uses system timezone. */
-    timezone?: string;
   };
 
   /**
@@ -268,24 +252,24 @@ export interface RuntimeConfig {
    */
   tasks?: TasksConfig;
 
+  /**
+   * Which agent runtime executes a run, and the external runtimes the
+   * installation reaches. See `src/config/execution.ts`.
+   */
+  execution?: ExecutionConfig;
+
+  /**
+   * Runtimes an embedder or a test hands the runtime directly, beside those
+   * `execution.runtimes` configures. `execution.default` may name any of them.
+   */
+  agentRuntimes?: AgentRuntime[];
+
   /** File context configuration. */
   files?: {
     maxFileSize?: number;
     maxTotalSize?: number;
     maxFilesPerMessage?: number;
     maxExtractedTextSize?: number;
-  };
-
-  /** User preferences for personalization. */
-  preferences?: {
-    /** Display name. Falls back to home.userName. */
-    displayName?: string;
-    /** IANA timezone. Falls back to home.timezone. */
-    timezone?: string;
-    /** BCP 47 locale. Default: "en-US". */
-    locale?: string;
-    /** Color theme. Default: "system". */
-    theme?: "system" | "light" | "dark";
   };
 }
 
@@ -310,7 +294,7 @@ export interface ChatRequest {
    * The workspace the chat is *focused* on (the `/w/:slug` the user is
    * viewing, plumbed from the workspace in the chat URL). Drives the
    * deterministic, workspace-scoped **briefing**: the Installed Apps
-   * section and the org/workspace instruction overlays reflect THIS
+   * section reflects THIS
    * workspace, identical for every member (no per-user generation).
    *
    * It is ALSO the tool scope: a session is walled to this one workspace —
@@ -369,10 +353,11 @@ export interface ChatRequest {
  * Detailed usage breakdown for a single chat turn.
  *
  * Carries the canonical TokenUsage plus runtime-added fields. NO costUsd —
- * cost is a derived value computed at the API boundary from
- * `cost(model, usage)`. Storing it here would invite the same drift bug
- * that double-billed cache tokens (issue #140): a stored derived value
- * that consumers forgot to refresh when its inputs changed.
+ * a turn's cost is `ChatResult.costUsd`, priced call by call, because a sum
+ * of calls' tokens does not determine their price once a model has
+ * prompt-length rate cards. Storing it here would also invite the drift bug
+ * that double-billed cache tokens (issue #140): a stored derived value that
+ * consumers forgot to refresh when its inputs changed.
  */
 export interface TurnUsage extends TokenUsage {
   model: string;
@@ -390,9 +375,9 @@ export interface ChatResult {
    * carrying the reserved `my_` marker. Stored raw; display name and friendly
    * name are rendered on the fly. The workspace is NOT in the name — it is the
    * session's, resolved from the conversation. There is no top-level
-   * `ChatResult.workspaceId` field (removed by T006 — different tool
-   * calls in the same turn can land in different workspaces, so a
-   * single result-level workspaceId would be misleading).
+   * `ChatResult.workspaceId` field (different tool calls in the same
+   * turn can land in different workspaces, so a single result-level
+   * workspaceId would be misleading).
    */
   toolCalls: Array<{
     id: string;
@@ -403,10 +388,18 @@ export interface ChatResult {
     ms: number;
     /** Structured failure reason when `ok === false`. See ToolCallRecord.errorReason. */
     errorReason?: string;
+    /** The call did not run; it waited for its tool's guidance. See ToolCallRecord.held. */
+    held?: true;
   }>;
   stopReason: string;
   /** Detailed usage breakdown for this turn. */
   usage: TurnUsage;
+  /**
+   * The run's cost in USD: each model call priced on its own rate card, then
+   * summed. Not derivable from `usage`, which sums the calls' tokens, once a
+   * model's price depends on prompt length.
+   */
+  costUsd: number;
 }
 
 /**
@@ -466,6 +459,11 @@ export interface TaskRequest {
    */
   workspaceId?: string;
   model?: string;
+  /**
+   * Reasoning depth for this run, in place of `RuntimeConfig.thinkingEffort`.
+   * Absent = the configured depth. See `RunSpec.thinkingEffort`.
+   */
+  thinkingEffort?: ThinkingEffort;
   maxIterations?: number;
   /**
    * Input tokens the whole run may spend, summed over every model call. Before
@@ -474,6 +472,12 @@ export interface TaskRequest {
    * Absent = no cap.
    */
   maxRunInputTokens?: number;
+  /**
+   * The run's wall-clock limit, which the caller enforces with `signal` (the
+   * tasks executor's timeout). The door bounds the run's model credential by it
+   * (`RunBudget.maxRunDurationMs`). Absent = the installation's ceiling.
+   */
+  maxRunDurationMs?: number;
   /**
    * The spend accounts the run draws on: opaque ids the caller chose, each with
    * a unit and the amount remaining. Runs in flight that name the same id share
@@ -484,6 +488,12 @@ export interface TaskRequest {
   spendAccounts?: SpendAccount[];
   /** Glob patterns filtering which tools are available. Matches use the same logic as chat. */
   allowedTools?: string[];
+  /**
+   * Skills, by catalog name, the run is given in full in its system prompt,
+   * before its first model call. A name the workspace does not offer refuses the
+   * run (`DeclaredSkillsUnavailableError`).
+   */
+  skills?: string[];
   /**
    * Arbitrary metadata. The tasks executor stamps `source` and
    * `taskId` here so the run is correlated to its task in logs
@@ -529,7 +539,7 @@ export interface TaskRequest {
  * Modeled on `ChatResult` but with chat-specific fields removed:
  *  - No `skillName` — task mode does not perform skill matching on the
  *    prompt; connector-affined skills still surface via Layer 3.
- *  - `response` renamed to `output` to reflect the deliverable contract.
+ *  - `output` rather than `response`, to reflect the deliverable contract.
  *  - `runId` is a traceability anchor — the id of the run, under which the
  *    caller (the tasks app) persists the run result (output +
  *    activity log + output-file refs). No conversation is created.
@@ -557,6 +567,8 @@ export interface TaskResult {
     ms: number;
     /** Structured failure reason when `ok === false`. See ToolCallRecord.errorReason. */
     errorReason?: string;
+    /** The call did not run; it waited for its tool's guidance. See ToolCallRecord.held. */
+    held?: true;
   }>;
   stopReason: string;
   /**
@@ -569,5 +581,20 @@ export interface TaskResult {
   finishReasonRaw?: string;
   /** The account that stopped the run, when `stopReason` is `spend_limit`. */
   spendAccountId?: string;
+  /** See `EngineResult.wrapUpLimit`. */
+  wrapUpLimit?: WrapUpLimit;
   usage: TurnUsage;
+  /** The run's cost in USD; see `ChatResult.costUsd`. */
+  costUsd: number;
+  /**
+   * Every skill the run was given, or that missed it, in order: the ones it
+   * declared, the ones delivered before a held call or after a promotion, and
+   * the ones it loaded from the catalog. A task run has no conversation log, so
+   * this is where its skill loads are read back.
+   */
+  skillsDelivered?: Array<{
+    name: string;
+    loadedBy: "declared" | "before_call" | "tool_use" | "activation";
+    status?: "fetch_failed" | "capped" | "renamed_unheld";
+  }>;
 }

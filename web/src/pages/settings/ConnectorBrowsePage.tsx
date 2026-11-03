@@ -13,7 +13,10 @@ import {
 } from "../../api/client";
 import { ComposioApiKeyModal } from "../../components/connectors/ComposioApiKeyModal";
 import { ConnectorIcon } from "../../components/connectors/ConnectorIcon";
-import { OperatorSetupModal } from "../../components/connectors/OperatorSetupModal";
+import {
+  OAuthClientSetupModal,
+  type OAuthClientSetupTarget,
+} from "../../components/connectors/OAuthClientSetupModal";
 import { SecretHeadersModal } from "../../components/connectors/SecretHeadersModal";
 import { Button } from "../../components/ui/button";
 import { useCanWriteActiveWorkspace } from "../../hooks/useScopedRole";
@@ -51,11 +54,11 @@ export function ConnectorBrowsePage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   // Entries installed during this visit, catalog id → serverName. Kept apart
-  // from `installed` so a directory refetch (after operator setup) cannot move
+  // from `installed` so a directory refetch (after OAuth client setup) cannot move
   // a card the user just installed into the Installed section.
   const [justInstalled, setJustInstalled] = useState<ReadonlyMap<string, string>>(new Map());
   const [query, setQuery] = useState("");
-  const [setupModalEntry, setSetupModalEntry] = useState<CatalogListing | null>(null);
+  const [setupModalEntry, setSetupModalEntry] = useState<OAuthClientSetupTarget | null>(null);
   // API-key Composio connector: after install we collect the key fields in a
   // modal (no OAuth redirect), then call connect_api_key. Holds the entry +
   // its installed serverName so success can route to Configure.
@@ -177,7 +180,7 @@ export function ConnectorBrowsePage() {
     result: InstallResult,
   ): Promise<boolean> => {
     const { serverName } = result;
-    // A provider-auth (platform) source has no user/operator OAuth — its
+    // A provider-auth (platform) source has no user OAuth and no OAuth client — its
     // credential is minted server-side and it eager-starts `running` at install.
     // So there's no auth flow to launch. Launching initiateMcpOAuth here would
     // spin a bogus OAuth flow against a server that has none.
@@ -311,7 +314,7 @@ export function ConnectorBrowsePage() {
               canManage={canManage}
               configurePath={configurePath}
               onInstall={() => onInstall(entry)}
-              onSetUp={() => setSetupModalEntry(entry)}
+              onSetUp={() => setSetupModalEntry(oauthClientSetupTarget(entry))}
             />
           )}
           configurePathFor={(entry) => {
@@ -323,13 +326,13 @@ export function ConnectorBrowsePage() {
       )}
 
       {setupModalEntry && (
-        <OperatorSetupModal
+        <OAuthClientSetupModal
           entry={setupModalEntry}
           // Pre-filling the existing clientId across renders is a v2
           // concern — list_installed doesn't echo the clientId today
           // (intentional: secret-or-not, surfacing identifiers from
           // workspace.json deserves its own response shape). For now
-          // the operator re-enters on rotate.
+          // the admin re-enters on rotate.
           open={true}
           onClose={() => setSetupModalEntry(null)}
           onSaved={() => {
@@ -400,7 +403,7 @@ function DirectoryResults({
   return (
     <>
       {available.length > 0 ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 @md/settings:grid-cols-2 gap-3">
           {available.map((entry) => renderCard(entry, configurePathFor(entry)))}
         </div>
       ) : (
@@ -413,7 +416,7 @@ function DirectoryResults({
       {installedEntries.length > 0 && (
         <section className="space-y-3 pt-2">
           <h2 className="text-sm font-medium text-muted-foreground">Installed</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 @md/settings:grid-cols-2 gap-3">
             {installedEntries.map(({ entry, serverName }) =>
               renderCard(entry, installedPathFor(serverName)),
             )}
@@ -422,6 +425,20 @@ function DirectoryResults({
       )}
     </>
   );
+}
+
+/**
+ * What Set up hands the OAuth client dialog. A catalog listing carries the vendor
+ * portal and secret key under `install`, only on a remote-OAuth install; the
+ * dialog reads a top-level `oauthClientSetup` and renders nothing without one.
+ */
+export function oauthClientSetupTarget(entry: CatalogListing): OAuthClientSetupTarget {
+  return {
+    id: entry.id,
+    name: entry.name,
+    oauthClientSetup:
+      entry.install.kind === "remote-oauth" ? entry.install.oauthClientSetup : undefined,
+  };
 }
 
 /**
@@ -467,8 +484,8 @@ function DirectoryCard({
   onSetUp: () => void;
 }) {
   const isStaticAuth = entry.install.kind === "remote-oauth" && entry.install.auth === "static";
-  const operatorReady = entry.operatorConfigured === true;
-  // Say it on the card, not once the dialog appears. `operatorConfigured` already
+  const oauthClientReady = entry.oauthClientConfigured === true;
+  // Say it on the card, not once the dialog appears. `oauthClientConfigured` already
   // distinguishes a static-auth entry that is ready from one that is not; this is
   // the same disclosure for the other thing an install can ask for.
   const secretCount = configurePath ? 0 : secretHeaderFields(entry.install).length;
@@ -497,7 +514,7 @@ function DirectoryCard({
           canManage={canManage}
           configurePath={configurePath}
           isStaticAuth={isStaticAuth}
-          operatorReady={operatorReady}
+          oauthClientReady={oauthClientReady}
           onInstall={onInstall}
           onSetUp={onSetUp}
         />
@@ -516,7 +533,7 @@ export function CardAction({
   canManage,
   configurePath,
   isStaticAuth,
-  operatorReady,
+  oauthClientReady,
   onInstall,
   onSetUp,
 }: {
@@ -525,17 +542,17 @@ export function CardAction({
   /** Set when the entry is installed in this workspace: its Configure page. */
   configurePath?: string;
   isStaticAuth: boolean;
-  operatorReady: boolean;
+  oauthClientReady: boolean;
   onInstall: () => void;
   onSetUp: () => void;
 }) {
   // Outline rather than filled: a grid of 30+ buttons reads as noise with a
   // bold primary fill on every card. The portal URL lives in
-  // OperatorSetupModal, so no per-card hint is needed here.
+  // OAuthClientSetupModal, so no per-card hint is needed here.
   //
   // Static-auth flow:
   //   - not configured + admin     → Set up
-  //   - not configured + non-admin → "Operator setup required"
+  //   - not configured + non-admin → "Needs an OAuth client"
   //   - configured                 → Install (rotation lives on Configure now)
   //
   // Installed comes first, for every role: it is a fact about the workspace,
@@ -553,13 +570,13 @@ export function CardAction({
       </div>
     );
   }
-  if (isStaticAuth && !operatorReady) {
+  if (isStaticAuth && !oauthClientReady) {
     return canManage ? (
       <Button type="button" variant="outline" size="sm" onClick={onSetUp}>
         Set up
       </Button>
     ) : (
-      <span className="text-xs text-muted-foreground">Operator setup required</span>
+      <span className="text-xs text-muted-foreground">Needs an OAuth client</span>
     );
   }
   // Every remaining path is an install, and installing is a workspace-scoped

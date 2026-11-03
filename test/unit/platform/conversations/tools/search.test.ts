@@ -38,10 +38,11 @@ function writeConversation(dir: string, id: string, opts: WriteOpts = {}): void 
   const updatedAt = opts.updatedAt ?? createdAt;
 
   const meta = JSON.stringify({
+    model: "anthropic:claude-sonnet-4-6",
+    ownerId: "usr_test",
     id,
     createdAt,
     updatedAt,
-    title: opts.title ?? null,
     totalInputTokens: 500,
     totalOutputTokens: 200,
     totalCostUsd: 0.05,
@@ -55,6 +56,10 @@ function writeConversation(dir: string, id: string, opts: WriteOpts = {}): void 
 
   const lines = [
     meta,
+    // The title is a `metadata.title` event; line 1 never carries one.
+    ...(opts.title
+      ? [JSON.stringify({ type: "metadata.title", ts: createdAt, title: opts.title })]
+      : []),
     ...conversationEventLines(
       messages.map((m) => ({ ...m, timestamp: m.timestamp ?? createdAt })) as FixtureTurn[],
     ),

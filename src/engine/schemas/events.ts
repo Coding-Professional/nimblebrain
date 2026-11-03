@@ -61,13 +61,7 @@ const WritableSkillScope = Type.Union([
 
 export const SkillsLoadedEntry = Type.Object({
   id: Type.String(),
-  name: Type.Optional(
-    Type.String({
-      description:
-        "The skill's own name. Optional because events recorded before the " +
-        "field existed are read back through this shape.",
-    }),
-  ),
+  name: Type.String({ description: "The skill's own name." }),
   connector: Type.Optional(
     Type.String({ description: "MCP server that published the skill, when one did." }),
   ),
@@ -106,13 +100,6 @@ export const ContextAssembledSource = Type.Object({
   userId: Type.Optional(Type.String()),
   messages: Type.Optional(
     Type.Number({ description: "`history`: how many messages the windowed history holds." }),
-  ),
-  turns: Type.Optional(
-    Type.Number({
-      description:
-        "`history`, as recorded before `messages` existed — the same message " +
-        "count under a name that read as conversational turns.",
-    }),
   ),
   compacted: Type.Optional(Type.Boolean()),
 });
@@ -181,8 +168,9 @@ export type SkillDeletedPayload = Static<typeof SkillDeletedPayload>;
 /**
  * `connector.skill.injected` — a curated connector overlay surfaced into
  * the conversation history for the first time, triggered by a matching
- * connector tool call. The reconstructor turns this into a synthetic
- * message; the body is wrapped in `<connector-skill>` containment at that point.
+ * connector tool call. The reconstructor appends it to a tool result of the
+ * iteration that delivered it; the body is wrapped in `<connector-skill>`
+ * containment at that point.
  */
 export const ConnectorSkillInjectedPayload = Type.Object({
   /** Engine-attached run id for debug/correlation. */
@@ -193,10 +181,33 @@ export const ConnectorSkillInjectedPayload = Type.Object({
   skillName: Type.String(),
   /** The overlay body (markdown), surfaced verbatim into history. */
   skillBody: Type.String(),
-  /** Scope label for containment / telemetry. Always `"connector"` in v1. */
+  /** Storage tier, or `connector` for a curated overlay. */
   scope: Type.String(),
+  /**
+   * The call held until this body arrived. Absent when the body followed a
+   * call that ran, or a promotion.
+   */
+  heldToolCallId: Type.Optional(Type.String()),
 });
 export type ConnectorSkillInjectedPayload = Static<typeof ConnectorSkillInjectedPayload>;
+
+/**
+ * `skill.not_delivered` — a skill bound to a called tool did not reach the
+ * model on that call: its body could not be fetched, one delivery's size limit
+ * left it out, or a `beforeToolCall` hook renamed the call past the hold. Recorded
+ * so the load ledger shows the gap instead of silence.
+ */
+export const SkillNotDeliveredPayload = Type.Object({
+  runId: Type.String(),
+  toolName: Type.String(),
+  skillName: Type.String(),
+  reason: Type.Union([
+    Type.Literal("fetch_failed"),
+    Type.Literal("capped"),
+    Type.Literal("renamed_unheld"),
+  ]),
+});
+export type SkillNotDeliveredPayload = Static<typeof SkillNotDeliveredPayload>;
 
 export const NotificationCreatedPayload = Type.Object({
   workspaceId: Type.String({
@@ -287,8 +298,8 @@ export type AdminToolCallPayload = Static<typeof AdminToolCallPayload>;
 /** A chat turn's conversation is resolved and the run is about to start. */
 export const ChatStartPayload = Type.Object({
   conversationId: Type.String(),
-  /** The conversation's bound model; absent when it has none. */
-  model: Type.Optional(Type.String()),
+  /** The conversation's bound model. */
+  model: Type.String(),
 });
 export type ChatStartPayload = Static<typeof ChatStartPayload>;
 
@@ -317,6 +328,23 @@ export const RunDonePayload = Type.Object({
   totalMs: Type.Number(),
 });
 export type RunDonePayload = Static<typeof RunDonePayload>;
+
+/**
+ * The agent runtime a run executes on, and that runtime's own session for it.
+ * A conversation's runs may each execute on a different runtime; this is the
+ * map from a run to where it ran.
+ */
+export const ExecutionBoundPayload = Type.Object({
+  runId: Type.String(),
+  runtime: Type.String({ description: "The runtime's name in `execution.runtimes`, or `native`." }),
+  runtimeSessionId: Type.Optional(
+    Type.String({
+      description:
+        "The runtime's own session id (an ACP sessionId), when it has one. Meaningful to that runtime only.",
+    }),
+  ),
+});
+export type ExecutionBoundPayload = Static<typeof ExecutionBoundPayload>;
 
 /** A run failed. */
 export const RunErrorPayload = Type.Object({
@@ -378,6 +406,11 @@ export const ToolDonePayload = Type.Object({
   resourceLinks: Type.Optional(opaque<ResourceLinkInfo[]>("MCP `resource_link` blocks.")),
   supervisorTripped: Type.Optional(Type.Literal(true)),
   trippedTool: Type.Optional(Type.String()),
+  held: Type.Optional(
+    Type.Literal(true, {
+      description: "The call did not run; it waits for guidance the model has not read yet.",
+    }),
+  ),
   consecutiveRepeats: Type.Optional(Type.Number()),
   workspaceId: Type.Optional(
     Type.String({ description: "The workspace the call ran in, stamped by the runtime." }),
@@ -419,6 +452,12 @@ export const LlmDonePayload = Type.Object({
   estimatedInputTokens: Type.Number(),
   finishReason: opaque<FinishReason>("AI SDK unified finish reason."),
   finishReasonRaw: Type.Optional(Type.String({ description: "The provider's own stop reason." })),
+  transcriptOnly: Type.Optional(
+    Type.Boolean({
+      description:
+        "Content an external agent's turn produced, recorded for replay: not a model call, so not counted or priced.",
+    }),
+  ),
 });
 export type LlmDonePayload = Static<typeof LlmDonePayload>;
 
@@ -663,6 +702,7 @@ export interface EngineEventPayloads {
   "run.start": RunStartPayload;
   "run.done": RunDonePayload;
   "run.error": RunErrorPayload;
+  "execution.bound": ExecutionBoundPayload;
   "text.delta": TextDeltaPayload;
   "reasoning.delta": TextDeltaPayload;
   "tool.preparing": ToolPreparingPayload;
@@ -686,8 +726,8 @@ export interface EngineEventPayloads {
   /**
    * A curated connector-skill overlay was surfaced into the conversation for
    * the first time, triggered by a matching connector tool call. The
-   * reconstructor turns this into a synthetic message carrying the skill
-   * body, placed after the tool results of the iteration that triggered it, so
+   * reconstructor appends the skill body to a tool result of the iteration
+   * that delivered it, so
    * the guidance rides the cached, append-only history and is in context for
    * the model's next action instead of re-entering the system prefix. Emitted
    * at most once per (conversation, skill). Payload: { runId, toolName,
@@ -704,6 +744,7 @@ export interface EngineEventPayloads {
    * scope, tokens }.
    */
   "skill.activated": SkillActivatedPayload;
+  "skill.not_delivered": SkillNotDeliveredPayload;
   "skill.suppression": SkillSuppressionPayload;
   "context.assembled": ContextAssembledPayload & { runId: string };
   /**

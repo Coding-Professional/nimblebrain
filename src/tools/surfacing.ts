@@ -2,14 +2,13 @@ import { isModelVisible, type ToolSchema } from "../engine/types.ts";
 import { DEFAULT_MAX_DIRECT_TOOLS } from "../limits.ts";
 import type { Skill } from "../skills/types.ts";
 import { isIdentitySource } from "./identity-sources.ts";
-import { bareToolName } from "./namespace.ts";
 import { toolNameMatchesPattern } from "./tool-pattern.ts";
 
 /**
  * Choosing a tool's surface — the three resting places.
  *
  * Two orthogonal axes govern any tool:
- *   - AUTHORITY — who may invoke it (member/admin/owner). Enforced in the
+ *   - AUTHORITY — who may invoke it (member/admin). Enforced in the
  *     handler and by role visibility; NOT this file's concern.
  *   - DRIVER — what surface decides to call it: the agent *reasoning* about a
  *     capability, or a deterministic *UI affordance* a human clicks. This is
@@ -25,9 +24,8 @@ import { toolNameMatchesPattern } from "./tool-pattern.ts";
  *      cold tools, not for hot ones.
  *   3. APP-ONLY — the agent NEVER legitimately calls it; it's a UI-driven
  *      affordance the web shell or a view invokes by name (settings/admin ops:
- *      `manage_*`, `set_model_config`, `briefing`,
- *      `instructions__write_instructions`). Declare the MCP Apps
- *      `_meta.ui.visibility: ["app"]` — stripped from EVERY listing that reaches a
+ *      `manage_*`, `set_model_config`, `briefing`, `skills__set_status`).
+ *      Declare the MCP Apps `_meta.ui.visibility: ["app"]` — stripped from EVERY listing that reaches a
  *      model: the chat tool list (`visibleTools` at the top of `surfaceTools`
  *      below), `nb__search`, the `/mcp` `tools/list`, and the invalid-name
  *      recovery hint (`ToolRegistry.searchTools`); the engine also refuses to
@@ -49,24 +47,15 @@ import { toolNameMatchesPattern } from "./tool-pattern.ts";
  */
 const SYSTEM_TOOL_PREFIX = "nb__";
 
-/**
- * A tool is a system tool if its BARE name starts with `nb__`.
- *
- * Wire names are bare, so for anything the platform emits today the strip is a
- * no-op. It stays because this also reads names replayed from history, which can
- * still carry the retired `ws_<id>-` prefix — and a raw
- * `name.startsWith("nb__")` on one of those classifies zero system tools, which
- * empties the Tier-2 direct list and hands the model no tools at all.
- */
+/** A tool is a system tool if its name starts with `nb__`. */
 function isSystemTool(t: ToolSchema): boolean {
-  return bareToolName(t.name).startsWith(SYSTEM_TOOL_PREFIX);
+  return t.name.startsWith(SYSTEM_TOOL_PREFIX);
 }
 
-/** The source segment of a tool's bare name (`files__read` → `files`). */
+/** The source segment of a tool's name (`files__read` → `files`). */
 function toolSource(t: ToolSchema): string {
-  const bare = bareToolName(t.name);
-  const sep = bare.indexOf("__");
-  return sep === -1 ? bare : bare.slice(0, sep);
+  const sep = t.name.indexOf("__");
+  return sep === -1 ? t.name : t.name.slice(0, sep);
 }
 
 /**
@@ -78,12 +67,6 @@ function toolSource(t: ToolSchema): string {
  * demand. Promotion mutates the tools block — which precedes the messages in
  * the request — so proxying a hot kernel tool busts the conversation's cached
  * prefix on every promote. Keeping kernel tools direct keeps that prefix stable.
- *
- * `instructions__write_instructions` is deliberately NOT here: the workspace
- * overlay is human-authored through the settings UI, and the tool that backs
- * that UI is internal (tier 3) — the model persists standing guidance by
- * drafting it and pointing the user at settings, not by writing the overlay
- * itself. See `src/platform/instructions/source.ts`.
  */
 function isKernelTool(t: ToolSchema): boolean {
   return isSystemTool(t) || isIdentitySource(toolSource(t));

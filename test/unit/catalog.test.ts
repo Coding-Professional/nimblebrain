@@ -8,6 +8,9 @@ import {
   getProviderName,
   googleThinkingModelIds,
   googleThinkingSupport,
+  greenptEffortModelIds,
+  greenptSupportedEfforts,
+  greenptUnmeasuredReasoningModels,
   isModelAllowed,
   isModelInPolicy,
   listModels,
@@ -28,13 +31,23 @@ describe("Model Catalog", () => {
     expect(providers).toContain("anthropic");
     expect(providers).toContain("openai");
     expect(providers).toContain("google");
+    expect(providers).toContain("greenpt");
   });
 
   it("getProviderName returns display names", () => {
     expect(getProviderName("anthropic")).toBe("Anthropic");
     expect(getProviderName("openai")).toBe("OpenAI");
     expect(getProviderName("google")).toBe("Google");
+    expect(getProviderName("greenpt")).toBe("GreenPT");
     expect(getProviderName("unknown")).toBe("unknown");
+  });
+
+  it("includes GreenPT's chat models without its response-style variants", () => {
+    const ids = listModels("greenpt").map((model) => model.id);
+    expect(ids).toEqual(expect.arrayContaining(["glm-5.2", "kimi-k2.7-code", "kimi-k3"]));
+    expect(ids.some((id) => /^glm-5\.2-(caveman|honey|ponytail)/.test(id))).toBe(false);
+    expect(getModel("greenpt", "glm-5.2")?.limits.context).toBe(1_000_000);
+    expect(getModel("greenpt", "kimi-k3")?.capabilities.attachment).toBe(true);
   });
 
   it("getModel returns model metadata", () => {
@@ -49,6 +62,21 @@ describe("Model Catalog", () => {
     expect(model!.capabilities.toolCall).toBe(true);
   });
 
+  it("resolves Gemini 4 Argon at its post-promotion rates", () => {
+    // Google's introductory $2 / $10 ends 2026-11-30; the catalog carries the
+    // rates that hold after it (see MANUAL_COST_OVERRIDES in sync-models.ts).
+    const model = getModelByString("google:gemini-4-argon");
+    expect(model?.provider).toBe("google");
+    expect(model?.limits.context).toBe(1_048_576);
+    expect(model?.limits.output).toBeLessThan(model?.limits.context ?? 0);
+    expect(model?.cost).toEqual({ input: 4, output: 20, cacheRead: 0.2 });
+    expect(model?.capabilities.toolCall).toBe(true);
+    expect(model?.capabilities.reasoning).toBe(true);
+    expect(getAvailableModels({ google: {} }).google.some((m) => m.id === "gemini-4-argon")).toBe(
+      true,
+    );
+  });
+
   it("getModel returns undefined for unknown model", () => {
     expect(getModel("anthropic", "nonexistent")).toBeUndefined();
     expect(getModel("unknown-provider", "anything")).toBeUndefined();
@@ -61,10 +89,8 @@ describe("Model Catalog", () => {
     expect(model!.id).toBe("gpt-4o");
   });
 
-  it("getModelByString defaults bare strings to anthropic", () => {
-    const model = getModelByString("claude-sonnet-4-6");
-    expect(model).toBeDefined();
-    expect(model!.provider).toBe("anthropic");
+  it("getModelByString finds nothing for a string with no provider", () => {
+    expect(getModelByString("claude-sonnet-4-6")).toBeUndefined();
   });
 
   it("listModels returns all models for a provider", () => {
@@ -103,6 +129,10 @@ describe("findProviderForModelId", () => {
     expect(findProviderForModelId("gpt-4o")).toBe("openai");
   });
 
+  it("returns greenpt for a GreenPT flagship model id", () => {
+    expect(findProviderForModelId("glm-5.2")).toBe("greenpt");
+  });
+
   it("returns null for an unknown model id", () => {
     // Pinned/custom model ids that aren't in the catalog should fall back
     // to the resolver's anthropic-default path, not to a wrong provider.
@@ -139,8 +169,8 @@ describe("isModelAllowed", () => {
     ).toBe(false);
   });
 
-  it("bare string defaults to anthropic", () => {
-    expect(isModelAllowed("claude-sonnet-4-6", { anthropic: {} })).toBe(true);
+  it("a string with no provider is allowed by none", () => {
+    expect(isModelAllowed("claude-sonnet-4-6", { anthropic: {} })).toBe(false);
     expect(isModelAllowed("claude-sonnet-4-6", { openai: {} })).toBe(false);
   });
 });
@@ -260,15 +290,16 @@ describe("getAvailableModels", () => {
   });
 
   it("excludes deprecated models from the picker", () => {
-    // gpt-5.3-chat-latest was retired by OpenAI 2026-08-10. It stays in the
-    // catalog (so existing references still resolve for cost/display) but
-    // must never be offered as a selectable model.
-    const deprecated = getModelByString("openai:gpt-5.3-chat-latest");
+    // gpt-4-turbo is a chat-capable model upstream flags deprecated. It stays
+    // in the catalog (so existing references still resolve for cost/display)
+    // but must never be offered as a selectable model.
+    const deprecated = getModelByString("openai:gpt-4-turbo");
     expect(deprecated?.deprecated).toBe(true);
+    expect(deprecated?.capabilities.toolCall).toBe(true);
 
     const result = getAvailableModels({ openai: {} });
     expect(result.openai.length).toBeGreaterThan(0);
-    expect(result.openai.some((m) => m.id === "gpt-5.3-chat-latest")).toBe(false);
+    expect(result.openai.some((m) => m.id === "gpt-4-turbo")).toBe(false);
     // The live successor is still offered.
     expect(result.openai.some((m) => m.id === "gpt-5.6-sol")).toBe(true);
   });
@@ -278,16 +309,16 @@ describe("supportsEnabledThinking", () => {
   it("returns false for adaptive-only Anthropic models", () => {
     // These reject thinking.type=enabled with a 400; the engine must
     // translate to thinking.type=adaptive + output_config.effort.
-    expect(supportsEnabledThinking("claude-opus-4-7")).toBe(false);
-    expect(supportsEnabledThinking("claude-opus-4-8")).toBe(false);
-    expect(supportsEnabledThinking("claude-opus-5")).toBe(false);
-    expect(supportsEnabledThinking("claude-sonnet-5")).toBe(false);
+    expect(supportsEnabledThinking("anthropic:claude-opus-4-7")).toBe(false);
     expect(supportsEnabledThinking("anthropic:claude-opus-4-8")).toBe(false);
+    expect(supportsEnabledThinking("anthropic:claude-opus-5")).toBe(false);
+    expect(supportsEnabledThinking("anthropic:claude-sonnet-5")).toBe(false);
+    expect(supportsEnabledThinking("anthropic:claude-haiku-5-5")).toBe(false);
   });
 
   it("returns true for Anthropic models that accept the enabled shape", () => {
-    expect(supportsEnabledThinking("claude-sonnet-4-6")).toBe(true);
-    expect(supportsEnabledThinking("claude-haiku-4-5-20251001")).toBe(true);
+    expect(supportsEnabledThinking("anthropic:claude-sonnet-4-6")).toBe(true);
+    expect(supportsEnabledThinking("anthropic:claude-haiku-4-5-20251001")).toBe(true);
   });
 
   it("returns true for non-Anthropic providers", () => {
@@ -322,7 +353,9 @@ describe("supportsEnabledThinking", () => {
     const unclassified = listModels("anthropic")
       .filter((m) => m.capabilities.reasoning)
       .map((m) => m.id)
-      .filter((id) => supportsEnabledThinking(id) && !ACCEPTS_ENABLED_THINKING.has(id));
+      .filter(
+        (id) => supportsEnabledThinking(`anthropic:${id}`) && !ACCEPTS_ENABLED_THINKING.has(id),
+      );
 
     expect(unclassified).toEqual([]);
   });
@@ -432,6 +465,7 @@ describe("Google thinking support", () => {
     // other. These rows are transcribed from Google's tables; changing one
     // should require changing this list and citing the source.
     const expected: Record<string, string[]> = {
+      "gemini-4-argon": ["low", "medium", "high"],
       "gemini-3.8-flash": ["low", "medium", "high"],
       "gemini-3.7-flash": ["low", "medium", "high"],
       "gemini-3.6-flash": ["minimal", "low", "medium", "high"],
@@ -491,9 +525,9 @@ describe("OpenAI effort support", () => {
     expect(ids.filter((id) => getModel("openai", id) === undefined)).toEqual([]);
     // Measured against /v1/responses, not taken from docs.
     expect([...openaiSupportedEfforts("openai:gpt-5-pro")]).toEqual(["high"]);
-    // Bounded from ABOVE as well as below — restriction is not a `-pro`
-    // property and not always a floor.
-    expect([...openaiSupportedEfforts("openai:gpt-5.2-chat-latest")]).toEqual(["medium"]);
+    // Restriction is not a `-pro` property: o3-pro was measured and takes the
+    // full ladder.
+    expect([...openaiSupportedEfforts("openai:o3-pro")].sort()).toEqual(["high", "low", "medium"]);
     expect([...openaiSupportedEfforts("openai:gpt-5.2-pro")].sort()).toEqual(["high", "medium"]);
     // `minimal` rides in the same table rather than a parallel set, so it
     // inherits the typo and coverage guards. It is not in OPENAI_EFFORTS, so
@@ -520,6 +554,31 @@ describe("OpenAI effort support", () => {
     // CI instead. Note the guard cannot be "every -pro id has a row":
     // o3-pro is -pro, was measured, and correctly takes the full ladder.
     expect(openaiUnmeasuredReasoningModels()).toEqual([]);
+  });
+});
+
+describe("greenpt effort support", () => {
+  it("classifies only real catalog models", () => {
+    for (const id of greenptEffortModelIds()) {
+      expect(getModel("greenpt", id), `${id} is not in the catalog`).toBeDefined();
+    }
+  });
+
+  it("has measured every catalog reasoning model", () => {
+    // Fail-closed, so an unmeasured model gets no reasoning options rather
+    // than a 400. Measure a newly synced one: GreenPT's 400 for an unaccepted
+    // `reasoning_effort` lists the values the model takes.
+    expect(greenptUnmeasuredReasoningModels()).toEqual([]);
+  });
+
+  it("gives an unlisted model no options at all", () => {
+    expect(greenptSupportedEfforts("greenpt:not-a-model")).toBeUndefined();
+  });
+
+  it("records no model accepting max", () => {
+    for (const id of greenptEffortModelIds()) {
+      expect([...(greenptSupportedEfforts(`greenpt:${id}`) ?? [])]).not.toContain("max");
+    }
   });
 });
 

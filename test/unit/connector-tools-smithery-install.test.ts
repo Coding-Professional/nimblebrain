@@ -27,6 +27,8 @@ import { buildManagedConnectorRegistry } from "../../src/connectors/providers/re
 import { _resetSmitheryConfigForTest } from "../../src/connectors/providers/smithery/config.ts";
 import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import type { ConnectorRef } from "../../src/connectors/runtime/types.ts";
+import type { UserStore } from "../../src/identity/user.ts";
+import type { PermissionStore } from "../../src/permissions/permission-store.ts";
 import type { Runtime } from "../../src/runtime/runtime.ts";
 import {
   createManageConnectorsTool,
@@ -34,12 +36,18 @@ import {
 } from "../../src/tools/connector-tools.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
+import {
+  installTestCredentialStore,
+  resetTestCredentialStore,
+} from "../helpers/credential-store.ts";
 import { fakeFetch } from "../helpers/fake-fetch.ts";
+import { makeIdentity } from "../helpers/identity.ts";
+import { stub } from "../helpers/stub.ts";
 import { seedWorkspace } from "../helpers/test-workspace.ts";
 
 const BASSETHOUND_ID = "ai.bassethound/mcp";
 const SERVER = "nimblebrain/bassethound";
-const ADMIN = { id: "usr_admin", name: "Admin", email: "admin@test" };
+const ADMIN = makeIdentity({ id: "usr_admin", displayName: "Admin", email: "admin@test" });
 
 function bassethoundEntry(): CatalogListing {
   return {
@@ -53,7 +61,7 @@ function bassethoundEntry(): CatalogListing {
       auth: "smithery",
       smithery: { server: SERVER },
     },
-  } as unknown as CatalogListing;
+  };
 }
 
 interface Harness {
@@ -65,6 +73,7 @@ interface Harness {
 
 function buildHarness(): Harness {
   const workDir = mkdtempSync(join(tmpdir(), "nb-smithery-install-"));
+  installTestCredentialStore(workDir);
   const wsId = "ws_0076759dbbe19fcc";
   const workspaceStore = new WorkspaceStore(workDir);
   // The catalog must PUBLISH the entry: a smithery install is permitted only for
@@ -93,7 +102,7 @@ function buildHarness(): Harness {
   const lifecycle = new ConnectorLifecycleManager(new NoopEventSink());
   const workspaceRegistry = new ToolRegistry();
 
-  const runtime = {
+  const runtime = stub<Runtime>({
     getWorkDir: () => workDir,
     getWorkspaceStore: () => workspaceStore,
     getConnectorCatalog: () => new ConnectorCatalog(join(workDir, "catalog.yaml")),
@@ -101,16 +110,17 @@ function buildHarness(): Harness {
     getRegistryForWorkspace: () => workspaceRegistry,
     getAllowInsecureRemotes: () => false,
     getEventSink: () => new NoopEventSink(),
-    getPermissionStore: () => ({
-      deleteConnector: async () => {},
-      listConnectorGrants: async () => ({}),
-      getConnectorGrants: async () => [],
-      revokeConnector: async () => {},
-    }),
-    getUserStore: () => ({ get: async () => null }),
+    getPermissionStore: () =>
+      stub<PermissionStore>({
+        deleteConnector: async () => {},
+        listConnectorGrants: async () => ({}),
+        getConnectorGrants: async () => [],
+        revokeConnector: async () => {},
+      }),
+    getUserStore: () => stub<UserStore>({ get: async () => null }),
     getConnectorInstancesForWorkspace: () => lifecycle.getInstances(),
     getManagedConnectorRegistry: () => buildManagedConnectorRegistry(),
-  } as unknown as Runtime;
+  });
 
   return { workDir, wsId, workspaceStore, runtime };
 }
@@ -120,7 +130,7 @@ function buildTool(h: Harness) {
     runtime: h.runtime,
     getIdentity: () => ADMIN,
     getWorkspaceId: () => h.wsId,
-  } as unknown as ManageConnectorsContext;
+  };
   return createManageConnectorsTool(ctx);
 }
 
@@ -159,6 +169,7 @@ afterEach(() => {
   _resetSmitheryConfigForTest();
   _resetConnectorsConfigForTest();
   globalThis.fetch = realFetch;
+  resetTestCredentialStore();
   rmSync(h.workDir, { recursive: true, force: true });
 });
 
@@ -338,14 +349,14 @@ describe("manage_connectors.install (smithery-auth)", () => {
         providerRef: { connectionId: "", namespace: "test-ns", baseUrl: "https://api.smithery.ai" },
       });
     }
-    const ctx = {
-      runtime: {
+    const ctx: ManageConnectorsContext = {
+      runtime: stub<Runtime>({
         ...h.runtime,
         getManagedConnectorRegistry: () => registry,
-      },
+      }),
       getIdentity: () => ADMIN,
       getWorkspaceId: () => h.wsId,
-    } as unknown as ManageConnectorsContext;
+    };
     const result = await createManageConnectorsTool(ctx).handler({
       action: "install",
       entry: bassethoundEntry(),

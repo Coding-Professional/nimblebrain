@@ -9,6 +9,7 @@ import { createPrivilegeHook, NoopConfirmationGate } from "../../src/config/priv
 import { ConnectorCatalog } from "../../src/connectors/catalog/catalog.ts";
 import { extractText, textContent } from "../../src/engine/content-helpers.ts";
 import { NON_ADVANCING_META_KEY } from "../../src/engine/types.ts";
+import { MAX_TOOL_RESULT_CHARS } from "../../src/limits.ts";
 import type { Runtime } from "../../src/runtime/runtime.ts";
 import { isToolEligibleForPromotion } from "../../src/runtime/tool-eligibility.ts";
 import type { Skill } from "../../src/skills/types.ts";
@@ -20,6 +21,7 @@ import type {
 } from "../../src/tools/system-tools.ts";
 import { createSystemTools } from "../../src/tools/system-tools.ts";
 import { makeInProcessSource } from "../helpers/in-process-source.ts";
+import { stub } from "../helpers/stub.ts";
 
 const noopSink = new NoopEventSink();
 
@@ -391,7 +393,7 @@ describe("System Tools", () => {
     // getRegistry). The handler resolves its workspace per call, so a bare
     // stand-in is enough to assert registration.
     const systemTools = await createSystemTools(() => registry, {
-      runtime: {} as unknown as Runtime,
+      runtime: stub<Runtime>({}),
     });
     const names = (await systemTools.tools()).map((t) => t.name);
     expect(names).toContain("nb__use_skill");
@@ -524,7 +526,7 @@ describe("System Tools", () => {
       { name: "test__tool.with.dot" },
     ]);
 
-    // search no longer mutates the active set (append-only — promoting a tool
+    // search does not mutate the active set (append-only — promoting a tool
     // would bust the cached prefix), so it added nothing; the manage_tools
     // call below is the only promotion (intent: it accepts the searched name).
     expect(calls).toEqual([]);
@@ -623,17 +625,17 @@ describe("status tool — scope: skills", () => {
 
   async function makeStatusSource(
     skills: { context: Skill[]; matchable: Skill[] },
-    layer3?: Array<{ skill: Skill; loadedBy: "always" | "tool_affinity"; reason: string }>,
+    bound?: Skill[],
   ) {
     const registry = await makeRegistry();
     const getSkills = () => skills;
     // Status reads workspace/user-tier skills through `describeRequestSkills`
     // (the same per-request path `chat` composes with); `context` carries the
-    // boot context skills, `layer3` the per-request selection.
-    const runtimeMock = {
+    // boot context skills, `bound` the skills held for their tool's first call.
+    const runtimeMock = stub<Runtime>({
       requireWorkspaceId: () => "ws_0076759dbbe19fcc",
-      describeRequestSkills: async () => ({ context: skills.context, layer3: layer3 ?? [] }),
-    } as unknown as import("../../src/runtime/runtime.ts").Runtime;
+      describeRequestSkills: async () => ({ context: skills.context, bound: bound ?? [] }),
+    });
     return await createSystemTools(() => registry, { getSkills, runtime: runtimeMock });
   }
 
@@ -681,25 +683,23 @@ describe("status tool — scope: skills", () => {
     expect(text).toContain("team-voice");
   });
 
-  it("shows a core skill that also enters the Layer-3 set once, under Core", async () => {
-    // If a core skill ever carries a Layer-3 loading strategy it can appear in
-    // both the boot context (Core) and the per-request Layer-3 set. Core is
-    // authoritative: it must render once, under "Core Skills", never also in
-    // the Layer-3 sections. Guards the name-based coreNames dedup.
-    const source = await makeStatusSource({ context: [coreSkill], matchable: [] }, [
-      { skill: coreSkill, loadedBy: "always", reason: "loading_strategy: always" },
-    ]);
+  it("shows a core skill that is also bound once, under Core", async () => {
+    // A core skill that names tools appears in both the boot context (Core)
+    // and the bound set. Core is authoritative: it must render once, under
+    // "Core Skills", never also in the bound section. Guards the name-based
+    // coreNames dedup.
+    const source = await makeStatusSource({ context: [coreSkill], matchable: [] }, [coreSkill]);
     const result = await source.execute("status", { scope: "skills" });
     expect(result.isError).toBe(false);
     const text = extractText(result.content);
     expect(text.split("soul").length - 1).toBe(1);
     expect(text).toContain("Core Skills");
-    expect(text).not.toContain("Workspace & User Skills");
+    expect(text).not.toContain("Bound Skills");
   });
 
   // A server skill's body is fetched only when it is needed: the overview
   // lists names, and the detail view fetches the one body it prints.
-  describe("a tool-affined server skill", () => {
+  describe("a bound server skill", () => {
     function serverSkill(loadBody: Skill["loadBody"]) {
       const skill: Skill = {
         manifest: {
@@ -708,29 +708,33 @@ describe("status tool — scope: skills", () => {
           loadingStrategy: "dynamic",
           priority: 50,
           status: "active",
+          toolAffinity: ["crm__search"],
         },
         body: "",
         sourcePath: "skill://lookup/SKILL.md",
         loadBody,
       };
-      return [{ skill, loadedBy: "tool_affinity" as const, reason: "tool: crm__search" }];
+      return [skill];
     }
 
     it("is listed by the overview without fetching its body", async () => {
       let fetched = 0;
-      const layer3 = serverSkill(async () => {
+      const bound = serverSkill(async () => {
         fetched++;
         return { ok: true, body: "LOOKUP_BODY" };
       });
-      const source = await makeStatusSource({ context: [], matchable: [] }, layer3);
+      const source = await makeStatusSource({ context: [], matchable: [] }, bound);
       const result = await source.execute("status", { scope: "skills" });
-      expect(extractText(result.content)).toContain("connector:crm:lookup");
+      const text = extractText(result.content);
+      expect(text).toContain("Bound Skills (delivered before their tool's first call)");
+      expect(text).toContain("connector:crm:lookup");
+      expect(text).toContain("Bound to: crm__search");
       expect(fetched).toBe(0);
     });
 
     it("has its body fetched and printed by the detail view", async () => {
-      const layer3 = serverSkill(async () => ({ ok: true, body: "LOOKUP_BODY" }));
-      const source = await makeStatusSource({ context: [], matchable: [] }, layer3);
+      const bound = serverSkill(async () => ({ ok: true, body: "LOOKUP_BODY" }));
+      const source = await makeStatusSource({ context: [], matchable: [] }, bound);
       const result = await source.execute("status", {
         scope: "skills",
         name: "connector:crm:lookup",
@@ -740,8 +744,8 @@ describe("status tool — scope: skills", () => {
     });
 
     it("is reported as unfetchable when its body cannot be loaded", async () => {
-      const layer3 = serverSkill(async () => ({ ok: false, reason: "unreachable" }));
-      const source = await makeStatusSource({ context: [], matchable: [] }, layer3);
+      const bound = serverSkill(async () => ({ ok: false, reason: "unreachable" }));
+      const source = await makeStatusSource({ context: [], matchable: [] }, bound);
       const result = await source.execute("status", {
         scope: "skills",
         name: "connector:crm:lookup",
@@ -843,9 +847,9 @@ describe("search — scope: catalog", () => {
     const catalogDir = join(workDir, "catalog");
     mkdirSync(catalogDir);
     writeFileSync(join(catalogDir, "catalog.json"), JSON.stringify({ servers }));
-    return {
+    return stub<Runtime>({
       getConnectorCatalog: () => new ConnectorCatalog(catalogDir),
-    } as unknown as Runtime;
+    });
   }
 
   async function search(runtime: Runtime, query: string) {
@@ -912,9 +916,9 @@ describe("search — scope: catalog", () => {
     const unreadable = join(workDir, "unreadable");
     mkdirSync(unreadable);
     chmodSync(unreadable, 0o000);
-    const runtime = {
+    const runtime = stub<Runtime>({
       getConnectorCatalog: () => new ConnectorCatalog(unreadable),
-    } as unknown as Runtime;
+    });
     try {
       const result = await search(runtime, "asana");
       expect(result.isError).toBe(true);
@@ -1107,6 +1111,46 @@ describe("nb__read_resource system tool", () => {
     expect(text.length).toBeLessThan(huge.length);
   });
 
+  it("reads a connector record whole past the skill budget", async () => {
+    const registry = new ToolRegistry();
+    const record = JSON.stringify({ id: "c1", dossier: "d".repeat(30_000) });
+    registry.addSource(await buildSource("acme-crm", { "crm://contacts/c1": { text: record } }));
+
+    const systemTools = await createSystemTools(() => registry);
+    const result = await systemTools.execute("read_resource", { uri: "crm://contacts/c1" });
+
+    expect(result.isError).toBe(false);
+    expect(extractText(result.content)).toBe(record);
+  });
+
+  it("cuts a record past the tool-result limit with a note the engine will not cut again", async () => {
+    const registry = new ToolRegistry();
+    const huge = "r".repeat(MAX_TOOL_RESULT_CHARS * 2);
+    registry.addSource(await buildSource("acme-crm", { "crm://contacts/big": { text: huge } }));
+
+    const systemTools = await createSystemTools(() => registry);
+    const result = await systemTools.execute("read_resource", { uri: "crm://contacts/big" });
+
+    const text = extractText(result.content);
+    expect(result.isError).toBe(false);
+    expect(text.length).toBeLessThanOrEqual(MAX_TOOL_RESULT_CHARS);
+    expect(text).toContain(`of ${huge.length} chars`);
+    expect(text).toContain("held only by the app that published it");
+    expect(text).not.toContain("on the user's screen");
+  });
+
+  it("keeps the skill budget for skill:// reads", async () => {
+    const registry = new ToolRegistry();
+    registry.addSource(
+      await buildSource("big", { "skill://big/huge": { text: "s".repeat(20_000) } }),
+    );
+
+    const systemTools = await createSystemTools(() => registry);
+    const result = await systemTools.execute("read_resource", { uri: "skill://big/huge" });
+
+    expect(extractText(result.content)).toContain("showing the first 12000 of 20000 chars");
+  });
+
   // Regression: issue #90. Pre-fix, `nb__read_resource` could not resolve
   // `ui://` URIs published by an InlineSource because the structural type
   // guard accepted both `string` and `ResourceData` shapes and the read
@@ -1128,16 +1172,16 @@ describe("nb__read_resource system tool", () => {
   });
 
   // Description signals the supported URI schemes so the agent can discover
-  // the platform-published `instructions://` resources and connector-published
-  // `<connector>://...` resources without having to be told about each one.
-  it("description references instructions:// and connector-scheme URIs alongside skill:// / ui://", async () => {
+  // connector-published `<connector>://...` resources without having to be
+  // told about each one.
+  it("description references connector-scheme URIs alongside skill:// / ui://", async () => {
     const registry = new ToolRegistry();
     const systemTools = await createSystemTools(() => registry);
     const tools = await systemTools.tools();
     const readResource = tools.find((t) => t.name === "nb__read_resource");
     expect(readResource).toBeDefined();
-    expect(readResource?.description).toContain("instructions://");
     expect(readResource?.description).toContain("skill://");
     expect(readResource?.description).toContain("ui://");
+    expect(readResource?.description).toContain("app-resource-templates");
   });
 });

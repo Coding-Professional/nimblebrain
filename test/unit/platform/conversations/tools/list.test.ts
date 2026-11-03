@@ -34,6 +34,8 @@ interface ConvSpec {
 
 function writeConvFile(spec: ConvSpec): string {
   const meta = {
+    model: "anthropic:claude-sonnet-4-6",
+    ownerId: "usr_test",
     id: spec.id,
     createdAt: spec.createdAt,
     updatedAt: spec.updatedAt,
@@ -192,6 +194,7 @@ describe("handleList", () => {
     expect(conv).toHaveProperty("totalOutputTokens");
     expect(conv).toHaveProperty("lastModel");
     expect(conv).toHaveProperty("preview");
+    expect(conv).not.toHaveProperty("filePath");
   });
 
   test("limit=2 returns 2 conversations and sets nextCursor", async () => {

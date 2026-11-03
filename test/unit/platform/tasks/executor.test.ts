@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { effectiveRunLimits, resolveTasksConfig } from "../../../../src/config/tasks.ts";
+import { MODEL_GATEWAY_BUDGET_ACCOUNT } from "../../../../src/model/gateway-refusal.ts";
+import { labelOf } from "../../../../src/platform/tasks/assessment.ts";
 import {
   createDirectExecutor,
   type ExecutorContext,
@@ -154,10 +156,10 @@ describe("createDirectExecutor", () => {
   });
 
   test("omits workspaceId and identity when context is empty", async () => {
-    let capturedRequest: Record<string, unknown> | undefined;
+    let capturedRequest: Parameters<TaskFn>[0] | undefined;
 
     const taskFn: TaskFn = async (req) => {
-      capturedRequest = req as unknown as Record<string, unknown>;
+      capturedRequest = req;
       return {
         output: "ok",
         runId: "run_test000000",
@@ -198,6 +200,20 @@ describe("createDirectExecutor", () => {
 
     expect(captured?.admission).toBe(ticket.lease);
   });
+
+  // The door mints the run's model credential to this cap, so it must be the
+  // one the executor's own timer enforces.
+  test("sends the run's duration cap, the one its timer enforces", async () => {
+    let captured: Parameters<TaskFn>[0] | undefined;
+    const taskFn: TaskFn = async (req) => {
+      captured = req;
+      return makeDirectTaskFn()(req);
+    };
+
+    await createDirectExecutor(taskFn, () => ({}))(makeTask({ maxRunDurationMs: 45_000 }));
+
+    expect(captured?.maxRunDurationMs).toBe(45_000);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -208,6 +224,49 @@ describe("createDirectExecutor", () => {
 // every tick. The mapping isn't exported, so exercise it via the executor.
 // (Restores coverage lost when the executeHttp tests were deleted.)
 // ---------------------------------------------------------------------------
+
+describe("createDirectExecutor — a task's declared skills", () => {
+  test("passes the skills to the run and records what the run was given", async () => {
+    let captured: TaskFnRequest | undefined;
+    const taskFn: TaskFn = async (req) => {
+      captured = req;
+      return {
+        ...(await makeDirectTaskFn()(req)),
+        skillsDelivered: [{ name: "ledger-runbook", loadedBy: "declared" }],
+      };
+    };
+    const executor = createDirectExecutor(taskFn, () => ({}));
+    const { result } = await executor(makeTask({ skills: ["ledger-runbook"] }));
+    expect(captured?.skills).toEqual(["ledger-runbook"]);
+    expect(result?.skillsDelivered).toEqual([{ name: "ledger-runbook", loadedBy: "declared" }]);
+  });
+
+  test("a task with skills and no prompt runs on an instruction to carry them out", async () => {
+    let captured: TaskFnRequest | undefined;
+    const executor = createDirectExecutor(
+      async (req) => {
+        captured = req;
+        return makeDirectTaskFn()(req);
+      },
+      () => ({}),
+    );
+    await executor(makeTask({ prompt: "", skills: ["ledger-runbook", "record-rules"] }));
+    expect(captured?.prompt).toBe(
+      'Carry out the "ledger-runbook", "record-rules" skills on this run\'s input, and give the result as the deliverable.',
+    );
+  });
+});
+
+describe("createDirectExecutor — the run's cost", () => {
+  test("records the runtime's per-call costUsd, not a price of the summed usage", async () => {
+    const executor = createDirectExecutor(
+      async (req) => ({ ...(await makeDirectTaskFn()(req)), costUsd: 1.2345 }),
+      () => ({}),
+    );
+    const { run } = await executor(makeTask());
+    expect(run.costUsd).toBe(1.2345);
+  });
+});
 
 describe("createDirectExecutor — the run input cap", () => {
   async function requestFor(overrides: Partial<Task>) {
@@ -228,6 +287,28 @@ describe("createDirectExecutor — the run input cap", () => {
   test("a task without maxInputTokens runs with no input cap when no ceiling is configured", async () => {
     const req = await requestFor({});
     expect(req?.maxRunInputTokens).toBeUndefined();
+  });
+});
+
+describe("createDirectExecutor — the run's thinking effort", () => {
+  async function requestFor(overrides: Partial<Task>) {
+    let seen: Parameters<TaskFn>[0] | undefined;
+    const taskFn: TaskFn = async (req) => {
+      seen = req;
+      return makeDirectTaskFn()(req);
+    };
+    await createDirectExecutor(taskFn, () => ({}))(makeTask(overrides));
+    return seen;
+  }
+
+  test("a task's thinkingEffort reaches the runtime as the run's depth", async () => {
+    const req = await requestFor({ thinkingEffort: "low" });
+    expect(req?.thinkingEffort).toBe("low");
+  });
+
+  test("a task without thinkingEffort leaves the depth to the runtime", async () => {
+    expect((await requestFor({}))?.thinkingEffort).toBeUndefined();
+    expect((await requestFor({ thinkingEffort: null }))?.thinkingEffort).toBeUndefined();
   });
 });
 
@@ -342,6 +423,70 @@ describe("createDirectExecutor — stopReason → status", () => {
     expect(run.error).not.toContain("Raise Max Input Tokens");
   });
 
+  test("complete on a cap wrap-up → degraded, naming the cap, with its answer kept", async () => {
+    const executor = createDirectExecutor(
+      async (): Promise<TaskFnResult> => ({
+        ...(await taskFnWithStop("complete")({} as TaskFnRequest)),
+        output: "partial answer",
+        wrapUpLimit: "max_input_tokens",
+      }),
+      () => ({}),
+    );
+    const { run, result } = await executor(makeTask({ maxInputTokens: 30_000 }));
+    expect(run.status).toBe("degraded");
+    expect(run.stopReason).toBe("complete");
+    expect(run.error).toContain("Told to finish early");
+    expect(run.error).toContain("30,000");
+    expect(run.error).toContain("its own Max Input Tokens");
+    expect(result?.output).toBe("partial answer");
+    expect(labelOf(run)).toBe("Needs review");
+  });
+
+  test("complete on a last-iteration wrap-up → degraded, naming the limit, with its answer kept", async () => {
+    const executor = createDirectExecutor(
+      async (): Promise<TaskFnResult> => ({
+        ...(await taskFnWithStop("complete")({} as TaskFnRequest)),
+        output: "partial answer",
+        wrapUpLimit: "max_iterations",
+      }),
+      () => ({}),
+    );
+    const { run, result } = await executor(makeTask({ maxIterations: 5 }));
+    expect(run.status).toBe("degraded");
+    expect(run.stopReason).toBe("complete");
+    expect(run.error).toContain("Told to finish early");
+    expect(run.error).toContain("last of the 5 iterations");
+    expect(run.error).toContain("its own Max Iterations");
+    expect(result?.output).toBe("partial answer");
+    expect(labelOf(run)).toBe("Needs review");
+  });
+
+  test("a last-iteration wrap-up with no iteration limit of its own names the runtime's", async () => {
+    const executor = createDirectExecutor(
+      async (): Promise<TaskFnResult> => ({
+        ...(await taskFnWithStop("complete")({} as TaskFnRequest)),
+        wrapUpLimit: "max_iterations",
+      }),
+      () => ({}),
+    );
+    const { run } = await executor(makeTask({}));
+    expect(run.status).toBe("degraded");
+    expect(run.error).toContain("this runtime's limit");
+    expect(run.error).not.toContain("Raise Max Iterations");
+  });
+
+  test("a run stopped at the cap stays a failure", async () => {
+    const executor = createDirectExecutor(
+      async (): Promise<TaskFnResult> => ({
+        ...(await taskFnWithStop("max_input_tokens")({} as TaskFnRequest)),
+        wrapUpLimit: "max_input_tokens",
+      }),
+      () => ({}),
+    );
+    const { run } = await executor(makeTask({ maxInputTokens: 30_000 }));
+    expect(run.status).toBe("failure");
+  });
+
   test("spend_limit → failure, naming the token budget it would have passed", async () => {
     const auto = makeTask({
       cumulativeInputTokens: 40_000,
@@ -372,6 +517,28 @@ describe("createDirectExecutor — stopReason → status", () => {
     expect(run.error).toContain("Token budget reached");
     expect(run.error).toContain("50,000 input tokens");
     expect(run.error).toContain("10,000 left");
+  });
+
+  test("spend_limit by the model gateway's run budget → failure, naming the run's budget, not the task's", async () => {
+    const executor = createDirectExecutor(
+      async (req): Promise<TaskFnResult> => ({
+        output: "partial",
+        runId: req.runId ?? "run_test000000",
+        toolCalls: [],
+        stopReason: "spend_limit",
+        spendAccountId: MODEL_GATEWAY_BUDGET_ACCOUNT,
+        usage: { inputTokens: 53_000, outputTokens: 900, iterations: 2 },
+      }),
+      () => ({}),
+    );
+    const { run } = await executor(
+      makeTask({ tokenBudget: { maxInputTokens: 50_000, period: "daily" } }),
+    );
+    expect(run.status).toBe("failure");
+    expect(run.spendAccountId).toBe(MODEL_GATEWAY_BUDGET_ACCOUNT);
+    expect(run.error).toContain("Model budget reached");
+    expect(run.error).toContain("this run's model budget");
+    expect(run.error).not.toContain("Token budget");
   });
 
   test("spend_limit by a batch's account before any call → skipped; after one → failure", async () => {
@@ -839,6 +1006,72 @@ describe("createDirectExecutor — degraded runs", () => {
   });
 });
 
+describe("createDirectExecutor — calls the engine held for guidance", () => {
+  const held = (id: string, name: string): TaskFnToolCall => ({
+    id,
+    name,
+    input: { to: "a@example.com" },
+    output: `Not run: ${name} is governed by guidance you have not read yet (drafting).`,
+    ok: false,
+    ms: 0,
+    errorReason: "skill_guidance_pending",
+    held: true,
+  });
+  const ran = (id: string, name: string, ok = true): TaskFnToolCall => ({
+    id,
+    name,
+    input: { to: "a@example.com" },
+    output: ok ? "{}" : "500",
+    ok,
+    ms: 10,
+  });
+
+  async function runWith(toolCalls: TaskFnToolCall[], stopReason = "complete"): Promise<TaskRun> {
+    const taskFn: TaskFn = async (): Promise<TaskFnResult> => ({
+      output: "Drafted.",
+      runId: "run_test000000",
+      toolCalls,
+      stopReason,
+      usage: { inputTokens: 10, outputTokens: 5, iterations: 2 },
+    });
+    const executor = createDirectExecutor(taskFn, () => ({}));
+    const { run } = await executor(makeTask());
+    return run;
+  }
+
+  test("a held call re-issued to success is neither a failure nor a counted call", async () => {
+    const run = await runWith([
+      held("c1", "outreach__draft_email"),
+      ran("c2", "outreach__draft_email"),
+    ]);
+    expect(run.status).toBe("success");
+    expect(run.unrecoveredToolFailures).toBeUndefined();
+    expect(run.toolCalls).toBe(1);
+  });
+
+  test("a held call the model rightly never re-issues does not mark a complete run", async () => {
+    const run = await runWith([held("c1", "outreach__draft_email")]);
+    expect(run.status).toBe("success");
+    expect(run.unrecoveredToolFailures).toBeUndefined();
+  });
+
+  test("a held call the run stopped before re-issuing is recorded as unrecovered", async () => {
+    const run = await runWith([held("c1", "outreach__draft_email")], "max_iterations");
+    expect(run.unrecoveredToolFailures).toEqual(["outreach__draft_email"]);
+  });
+
+  test("three holds then failures still read as a tool that never succeeded", async () => {
+    const run = await runWith([
+      held("c1", "records__create"),
+      ran("c2", "records__create", false),
+      ran("c3", "records__create", false),
+      ran("c4", "records__create", false),
+    ]);
+    expect(run.status).toBe("failure");
+    expect(run.error).toMatch(/never succeeded/);
+  });
+});
+
 describe("createDirectExecutor — aborted run preserves partial usage", () => {
   // Mirrors runtime.executeTask under signal-driven abort: wait for the
   // abort, then RETURN the work done so far tagged "aborted" instead of
@@ -860,6 +1093,16 @@ describe("createDirectExecutor — aborted run preserves partial usage", () => {
       };
     };
   }
+
+  test("a wall-clock timeout is not transient, whatever the task is called", async () => {
+    const executor = createDirectExecutor(abortingTaskFn(), () => ({
+      workspaceId: "ws_0076759dbbe19fcc",
+    }));
+    const { run } = await executor(makeTask({ id: "timeout-report", maxRunDurationMs: 30 }));
+
+    expect(run.status).toBe("timeout");
+    expect(run.transient).toBe(false);
+  });
 
   test("wall-clock timeout records status=timeout with the real counters and runId; result is non-null", async () => {
     const executor = createDirectExecutor(abortingTaskFn(), () => ({

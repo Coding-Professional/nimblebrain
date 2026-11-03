@@ -1,6 +1,6 @@
 # 0047. The door decides a run, and an execution provider runs it
 
-- Status: Proposed
+- Status: Superseded by ADR-0056 (the seam: the door decides, a runtime executes) and ADR-0057 (an agent or loop out of process)
 - Date: 2026-10-04
 - Serves: orchestrate remote MCP, secure RBAC
 
@@ -36,6 +36,11 @@ Each of those guarantees lives somewhere a remote loop would not be:
   and outside the wall.
 - **Admission** is door state. A second queue anywhere else is a second ordering
   that fair share cannot see.
+
+A batch run in-process also competes with chat for the runtime's event loop
+(#1557). The intended first remote provider runs each run as its own job,
+holding a run-scoped credential; no provider seam, run credential or
+runtime-hosted model endpoint exists yet.
 
 ## Decision
 

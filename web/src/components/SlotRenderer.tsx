@@ -3,11 +3,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { getResources, uiPathFromUri } from "../api/client";
 import type { BridgeHandle } from "../bridge/bridge";
 import { createBridge } from "../bridge/bridge";
-import {
-  buildHostContext,
-  buildHostExtensions,
-  type ConnectorForHostContext,
-} from "../bridge/host-extensions";
+import { buildHostExtensions, type ConnectorForHostContext } from "../bridge/host-extensions";
 import type { CreateIframeOptions } from "../bridge/iframe";
 import { createAppIframe } from "../bridge/iframe";
 import type { AppTrailEntry } from "../bridge/schemas";
@@ -16,6 +12,8 @@ import { useFileLimits } from "../context/ChatContext";
 import { useTheme } from "../context/ThemeContext";
 import { useWorkspaceContext } from "../context/WorkspaceContext";
 import { useAppDisplayName } from "../hooks/useAppDisplayName";
+import { useHostContextSync } from "../hooks/useHostContextSync";
+import { shellOpenCallbacks } from "../lib/open-app";
 import type { PlacementEntry } from "../types";
 import { buildSizedHtml, DEFAULT_CONTENT_HEIGHT, RUNAWAY_HEIGHT_GUARD } from "./content-height";
 import { useNotice } from "./notices";
@@ -41,11 +39,21 @@ interface SlotRendererProps {
    */
   target?: { id: string; key: string };
   /**
-   * Whether the viewer can manage the connector these placements belong to.
-   * Set only by the connector settings page; when set, it reaches the app as
-   * the `connector` host-context extension. Every other mount leaves it unset.
+   * Whether the viewer can manage the connector these placements belong to:
+   * the older, coarser signal (a role, not the tools it unlocks). Set only by
+   * the connector settings page; when set, it reaches the app as
+   * `connector.canManage`. Every other mount leaves it unset. Prefer
+   * `allowedTools`.
    */
   canManage?: boolean;
+  /**
+   * The bare names of the connector's tools the viewer may call, from its
+   * installed-connector entry. Set by the connector settings page and by a
+   * workspace app's own page (`AppWithChat`); when set, it reaches the app as
+   * `connector.allowedTools`. Left unset on every other mount, and until the
+   * entry has loaded.
+   */
+  allowedTools?: readonly string[];
   /**
    * Size each iframe to its content instead of filling the container. For a
    * placement in a flow layout (a page section), where `height: 100%` has no
@@ -176,6 +184,7 @@ export function SlotRenderer({
   onLocation,
   target,
   canManage,
+  allowedTools,
   fitContent = false,
 }: SlotRendererProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -193,7 +202,8 @@ export function SlotRenderer({
   workspaceRef.current = activeWorkspace;
   // Same reason as `workspaceRef`: the handshake reads the value current when
   // the iframe finishes loading, not the one from the render that mounted it.
-  const connector: ConnectorForHostContext = canManage === undefined ? undefined : { canManage };
+  const connector: ConnectorForHostContext =
+    canManage === undefined && allowedTools === undefined ? undefined : { canManage, allowedTools };
   const connectorRef = useRef(connector);
   connectorRef.current = connector;
   // Instance config, fixed at startup; a ref only so the callbacks built once
@@ -251,7 +261,7 @@ export function SlotRenderer({
   // Stable key: only re-mount iframes when the actual placements change
   const placementKey = filtered.map((p) => p.resourceUri).join(",");
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: re-mount iframes only when placementKey changes — `filtered` is read at run time but changes identity every render (depending on it would thrash iframes), mode is read through a ref, and `fitContent` is fixed per mount site
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `placementKey` stands for `filtered`, a new array every render, so depending on it would remount every iframe each render; `fitContent` is fixed per mount site, and `deliverTarget`, `onLocationReport` and `nameApp` keep one identity for the component's life
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -266,6 +276,7 @@ export function SlotRenderer({
       getHostExtensions: () =>
         buildHostExtensions(workspaceRef.current, connectorRef.current, uploadLimitsRef.current),
       getUploadLimits: () => uploadLimitsRef.current,
+      ...shellOpenCallbacks,
     };
 
     // Fetch + mount one placement. A failure is contained here: it renders its
@@ -337,22 +348,10 @@ export function SlotRenderer({
     deliverTarget(target);
   }, [target, deliverTarget]);
 
-  // Propagate host-context changes (theme, workspace, manage flag) to mounted
-  // iframes via the ext-apps `host-context-changed` notification. Iframes stay
-  // mounted; apps that observe `useHostContext()` (or `useTheme()`) re-render
-  // and refetch workspace-scoped data without losing local state. A role
-  // change mid-session reaches a mounted settings component this way.
-  useEffect(() => {
-    const ctx = buildHostContext(
-      mode,
-      activeWorkspace,
-      canManage === undefined ? undefined : { canManage },
-      uploadLimits,
-    );
-    for (const bridge of bridgesRef.current) {
-      bridge.setHostContext(ctx);
-    }
-  }, [mode, activeWorkspace, canManage, uploadLimits]);
+  // Iframes stay mounted across a theme, workspace or role change; apps that
+  // observe `useHostContext()` (or `useTheme()`) re-render and refetch
+  // workspace-scoped data without losing local state.
+  useHostContextSync(() => bridgesRef.current, mode, activeWorkspace, connector, uploadLimits);
 
   if (filtered.length === 0) return null;
 

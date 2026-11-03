@@ -70,6 +70,20 @@ Each JSON line is auto-enriched with:
 
 Identity comes only from the verified request context, never the wire, and never includes the human display name. Logs stay on stderr, so Kubernetes captures them alongside stdout and stdout stays clean for JSON-RPC and piped output.
 
+## Model provider retries
+
+A model call that fails with a transient error is retried up to three times, after about 1 s, 2 s and 4 s, each plus up to 0.5 s of jitter. Whether an error is transient is decided by the first of these that answers:
+
+1. The runtime's own verdict, for errors it raises itself. A stalled model stream is retried until output has reached the client, and not after. An error the provider reports inside a stream is not retried after that point either.
+2. The provider's verdict (`isRetryable` on the AI SDK's error). It covers network failures, which carry no status, and provider-specific cases such as a quota-exhausted 429, which is not retried.
+3. The HTTP status: 408, 429, 500, 502, 503, 504 and 529 are retried.
+
+Because the provider's verdict comes before the status list, a provider can mark another status retryable; the AI SDK does so for 409. A 401 is never retried, whatever the provider says: the turn fails with `Authentication failed (401). Check your API key.` Any other error fails the turn at once.
+
+Each retried attempt logs one `warn` line, such as `[engine] retry attempt=1/3 reason=503 delayMs=1234`. `reason` is the HTTP status, or the error's name when it has none. A retry that later succeeds moves no counter, so this line is the only record of it.
+
+Before any output, a stalled stream is retried, and an error the provider reports inside a stream (such as an `overloaded_error` or `rate_limit_error` event) is retried on the provider's verdict and status, like any other provider error. After output has reached the client, either one fails the turn, so deltas are never streamed twice. An in-stream error the provider does not mark as its own, such as a chunk that fails to parse, fails the call only when the stream produced no output and did not finish cleanly.
+
 ## Error reporting (Sentry, optional)
 
 The OpenTelemetry pipeline above is the system of record for traces and logs. Sentry is an **optional, additive** error sink on top of it — turn it on when you want uncaught exceptions and unhandled promise rejections grouped, deduplicated, and alertable with full stack traces, without scraping logs for them.
@@ -98,6 +112,8 @@ Sentry here is initialized as an out-of-kernel preload and does **not** take ove
 
 <Aside type="caution">
 The same trust boundary as traces and logs applies: `sendDefaultPii` is off and events are scrubbed before send — no request headers or cookies (auth tokens), no request bodies, no query strings (which can carry prompts and ids). The breadcrumb trail is scrubbed the same way: `console` breadcrumbs are dropped (dependency logs can carry prompts) and URL query strings are stripped from request breadcrumbs (outbound LLM/MCP/OAuth calls). The only identity on a backend event is the boot-time `tenant_id` tag — unlike the web client, the runtime does **not** attach per-request `workspace_id` / `user_id` (the kernel can't import Sentry, so that identity stays on the OTel spans). Never widen this to capture request content.
+
+The web client applies the same rule in the browser: the page URL and transaction name on an event, and the URLs in its fetch, XHR, and navigation breadcrumbs, lose their query string and fragment before send. The path stays.
 </Aside>
 
 ## Prometheus metrics
@@ -114,6 +130,18 @@ A few properties worth knowing:
 - It is unauthenticated. It carries no per-user data and is meant to be reachable only inside the cluster.
 
 In Kubernetes, point a `ServiceMonitor` (or your scrape config) at the platform service's `/metrics` path. Do not expose it to the internet.
+
+### Connector metrics
+
+Two gauges say whether a connector works, and they cover different faults, so alert on each:
+
+| Metric | Type | Labels | What it says |
+|---|---|---|---|
+| `nb_connector_unhealthy` | gauge | `source` | `1` while a connector's transport is down and the runtime is reconnecting it. No series for a connector that is up. A transport outage only: a connector whose sign-in was rejected is not counted here. |
+| `nb_connector_reauth_required` | gauge | `source` | The number of connections of a connector that need someone to **Reconnect** because the service rejected its credential. No series when none do. It stays set across a restart and clears only on Reconnect or Disconnect; the runtime does not retry these connections on its own. |
+| `nb_connector_crashed_total` | counter | `source`, `remote` | Health checks that found a connector's transport down. A rate for dashboards; use `nb_connector_unhealthy` to alert on a connector that stays down. |
+
+`source` is the connector's server name. Personal connectors are not counted by either gauge.
 
 ### Task run metrics
 
@@ -158,7 +186,7 @@ Two loops run on timers inside the runtime process: the **connection revalidator
 Both are per-process and hold their state in memory, so both carry the same prerequisite:
 
 <Aside type="caution">
-  `replicas: 1` is the supported topology for both loops. At `replicas > 1` each pod would run its own copy: the revalidator would re-probe connections whose state another pod owns, and the poller would read every outbox once per pod and race the same stored cursor. Making either safe needs per-tenant leader election, which is not built. Keep the platform at a single replica — the same conclusion the [session store](#multi-replica-session-storage) reaches for its own reasons.
+  `replicas: 1` is the supported topology for both loops. At `replicas > 1` each pod would run its own copy: the revalidator would re-probe connections whose state another pod owns, and the poller would read every outbox once per pod and race the same stored cursor. Making either safe needs per-tenant leader election, which is not built. Keep the platform at a single replica; see [Scaling to multiple replicas](/config/nimblebrain-json/#scaling-to-multiple-replicas).
 </Aside>
 
 To confirm the poller found anything after a restart, look for `[notifications] targets=N` — it is logged on the first sweep and again whenever the count changes, so `targets=0` on a pod where an app declaring an outbox is installed means the declaration is not reaching the poller, which is a different fault from an outbox that is being read and is empty.
@@ -184,41 +212,4 @@ To see more than liveness:
 | To confirm | Read |
 |---|---|
 | Which build is live | `version` and `buildSha` on the authenticated `GET /v1/bootstrap`, also shown on the **About** page in organization settings |
-| Whether connectors are up | The `nb_connector_unhealthy` gauge on [`/metrics`](#prometheus-metrics): `1` for each connector that is currently down, and no series for a healthy one |
-
-## Multi-replica session storage
-
-The `/mcp` endpoint allocates a stateful session per client (`Mcp-Session-Id`). At a single replica these live in process memory. To run more than one platform replica, the session **metadata** must be shared across pods through a registry, and requests must be routed back to the pod holding a session's transport.
-
-### Session store
-
-Select the session store with the `sessionStore` config block (or the env knobs below):
-
-| Store | When |
-|---|---|
-| `memory` | Single replica (default). Sessions live in process memory only |
-| `redis` | Multiple replicas. Session metadata is shared via Redis so any pod can recognize a session id |
-
-```json title="nimblebrain.json"
-{
-  "sessionStore": {
-    "type": "redis",
-    "url": "redis://nb-redis:6379"
-  }
-}
-```
-
-The registry stores only session metadata (`sessionId`, identity, workspace, timestamps) — never the live transport, which is process-bound. Routing a request to the pod that owns a session's transport is the load balancer's job (sticky routing on `Mcp-Session-Id`), not the registry's.
-
-### Session limits
-
-These apply regardless of store and tune the per-process transport map:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MCP_MAX_SESSIONS` | `100` | Maximum concurrent MCP sessions per process. At the cap, a new `initialize` evicts the least-recently-used session rather than returning an error |
-| `MCP_SESSION_TTL_SECONDS` | `28800` (8h) | Idle session TTL. Drives both the per-process idle sweep and the registry TTL |
-
-<Aside type="caution">
-`sessionStore: "redis"` does not make `replicas > 1` work. More than one replica is not supported; see [Scaling to multiple replicas](/config/nimblebrain-json/#scaling-to-multiple-replicas). Keep the platform at a single replica.
-</Aside>
+| Whether connectors are up | The [connector gauges](#connector-metrics) on `/metrics`: `nb_connector_unhealthy` for a connector whose transport is down, `nb_connector_reauth_required` for one that needs Reconnect |

@@ -48,7 +48,10 @@ function storeV2Tests(
     // --- create() ---
 
     it("create() produces conversation with full enriched metadata", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       expect(conv.id).toMatch(/^conv_/);
       expect(conv.createdAt).toBeTruthy();
       expect(conv.updatedAt).toBe(conv.createdAt);
@@ -59,28 +62,31 @@ function storeV2Tests(
     // --- append() preserves usage data; totals derive on read ---
 
     it("append() preserves assistant usage so totals can be derived later", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
 
       await store.append(conv, msg("user", "Hello"));
       await store.append(
         conv,
         assistantMsg("Hi there", {
           usage: { inputTokens: 100, outputTokens: 50 },
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         }),
       );
       await store.append(
         conv,
         assistantMsg("More", {
           usage: { inputTokens: 200, outputTokens: 75 },
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         }),
       );
 
       // lastModel is the only display field still maintained on the
       // Conversation; tokens are derived at read time (see the
       // summary assertions below).
-      expect(conv.lastModel).toBe("claude-sonnet-4-5-20250929");
+      expect(conv.lastModel).toBe("anthropic:claude-sonnet-4-5-20250929");
 
       const result = await store.list();
       const summary = result.conversations.find((c) => c.id === conv.id);
@@ -93,7 +99,10 @@ function storeV2Tests(
     });
 
     it("append() updates updatedAt from message timestamp", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       const originalUpdatedAt = conv.updatedAt;
 
       const laterTimestamp = new Date(Date.now() + 5000).toISOString();
@@ -108,7 +117,10 @@ function storeV2Tests(
     });
 
     it("user-only conversations show zero derived totals", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv, msg("user", "Hello"));
       const result = await store.list();
       const summary = result.conversations.find((c) => c.id === conv.id);
@@ -120,7 +132,10 @@ function storeV2Tests(
     // --- history() preserves metadata ---
 
     it("history() preserves metadata on messages", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(
         conv,
         assistantMsg("Result", {
@@ -136,7 +151,7 @@ function storeV2Tests(
             },
           ],
           usage: { inputTokens: 100, outputTokens: 50 },
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         }),
       );
 
@@ -146,13 +161,16 @@ function storeV2Tests(
       expect(history[0]!.metadata!.skill).toBe("test-skill");
       expect(history[0]!.metadata!.toolCalls).toHaveLength(1);
       expect(history[0]!.metadata!.usage?.inputTokens).toBe(100);
-      expect(history[0]!.metadata!.model).toBe("claude-sonnet-4-5-20250929");
+      expect(history[0]!.metadata!.model).toBe("anthropic:claude-sonnet-4-5-20250929");
     });
 
     // --- delete() ---
 
     it("delete() removes conversation and returns true", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv, msg("user", "Hello"));
 
       const result = await store.delete(conv.id);
@@ -168,7 +186,10 @@ function storeV2Tests(
     });
 
     it("second delete() returns false", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       expect(await store.delete(conv.id)).toBe(true);
       expect(await store.delete(conv.id)).toBe(false);
     });
@@ -176,7 +197,10 @@ function storeV2Tests(
     // --- update() ---
 
     it("update() changes title in metadata", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       expect(conv.title).toBeNull();
 
       const updated = await store.update(conv.id, {
@@ -195,7 +219,10 @@ function storeV2Tests(
     });
 
     it("update() persists title on reload", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.update(conv.id, { title: "Persisted Title" });
 
       const loaded = await store.load(conv.id);
@@ -205,13 +232,16 @@ function storeV2Tests(
     // --- fork() ---
 
     it("fork() creates new conversation with all messages", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv, msg("user", "First"));
       await store.append(
         conv,
         assistantMsg("Second", {
           usage: { inputTokens: 100, outputTokens: 50 },
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         }),
       );
       await store.append(conv, msg("user", "Third"));
@@ -228,7 +258,10 @@ function storeV2Tests(
     });
 
     it("fork() with atMessage truncates messages", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv, msg("user", "First"));
       await store.append(conv, msg("assistant", "Second"));
       await store.append(conv, msg("user", "Third"));
@@ -243,7 +276,10 @@ function storeV2Tests(
     });
 
     it("fork() with atMessage=0 creates empty conversation", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv, msg("user", "First"));
 
       const forked = await store.fork(conv.id, 0);
@@ -259,13 +295,16 @@ function storeV2Tests(
     });
 
     it("fork() carries forward usage so derived totals match the slice", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv, msg("user", "Hello"));
       await store.append(
         conv,
         assistantMsg("Reply 1", {
           usage: { inputTokens: 100, outputTokens: 50 },
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         }),
       );
       await store.append(conv, msg("user", "More"));
@@ -273,7 +312,7 @@ function storeV2Tests(
         conv,
         assistantMsg("Reply 2", {
           usage: { inputTokens: 200, outputTokens: 75 },
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         }),
       );
 
@@ -290,11 +329,17 @@ function storeV2Tests(
     // --- list() with search ---
 
     it("list() search matches a title set by update(), after a later append", async () => {
-      const conv1 = await store.create({ ownerId: "user_test" });
+      const conv1 = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.update(conv1.id, { title: "Deploy Pipeline" });
       await store.append(conv1, msg("user", "ship it"));
 
-      const conv2 = await store.create({ ownerId: "user_test" });
+      const conv2 = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.update(conv2.id, { title: "Budget Review" });
       await store.append(conv2, msg("user", "numbers please"));
 
@@ -303,10 +348,16 @@ function storeV2Tests(
     });
 
     it("list() search matches the first user message's text", async () => {
-      const conv1 = await store.create({ ownerId: "user_test" });
+      const conv1 = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv1, msg("user", "Deploy stuff"));
 
-      const conv2 = await store.create({ ownerId: "user_test" });
+      const conv2 = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.append(conv2, msg("user", "Review budget"));
 
       const result = await store.list({ search: "stuff" });
@@ -315,7 +366,10 @@ function storeV2Tests(
     });
 
     it("append() with a copy that predates update() keeps the stored title", async () => {
-      const conv = await store.create({ ownerId: "user_test" });
+      const conv = await store.create({
+        model: "anthropic:claude-sonnet-4-6",
+        ownerId: "user_test",
+      });
       await store.update(conv.id, { title: "Generated title" });
       // `conv` still has title: null, as a caller's copy does when a background
       // auto-title lands between its turns.

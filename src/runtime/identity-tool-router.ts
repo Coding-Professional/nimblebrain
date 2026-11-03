@@ -1,5 +1,5 @@
 /**
- * Identity-scoped `ToolRouter` — the bridge between Stage 2's identity-bound
+ * Identity-scoped `ToolRouter` — the bridge between identity-bound
  * sessions and the engine's per-call ToolRouter contract.
  *
  * A session is bounded to one workspace (the wall). This router is the single
@@ -116,7 +116,9 @@ export interface IdentityToolRouterOptions {
 function buildPerCallContext(
   outer: RequestContext | undefined,
   routed: RoutedToolCall,
+  isToolAllowed: ((name: string) => boolean) | undefined,
 ): RequestContext {
+  const toolLimit = isToolAllowed ?? outer?.isToolAllowed;
   const workspaceId = routed.kind === "workspace" ? routed.context.workspaceId : outer?.workspaceId;
   return {
     identity: outer?.identity ?? null,
@@ -139,6 +141,9 @@ function buildPerCallContext(
     // run stays walled from the task-authoring surface. Dropping it here
     // would reopen the wall for anything below the top level.
     ...(outer?.unattended !== undefined ? { unattended: outer.unattended } : {}),
+    // The run's tool limit rides the restamp so whatever reads on a call's
+    // behalf (a tool's resource arguments) reads only what the run could.
+    ...(toolLimit ? { isToolAllowed: toolLimit } : {}),
   };
 }
 
@@ -231,7 +236,7 @@ export class IdentityToolRouter implements ToolRouter {
     // Restamp the per-call workspace from the ROUTED namespace, not ambient
     // state.
     const outer = getRequestContext();
-    const perCallCtx = buildPerCallContext(outer, routed);
+    const perCallCtx = buildPerCallContext(outer, routed, this.isToolAllowed);
     return runWithRequestContext(perCallCtx, () =>
       routed.source.execute(bareToolName, call.input, signal),
     );

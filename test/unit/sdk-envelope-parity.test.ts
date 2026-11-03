@@ -19,7 +19,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { ACTION_METHOD } from "../../web/src/bridge/extensions.ts";
+import { OPEN_CONNECTOR_SETTINGS_METHOD, OPEN_METHOD } from "../../web/src/bridge/extensions.ts";
 import { buildHostCapabilities } from "../../web/src/bridge/host-capabilities.ts";
 import { validateAppToHostMessage } from "../../web/src/bridge/validate.ts";
 
@@ -165,8 +165,8 @@ function completeHandshake(): void {
  * Let the SDK's outbound envelope reach the capture.
  *
  * `connect()` runs on the spec's own client, which posts through its transport
- * over several async hops rather than the single microtask the SDK used to
- * take. A macrotask turn covers both, so every site waits the same way instead
+ * over several async hops rather than a single microtask. A macrotask turn
+ * covers any number of them, so every site waits the same way instead
  * of each one guessing how many `Promise.resolve()`s its call needs.
  */
 async function flush(): Promise<void> {
@@ -233,10 +233,9 @@ describe("Synapse SDK ⇄ host bridge schema parity", () => {
   });
 
   it("app.updateModelContext emits a schema-valid request (carries an id)", async () => {
-    // Regression: the host previously required `id` on
-    // `ui/update-model-context`, dropping every model-context push from every
-    // synapse-app. The spec defines it as a **request**, so the SDK sends it
-    // with an `id` and the host answers it. Schema must admit that shape.
+    // The spec defines `ui/update-model-context` as a **request**, so the SDK
+    // sends it with an `id` and the host answers it. Schema must admit that
+    // shape, or every model-context push from every synapse-app is dropped.
     const app = await connectAndHandshake();
 
     // Sends immediately; the 250ms debounce moved into `useModelContext`.
@@ -292,27 +291,41 @@ describe("Synapse SDK ⇄ host bridge schema parity", () => {
     expect(v.ok, `ui/message: ${v.reason}`).toBe(true);
   });
 
-  it("action() emits a schema-valid ai.nimblebrain/action envelope", async () => {
-    const { action } = await import("@nimblebrain/synapse");
+  it("open() emits a schema-valid ai.nimblebrain/open request", async () => {
+    const { open } = await import("@nimblebrain/synapse");
     const app = await connectAndHandshake();
 
-    action(app, "openConversation", { id: "abc-123" });
+    void open(app, "conversation://abc-123");
+    await flush();
 
-    const env = lastEnvelopeWithMethod(ACTION_METHOD);
+    const env = lastEnvelopeWithMethod(OPEN_METHOD);
     expect(env).toBeDefined();
     const v = validateAppToHostMessage(env);
-    expect(v.ok, `${ACTION_METHOD}: ${v.reason}`).toBe(true);
+    expect(v.ok, `${OPEN_METHOD}: ${v.reason}`).toBe(true);
+  });
+
+  it("openConnectorSettings() emits a schema-valid request", async () => {
+    const { openConnectorSettings } = await import("@nimblebrain/synapse");
+    const app = await connectAndHandshake();
+
+    void openConnectorSettings(app);
+    await flush();
+
+    const env = lastEnvelopeWithMethod(OPEN_CONNECTOR_SETTINGS_METHOD);
+    expect(env).toBeDefined();
+    const v = validateAppToHostMessage(env);
+    expect(v.ok, `${OPEN_CONNECTOR_SETTINGS_METHOD}: ${v.reason}`).toBe(true);
   });
 
   it("every envelope captured during a typical session validates", async () => {
-    // Aggregate check: nothing the SDK emits across init + a call + an action
+    // Aggregate check: nothing the SDK emits across init + a call + an open
     // is allowed to be malformed. This catches drift in envelopes we didn't
     // think to test individually (e.g., size-changed notifications).
-    const { action } = await import("@nimblebrain/synapse");
+    const { open } = await import("@nimblebrain/synapse");
     const app = await connectAndHandshake();
 
     void app.callTool("report", {});
-    action(app, "openConversation", { id: "x" });
+    void open(app, "conversation://x");
     await flush();
 
     expectAllCapturedValid();

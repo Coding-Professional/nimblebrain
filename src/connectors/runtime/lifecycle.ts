@@ -1,6 +1,9 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { oauthClientIdentity } from "../../brand/index.ts";
 import { resolveConnectorSkillsConfig } from "../../config/connector-skills.ts";
+import type { AccountLookup } from "../../connectors/catalog/account-lookup.ts";
+import type { CatalogEntriesReader } from "../../connectors/catalog/binding.ts";
 import type { ManagedConnectorProvider } from "../../connectors/providers/managed-provider.ts";
 import {
   type ManagedConnectorRegistry,
@@ -9,7 +12,6 @@ import {
 import type { EventSink } from "../../engine/types.ts";
 import type { ConnectorOwner } from "../../identity/connector-owner.ts";
 import { IdentityConnectorStore } from "../../identity/connector-store.ts";
-import { fleetIssuerOption } from "../../oauth/fleet-assertion.ts";
 import { mcpAuthCallbackUrl } from "../../oauth/mcp-callback-url.ts";
 import { log } from "../../observability/log.ts";
 import type { PlacementRegistry } from "../../runtime/placement-registry.ts";
@@ -25,15 +27,22 @@ import {
   hasMcpOAuthAuthLost,
   hasMcpOAuthTokens,
   McpOAuthRecords,
+  setMcpOAuthAuthLost,
 } from "../../tools/mcp-oauth-records.ts";
 import { McpSource } from "../../tools/mcp-source.ts";
-import { OAuthFlowExpiredError } from "../../tools/oauth-flow-registry.ts";
+import {
+  OAuthFlowAbandonedError,
+  OAuthFlowExpiredError,
+  OAuthFlowRefusedError,
+  peekFlowOwner,
+} from "../../tools/oauth-flow-registry.ts";
 import { SharedSourceRef, ToolRegistry } from "../../tools/registry.ts";
 import type { ToolSource } from "../../tools/types.ts";
 import { WorkspaceOAuthProvider } from "../../tools/workspace-oauth-provider.ts";
 import { validateAdditionalAuthorizationParams } from "../../util/oauth-params.ts";
 import { WorkspaceContext } from "../../workspace/context.ts";
 import { resolveWorkspaceDisplayName } from "../../workspace/workspace-store.ts";
+import { AccountLookups } from "./account-lookups.ts";
 import { brokeredConnectorDir, brokeredRef } from "./brokered.ts";
 import {
   type Connection,
@@ -43,8 +52,9 @@ import {
 } from "./connection.ts";
 import { brokeredConnectionPresent, connectorHasStaticAuth } from "./connector-auth.ts";
 import { sanitizePlacements } from "./defaults.ts";
+import { inBandAuthErrorsOption } from "./in-band-auth-errors.ts";
 import { resolveStaticOAuthClient, type StaticOAuthClient } from "./oauth-static-client.ts";
-import { defaultWorkDir, validateServerName } from "./paths.ts";
+import { defaultWorkDir, isUsableConnectorRef, validateServerName } from "./paths.ts";
 import { consumePendingAuth } from "./pending-auth-buffer.ts";
 import {
   buildUrlOAuthProvider,
@@ -73,7 +83,9 @@ import type {
  * operator. (#1245)
  */
 export function userFacingStartError(err: unknown, raw: string): string {
-  if (err instanceof OAuthFlowExpiredError) return err.userMessage;
+  if (err instanceof OAuthFlowExpiredError || err instanceof OAuthFlowRefusedError) {
+    return err.userMessage;
+  }
   return raw;
 }
 
@@ -92,7 +104,8 @@ type SeedManifestMeta = {
 /**
  * A user-initiated interactive connect (`startIdentityAuth`) can't start a clean
  * OAuth flow because a start for the same `(userId, serverName)` is already in
- * flight, or the source is already connected. Retriable and NOT a server fault —
+ * flight, or the source is already connected. A sign-in that only waits on its
+ * person is not this: Connect resumes it. Retriable and NOT a server fault —
  * the caller should back off and retry, not read logs. Surfaced as a `409` at
  * the route layer.
  */
@@ -237,6 +250,30 @@ export class ConnectorLifecycleManager {
   private getConnectorMcpDeps: ((wsId: string) => ConnectorMcpDeps) | null = null;
 
   /**
+   * Reads the operator catalog. Set by Runtime after construction
+   * (`setCatalogReader`). Every path here that builds a connection from an
+   * installed ref passes it to `resolveRefTransport`, which a minted fleet
+   * connector needs: its credential settings come from its catalog entry at
+   * every start. Read only through {@link catalogReader}.
+   */
+  private readCatalog: CatalogEntriesReader | null = null;
+
+  /**
+   * The wired catalog reader, or one that rejects when none is wired. This is
+   * the one runtime guard left on the catalog: the reader arrives after
+   * construction (`setCatalogReader`, the lifecycle's settable-dependency
+   * pattern), so the type cannot require it here. An unwired reader rejects,
+   * which `resolveRefTransport` reads as an unreadable catalog, so a minted
+   * connector fails to start rather than mint from its stored copy.
+   */
+  private catalogReader(): CatalogEntriesReader {
+    return (
+      this.readCatalog ??
+      (() => Promise.reject(new Error("catalog reader not wired (setCatalogReader)")))
+    );
+  }
+
+  /**
    * Notified when a workspace connection reaches `running`.
    *
    * Wired by the runtime at construction ({@link setConnectionRunningObserver})
@@ -337,7 +374,7 @@ export class ConnectorLifecycleManager {
    * disconnect tool refuses an established connection where it is false.
    */
   isDisconnectable(ref: ConnectorRef | undefined): boolean {
-    if (!ref || !("url" in ref)) return false;
+    if (!ref) return false;
     const brokered = brokeredRef(ref);
     if (brokered) {
       const provider = this.managedConnectors.get(brokered.provider);
@@ -359,6 +396,11 @@ export class ConnectorLifecycleManager {
    */
   setConnectorMcpDepsFactory(factory: (wsId: string) => ConnectorMcpDeps): void {
     this.getConnectorMcpDeps = factory;
+  }
+
+  /** Wire the operator catalog reader. See {@link readCatalog}. */
+  setCatalogReader(reader: CatalogEntriesReader): void {
+    this.readCatalog = reader;
   }
 
   /**
@@ -464,7 +506,7 @@ export class ConnectorLifecycleManager {
       if (!materialized) return [];
 
       log.debug("mcp", `[connector-skills] bound overlay "${identity}" → ${serverName} (${wsId})`);
-      return [{ identity, version: config.version, sha: resolved.sha, path: materialized.path }];
+      return [{ identity, version: config.version, sha: resolved.sha }];
     } catch (err) {
       // Non-fatal: the connector is installed regardless. Surface the reason so
       // an operator can see why an expected overlay didn't bind.
@@ -600,7 +642,9 @@ export class ConnectorLifecycleManager {
     // `disconnect` (which invalidates "all" including the client record), but a
     // leftover from a partial earlier disconnect shouldn't survive an
     // uninstall. Worst case the keys are already gone; `deleteAll` is a no-op
-    // then.
+    // then. A pending `auth_lost` write lands first, so it cannot re-create
+    // the flag after the records are gone.
+    await this.settleCredentialLossWrites(serverName, instance.wsId);
     try {
       await new McpOAuthRecords({
         owner: { type: "workspace", wsId: instance.wsId },
@@ -788,9 +832,10 @@ export class ConnectorLifecycleManager {
     instance.connections.set(principalId, next);
 
     logTransition(serverName, wsId, existing?.state, next);
+    this.persistBrokeredCredentialLoss(instance, existing?.state, newState);
 
-    // Recompute summary state so legacy consumers (HealthMonitor,
-    // briefing-collector, runtime status API) see the right surface.
+    // Recompute the instance-level summary state, which readers that do not
+    // track per-principal connections see.
     instance.state = summarizeConnectionState(instance.connections);
 
     this.notifyConnectionRunning(serverName, wsId, principalId, newState);
@@ -807,6 +852,80 @@ export class ConnectorLifecycleManager {
         ...(next.lastError ? { lastError: next.lastError } : {}),
       },
     });
+  }
+
+  /**
+   * Keep a brokered connection's `reauth_required` across a restart. The
+   * revalidator's flip is the only record of a broker's lost credential, and the
+   * boot seed otherwise reads the broker's local account as connected and seeds
+   * `running`. The `auth_lost` flag is set when a live connection enters
+   * `reauth_required` and cleared when it leaves for `running` (a Reconnect);
+   * disconnect and uninstall clear it themselves. A first record (`from`
+   * absent) is the boot seed, which read the flag and has nothing to write.
+   *
+   * Writes are chained per connection, so a clear never lands before the set it
+   * follows. Best-effort: a failed write is logged, and the in-memory state
+   * stands for this process.
+   */
+  private persistBrokeredCredentialLoss(
+    instance: ConnectorInstance,
+    from: ConnectionState | undefined,
+    to: ConnectionState,
+  ): void {
+    if (from === undefined || from === to || !brokeredRef(instance.ref)) return;
+    const owner: ConnectorOwner = { type: "workspace", wsId: instance.wsId };
+    let write: (() => Promise<void>) | undefined;
+    if (to === "reauth_required") write = () => setMcpOAuthAuthLost(owner, instance.serverName);
+    else if (from === "reauth_required" && to === "running") {
+      write = () => clearMcpOAuthAuthLost(owner, instance.serverName);
+    }
+    if (!write) return;
+    const key = `${instance.serverName}|${instance.wsId}`;
+    const next = (this.credentialLossWrites.get(key) ?? Promise.resolve())
+      .then(write)
+      .catch((err) => {
+        log.warn(
+          `[lifecycle] could not persist the credential state of ${instance.serverName} in ${instance.wsId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    this.credentialLossWrites.set(key, next);
+    void next.finally(() => {
+      if (this.credentialLossWrites.get(key) === next) this.credentialLossWrites.delete(key);
+    });
+  }
+
+  /** In-flight `auth_lost` writes for brokered connections, keyed `serverName|wsId`. */
+  private readonly credentialLossWrites = new Map<string, Promise<void>>();
+
+  /**
+   * Wait out a connection's pending `auth_lost` writes. Disconnect and uninstall
+   * call it before they clear the flag, so a set still in flight cannot land
+   * after the clear and bring the connection back as `reauth_required` on the
+   * next boot. The chain never rejects; failures are logged where they occur.
+   */
+  private async settleCredentialLossWrites(serverName: string, wsId: string): Promise<void> {
+    await this.credentialLossWrites.get(`${serverName}|${wsId}`);
+  }
+
+  /**
+   * Every workspace connection in `reauth_required`: its credential was
+   * rejected, and only a user's Reconnect (`startAuth`, or a broker's connect
+   * flow) can replace it. The state survives a restart through `auth_lost`, so
+   * this answers the same before and after one, whether or not a source is
+   * registered for the connection.
+   */
+  reauthRequiredConnections(): Array<{ serverName: string; wsId: string; principalId: string }> {
+    const out: Array<{ serverName: string; wsId: string; principalId: string }> = [];
+    for (const inst of this.instances.values()) {
+      for (const conn of inst.connections?.values() ?? []) {
+        if (conn.state === "reauth_required") {
+          out.push({ serverName: inst.serverName, wsId: inst.wsId, principalId: conn.principalId });
+        }
+      }
+    }
+    return out;
   }
 
   /**
@@ -881,7 +1000,7 @@ export class ConnectorLifecycleManager {
     if (!instance) {
       throw new Error(`[lifecycle] connector "${serverName}" not installed in workspace ${wsId}`);
     }
-    if (!instance.ref || !("url" in instance.ref)) {
+    if (!instance.ref) {
       throw new Error(`[lifecycle] missing URL ref for "${serverName}" — cannot construct source`);
     }
     // Every URL connector is workspace-scoped, so the only legal principal
@@ -908,7 +1027,7 @@ export class ConnectorLifecycleManager {
     // disconnect (tokens revoked but McpSource still alive in memory),
     // after reauth_required, and after dead/crashed states. We construct
     // a fresh provider+source below regardless of prior state.
-    await this.teardownConnectionSource(serverName, wsId, principalId);
+    await this.teardownConnectionSource(serverName, wsId);
 
     // Resolve pre-registered OAuth client config (Track A: oauthClient
     // + scopes + additionalAuthorizationParams). Dereferences the client
@@ -974,12 +1093,15 @@ export class ConnectorLifecycleManager {
         url: new URL(ref.url),
         // Resolved like the boot path, so Reconnect / `/v1/mcp-auth/initiate`
         // builds the same transport a restart would.
-        transportConfig: resolveRefTransport(ref).transportConfig,
+        transportConfig: (await resolveRefTransport(ref, this.catalogReader())).transportConfig,
+        resolveTransportConfig: async () =>
+          (await resolveRefTransport(ref, this.catalogReader())).transportConfig,
         // Honor the per-call flag, same source the OAuth provider above and the
         // startup-time validateConnectorUrl use — not the manager default — so the
         // transport's SSRF guard agrees with what this install was authorized for.
         allowInsecure: opts.allowInsecureRemotes === true,
         authProvider: provider,
+        ...(await inBandAuthErrorsOption(ref)),
       },
       this.eventSink,
       composeConnectorMcpContext(this.resolveConnectorMcpDeps(wsId), serverName),
@@ -1103,6 +1225,7 @@ export class ConnectorLifecycleManager {
       onInteractiveAuthRequired,
     } = args;
     return new WorkspaceOAuthProvider({
+      clientIdentity: oauthClientIdentity(),
       owner: { type: "workspace", wsId },
       ...(ownerDisplayName ? { ownerDisplayName } : {}),
       serverName,
@@ -1112,10 +1235,6 @@ export class ConnectorLifecycleManager {
       callbackUrl: opts.callbackUrl,
       allowInsecureRemotes: opts.allowInsecureRemotes === true,
       headlessAuthProbe: ref.headlessAuthProbe === true,
-      // Fleet tenant binding. Safe to pass for every server: the provider only
-      // attaches an assertion when the token endpoint's origin matches this
-      // issuer (the fleet authorizer), never to a vendor.
-      ...fleetIssuerOption(),
       onInteractiveAuthRequired,
       // Mid-session auth loss on this connection (a tool call hit
       // UnauthorizedError because the refresh token was rejected). Flip to
@@ -1138,8 +1257,8 @@ export class ConnectorLifecycleManager {
    * success transitions to `running` (and, for the headless / pre-authenticated
    * path with no captured URL, resolves the caller's auth-URL promise with `null`
    * — a success the route reports as "already connected"); on failure logs,
-   * transitions to `dead` with the error, and rejects the promise on the pre-auth
-   * path. Always disarms interactive auth so a later background reconnect of this
+   * transitions to `dead` with the error (`reauth_required` while `auth_lost` is
+   * set), and rejects the promise on the pre-auth path. Always disarms interactive auth so a later background reconnect of this
    * long-lived source can't drive a browser flow.
    */
   private startAuthBackground(args: {
@@ -1174,26 +1293,47 @@ export class ConnectorLifecycleManager {
           resolveAuthUrl(null);
         }
       })
-      .catch((err) => {
+      .catch(async (err) => {
+        // The source was stopped while its sign-in was open (a disconnect, an
+        // uninstall). Whoever stopped it records what the connection is now; a
+        // `dead` written here would land over that. The provider registers the
+        // flow and captures the auth URL in one synchronous step, so the
+        // caller's promise is already settled.
+        if (err instanceof OAuthFlowAbandonedError) {
+          log.info(
+            `[lifecycle] startAuth: ${serverName} sign-in abandoned for ${principalId} in ${wsId}`,
+          );
+          return;
+        }
         // An error with an empty `.message` falls back to its `.name`, so the
         // surfaced diagnostic is never blank, which is nearly as useless as
         // swallowing it. (The SDK's `OAuthError` carries the OAuth error code,
         // e.g. `invalid_grant`, as its message.)
         const msg = err instanceof Error ? err.message || err.name : String(err);
-        // Always surface the failure. The interactive path (capturedAuthUrl
-        // set) used to be swallowed here: if the background start() failed
-        // AFTER the auth URL was returned — the token exchange or reconnect
-        // threw once the user came back, or the pending flow timed out — the
-        // connection was left stuck in `pending_auth` ("Connecting…") forever
-        // with no log and no tokens. Log it and move the connection to `dead`
-        // (+ lastError) so the UI offers a recoverable Reconnect instead of
-        // an indefinite spinner.
+        // Always surface the failure, including on the interactive path
+        // (capturedAuthUrl set): if the background start() fails AFTER the
+        // auth URL was returned — the token exchange or reconnect throws once
+        // the user comes back, or the pending flow times out — a swallowed
+        // error leaves the connection stuck in `pending_auth` ("Connecting…")
+        // forever with no log and no tokens. Log it and move the connection to
+        // `dead` or `reauth_required` (+ lastError) so the UI offers a
+        // recoverable Reconnect instead of an indefinite spinner.
         log.warn(
           `[lifecycle] startAuth: ${serverName} start failed for ${principalId} in ${wsId}: ${msg}`,
         );
-        this.recordConnectionStateChange(serverName, wsId, principalId, "dead", {
+        await this.recordStartAuthFailure(source, serverName, wsId, principalId, {
           lastError: userFacingStartError(err, msg),
         });
+        // A sign-in that ended without a code leaves nothing a restart can
+        // use: only a person can sign in, and Reconnect builds a fresh source
+        // for that. This source's provider holds its one flow for life, so a
+        // restart would wait on the settled flow and fail the same way on
+        // every HealthMonitor sweep. Stopped, the source is terminal for the
+        // monitor and for on-demand reconnects (`isStopped`), and stays
+        // registered so a tool call still gets a structured answer.
+        if (err instanceof OAuthFlowExpiredError || err instanceof OAuthFlowRefusedError) {
+          void source.stop().catch(() => {});
+        }
         // `authUrlPromise` already resolved on the interactive path, so a
         // reject there is a no-op; only the headless / pre-auth failure path
         // (no captured URL) still needs the caller's promise rejected.
@@ -1206,6 +1346,35 @@ export class ConnectorLifecycleManager {
         // long-lived source must NOT drive a browser flow.
         provider.setInteractiveAuthAllowed(false);
       });
+  }
+
+  /**
+   * Record a failed `startAuth` start: `dead`, or `reauth_required` while
+   * `auth_lost` is set. With the flag set the credential is still the rejected
+   * one, so `reauth_required` is the state the boot seed derives from the same
+   * flag (a restart does not change it), and the one `HealthMonitor` and
+   * `tryRecoverSource` leave to the user. A teardown that lands during the read
+   * stops the source and records the connection itself, so nothing is written
+   * over it.
+   */
+  private async recordStartAuthFailure(
+    source: McpSource,
+    serverName: string,
+    wsId: string,
+    principalId: string,
+    opts: { lastError: string },
+  ): Promise<void> {
+    const authLost = await hasMcpOAuthAuthLost({ type: "workspace", wsId }, serverName).catch(
+      () => false,
+    );
+    if (source.isStopped()) return;
+    this.recordConnectionStateChange(
+      serverName,
+      wsId,
+      principalId,
+      authLost ? "reauth_required" : "dead",
+      opts,
+    );
   }
 
   /**
@@ -1232,15 +1401,15 @@ export class ConnectorLifecycleManager {
       throw new Error(`[lifecycle] connector "${serverName}" not installed in workspace ${wsId}`);
     }
     const ref = instance.ref;
-    if (!ref || !("url" in ref)) {
+    if (!ref) {
       throw new Error(`[lifecycle] missing URL ref for "${serverName}" — cannot revoke tokens`);
     }
-    // Stage 2: every URL connector is workspace-scoped. The only legal
+    // Every URL connector is workspace-scoped. The only legal
     // principal is `WORKSPACE_PRINCIPAL_ID`.
     if (principalId !== WORKSPACE_PRINCIPAL_ID) {
       throw new Error(
         `[lifecycle] disconnect: principal "${principalId}" is not a workspace principal — ` +
-          "Stage 2 cut the legacy user-scope path.",
+          "a workspace connector is disconnected as the workspace; disconnect a personal connector from the identity plane.",
       );
     }
 
@@ -1270,7 +1439,8 @@ export class ConnectorLifecycleManager {
         brokered: brokeredTarget.brokered,
         workDir: opts.workDir,
       });
-      await this.teardownConnectionSource(serverName, wsId, principalId);
+      await this.teardownConnectionSource(serverName, wsId);
+      await this.settleCredentialLossWrites(serverName, wsId);
       await clearMcpOAuthAuthLost({ type: "workspace", wsId }, serverName);
       this.recordConnectionStateChange(serverName, wsId, principalId, "not_authenticated", {
         authorizationUrl: undefined,
@@ -1285,6 +1455,7 @@ export class ConnectorLifecycleManager {
     }
 
     const provider = new WorkspaceOAuthProvider({
+      clientIdentity: oauthClientIdentity(),
       owner: { type: "workspace", wsId },
       serverName,
       workspaceContext: new WorkspaceContext({ wsId, workDir: opts.workDir }),
@@ -1301,10 +1472,11 @@ export class ConnectorLifecycleManager {
     });
     const result = await provider.revokeAndDeleteTokens({ connectorUrl: ref.url });
 
-    await this.teardownConnectionSource(serverName, wsId, principalId);
+    await this.teardownConnectionSource(serverName, wsId);
     // A disconnect is deliberate: whatever broke before it, the connection now
     // rests. Cleared after teardown, so a refresh still in flight on the old
     // source — racing the revoke above — cannot set it again.
+    await this.settleCredentialLossWrites(serverName, wsId);
     await clearMcpOAuthAuthLost({ type: "workspace", wsId }, serverName);
 
     this.recordConnectionStateChange(serverName, wsId, principalId, "not_authenticated", {
@@ -1321,6 +1493,35 @@ export class ConnectorLifecycleManager {
   }
 
   /**
+   * Point an installed connection at a replaced pre-registered OAuth client
+   * (`oauthClient`) and make it sign in again.
+   *
+   * Tokens, the PKCE verifier, and any identity were minted for the previous
+   * client, which the vendor will not accept from the new one, so every OAuth
+   * record goes. Nothing is revoked upstream: revocation authenticates as the
+   * client that minted the tokens, and its secret has already been replaced.
+   * The connection lands in `not_authenticated`, so the next Connect runs
+   * `startAuth` with `ref`'s client.
+   *
+   * The caller persists `ref` to the workspace record; this updates the copy the
+   * live instance reads. No-op when the connector is not installed here.
+   */
+  async replaceOAuthClient(serverName: string, wsId: string, ref: ConnectorRef): Promise<void> {
+    const instance = this.instances.get(`${serverName}|${wsId}`);
+    if (!instance) return;
+    instance.ref = { ...ref };
+    await this.teardownConnectionSource(serverName, wsId);
+    await new McpOAuthRecords({ owner: { type: "workspace", wsId }, serverName }).deleteAll();
+    this.recordConnectionStateChange(
+      serverName,
+      wsId,
+      WORKSPACE_PRINCIPAL_ID,
+      "not_authenticated",
+      { authorizationUrl: undefined },
+    );
+  }
+
+  /**
    * Stop and unwire the McpSource for one (connector, workspace-principal)
    * tuple. Stops `source.stop()` and removes the source from the
    * workspace registry.
@@ -1329,18 +1530,11 @@ export class ConnectorLifecycleManager {
    * live on the identity plane and never reach here.
    *
    * Idempotent: silently no-ops if no source is currently wired up.
+   *
+   * Takes no principal: every caller (`startAuth`, `disconnect`) has already
+   * refused one other than `WORKSPACE_PRINCIPAL_ID`.
    */
-  private async teardownConnectionSource(
-    serverName: string,
-    wsId: string,
-    principalId: string,
-  ): Promise<void> {
-    if (principalId !== WORKSPACE_PRINCIPAL_ID) {
-      throw new Error(
-        `[lifecycle] teardownConnectionSource: principal "${principalId}" is not a workspace principal — ` +
-          "Stage 2 cut the legacy user-scope path.",
-      );
-    }
+  private async teardownConnectionSource(serverName: string, wsId: string): Promise<void> {
     // `removeSource` calls `stop()` on the way out, so the registry entry is
     // both the handle and the teardown. There is no second reference to stop.
     const registry = this.workspaceRegistries().get(wsId);
@@ -1370,6 +1564,30 @@ export class ConnectorLifecycleManager {
     const source = this.workspaceRegistries().get(wsId)?.getSource(serverName);
     const unwrapped = source instanceof SharedSourceRef ? source.unwrap() : source;
     return unwrapped instanceof McpSource ? unwrapped : null;
+  }
+
+  /**
+   * Ask a connection's connected service which account it is signed in as,
+   * through the tool its catalog entry declares (`AccountLookup`). Null when
+   * the connection has no live source in this process, or the tool names no
+   * account. Never throws.
+   *
+   * Asks only a source that is already connected and starts nothing: a
+   * connectors listing must not start a cold connector to label it. A
+   * personal connector that is authenticated but cold is labelled the first
+   * time it is listed after something has used it.
+   */
+  lookUpAccount(
+    owner: ConnectorOwner,
+    serverName: string,
+    lookup: AccountLookup,
+  ): Promise<string | null> {
+    const source =
+      owner.type === "workspace"
+        ? this.connectionSource(serverName, owner.wsId)
+        : this.registriesByUser.get(owner.userId)?.getSource(serverName);
+    if (!(source instanceof McpSource) || !source.isAlive()) return Promise.resolve(null);
+    return this.accountLookups.ask(source, lookup);
   }
 
   /**
@@ -1427,6 +1645,33 @@ export class ConnectorLifecycleManager {
    */
   private readonly identityConnectorStarts = new Map<string, Promise<ToolSource | undefined>>();
 
+  /** Account lookups in flight and recently failed, per source. */
+  private readonly accountLookups = new AccountLookups();
+
+  /**
+   * The sign-in each interactive Connect handed out, keyed like
+   * `identityConnectorStarts`: the authorization URL and the flow `state` in
+   * it. Written when the provider hands a URL out and dropped with the start
+   * gate, so an entry never outlives the start it belongs to.
+   *
+   * It is what separates a start that waits on a PERSON from one that is in
+   * flight. The gate treats both as held, but only the second is busy: a
+   * sign-in can wait for the flow's whole TTL, and its person coming back to
+   * click Connect again is asking for that same sign-in.
+   */
+  private readonly identitySignIns = new Map<string, { url: string; state: string }>();
+
+  /**
+   * The authorization URL of a personal connector's sign-in that is still
+   * waiting on its person: handed out, and not yet answered by a callback.
+   * Once the callback delivers a code the flow leaves the registry and this
+   * reads undefined, though the start runs on (the exchange, the reconnect).
+   */
+  private waitingIdentitySignIn(connectorKey: string): string | undefined {
+    const signIn = this.identitySignIns.get(connectorKey);
+    return signIn && peekFlowOwner(signIn.state) !== null ? signIn.url : undefined;
+  }
+
   /**
    * Per-`${serverName}|${wsId}` timestamp (epoch ms) of the last
    * best-effort recovery attempt (`tryRecoverSource`). Negative cache: a
@@ -1435,10 +1680,9 @@ export class ConnectorLifecycleManager {
    * successful recovery clears it.
    *
    * Per-pod by design, and correct under `replicas > 1` — do NOT move it
-   * to Redis/`SessionRegistry`. It guards a per-pod in-memory registry
-   * repair: a workspace registry is process-local and its sources are
-   * process-bound transports (see the "MCP Session Architecture" two-layer
-   * model — transports "never serialize, never share across processes").
+   * to a shared store. It guards a per-pod in-memory registry repair: a
+   * workspace registry is process-local and its sources are process-bound
+   * transports, which never serialize or move between processes.
    * A source missing from this pod's registry says nothing about another
    * pod's, so each pod must heal its own registry on its own evidence. A
    * cluster-shared cooldown would be a bug: one pod's failed heal would
@@ -1553,12 +1797,23 @@ export class ConnectorLifecycleManager {
 
     await startConnectorSource(ref, wsRegistry, this.eventSink, {
       allowInsecureRemotes: this.allowInsecureRemotes,
+      readCatalog: this.catalogReader(),
       // A recovery that fails must not be destructive. With this set, the catch
       // sees the retained entry still holding the name and leaves it alone, so a
       // failed attempt is a no-op rather than a downgrade — the source stays
       // registered and unstopped, and HealthMonitor keeps working on it.
       keepRegisteredOnStartFailure: true,
       workspaceContext: new WorkspaceContext({ wsId, workDir }),
+      // Same as every other path that builds a workspace source: a credential
+      // rejected on this source must reach the connection record.
+      onAuthLost: () => {
+        this.recordConnectionStateChange(
+          serverName,
+          wsId,
+          WORKSPACE_PRINCIPAL_ID,
+          "reauth_required",
+        );
+      },
       // Re-thread on reconnect so a Composio OAuth callback doesn't
       // silently drop the connector's host-resources handlers. The
       // composio-auth callback path goes through here.
@@ -1597,8 +1852,13 @@ export class ConnectorLifecycleManager {
    * authenticated" (cross-pod / persisted connection state is the deferred reauth
    * slice). Used by `list_personal_connectors` so a just-connected connector
    * reflects "running" instead of the resting state.
+   *
+   * A source whose sign-in still waits on its person is registered and not
+   * running: it reads false, so the listing offers Connect (which resumes that
+   * sign-in) and does not call it connected.
    */
   isIdentityConnectorRunning(userId: string, serverName: string): boolean {
+    if (this.waitingIdentitySignIn(`${userId}|${serverName}`)) return false;
     return this.registriesByUser.get(userId)?.hasSource(serverName) ?? false;
   }
 
@@ -1638,6 +1898,7 @@ export class ConnectorLifecycleManager {
     await startConnectorSource(ref, registry, this.eventSink, {
       allowInsecureRemotes: this.allowInsecureRemotes,
       identityOwner: { userId, workDir },
+      readCatalog: this.catalogReader(),
     });
     return registry.getSource(serverName);
   }
@@ -1658,7 +1919,7 @@ export class ConnectorLifecycleManager {
    * LOCAL credentials, so the platform forgets them. The workspace `uninstall`
    * DOES revoke upstream (`revokeUrlConnectorTokens` for DCR, the provider's
    * `cleanup` arm for a brokered one) — a known asymmetry with this method, and
-   * one the seam no longer blocks: `cleanup` takes an owner, so closing it is a
+   * one the seam does not block: `cleanup` takes an owner, so closing it is a
    * call, deliberately left to the connection-state / reauth slice rather than
    * changing teardown semantics here. A user who wants the vendor-side grant gone
    * meanwhile can revoke it in the vendor's own authorized-apps list.
@@ -1730,6 +1991,11 @@ export class ConnectorLifecycleManager {
    * second Connect finds the gate held and throws `ConnectorBusyError` (a
    * retriable 409 at the route) rather than racing a rival `auth()` chain.
    *
+   * A Connect that arrives while an earlier one's sign-in waits on the person
+   * resumes it: the same authorization URL is returned and nothing is started
+   * (see `identitySignIns`). Busy is for a start that is in flight, which
+   * lasts seconds; a sign-in can wait for the flow's whole TTL.
+   *
    * Minimal connection state by design: the returned URL drives the browser and
    * the source runs once the user returns; the rich per-user connection-state
    * model + reauth surfacing are deferred.
@@ -1755,6 +2021,13 @@ export class ConnectorLifecycleManager {
     // exists, or a start is already in flight either way, we can't run a clean
     // interactive flow — surface a retriable busy error instead of racing a
     // second `auth()` chain that would clobber the shared credential root.
+    //
+    // A sign-in still waiting on this person is the exception: nothing is in
+    // flight, and the same authorization URL carries on the same flow (state,
+    // PKCE pair, records). Handing it out again starts nothing, so it races
+    // nothing, and it is how someone who closed the provider's tab gets back.
+    const waiting = this.waitingIdentitySignIn(connectorKey);
+    if (waiting) return { authorizationUrl: waiting };
     if (registry.hasSource(serverName) || this.identityConnectorStarts.has(connectorKey)) {
       throw new ConnectorBusyError(serverName, userId);
     }
@@ -1771,6 +2044,7 @@ export class ConnectorLifecycleManager {
     const clearConnectorGate = (): void => {
       if (this.identityConnectorStarts.get(connectorKey) === sourceReady) {
         this.identityConnectorStarts.delete(connectorKey);
+        this.identitySignIns.delete(connectorKey);
       }
     };
 
@@ -1780,7 +2054,9 @@ export class ConnectorLifecycleManager {
         userId,
         serverName,
       );
-      if (!ref || !("url" in ref)) {
+      // The record is read off disk unvalidated: a row without a usable url is
+      // refused here, never handed to the transport to parse.
+      if (!ref || !isUsableConnectorRef(ref)) {
         throw new Error(`[lifecycle] "${serverName}" is not a personal connector for ${userId}`);
       }
 
@@ -1812,6 +2088,10 @@ export class ConnectorLifecycleManager {
         },
         (url) => {
           capturedAuthUrl = url;
+          // Each hand-out replaces the last: a flow that fell back to the
+          // connector's own scope runs on the fallback URL from then on.
+          const state = URL.canParse(url) ? new URL(url).searchParams.get("state") : null;
+          if (state) this.identitySignIns.set(connectorKey, { url, state });
           resolveAuthUrl(url);
         },
       );
@@ -1824,9 +2104,12 @@ export class ConnectorLifecycleManager {
         {
           type: "remote",
           url: new URL(ref.url),
-          transportConfig: ref.transport,
+          transportConfig: (await resolveRefTransport(ref, this.catalogReader())).transportConfig,
+          resolveTransportConfig: async () =>
+            (await resolveRefTransport(ref, this.catalogReader())).transportConfig,
           allowInsecure: opts.allowInsecureRemotes === true,
           authProvider: provider,
+          ...(await inBandAuthErrorsOption(ref)),
         },
         this.eventSink,
         composeConnectorMcpContext(undefined, serverName),
@@ -1867,9 +2150,17 @@ export class ConnectorLifecycleManager {
         })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message || err.name : String(err);
-          log.warn(
-            `[lifecycle] startIdentityAuth: ${serverName} start failed for ${userId}: ${msg}`,
-          );
+          // A sign-in abandoned by a stop (the connector was removed while it
+          // was open) is not a failed start.
+          if (err instanceof OAuthFlowAbandonedError) {
+            log.info(
+              `[lifecycle] startIdentityAuth: ${serverName} sign-in abandoned for ${userId}`,
+            );
+          } else {
+            log.warn(
+              `[lifecycle] startIdentityAuth: ${serverName} start failed for ${userId}: ${msg}`,
+            );
+          }
           void registry.removeSource(serverName).catch(() => {}); // ours to remove
           rejectAuthUrl(err instanceof Error ? err : new Error(msg));
         })
@@ -1922,9 +2213,8 @@ export class ConnectorLifecycleManager {
    *
    *   - returns `true` immediately if the source is already registered;
    *   - returns `false` for an unknown instance (connector not installed
-   *     here), a non-URL ref (named/stdio re-spawn is the heavier
-   *     `startConnectorSource` path — deferred; see the tracked follow-up),
-   *     or a recent failed attempt still inside the cooldown window;
+   *     here), an instance with no persisted ref, or a recent failed
+   *     attempt still inside the cooldown window;
    *   - otherwise re-spawns once from the persisted URL ref, stamps the
    *     attempt, and returns whether the source is now registered.
    *
@@ -1943,17 +2233,25 @@ export class ConnectorLifecycleManager {
     // Liveness, not membership. A boot-failed source stays REGISTERED so it
     // remains visible and HealthMonitor can heal it — so `hasSource` would say
     // "already fine" for exactly the sources that need this path most, and the
-    // app-open recovery that used to re-spawn them would never fire.
+    // app-open recovery that re-spawns them would never fire.
     if (wsRegistry.hasEstablishedSource(serverName)) return true;
 
     const key = `${serverName}|${wsId}`;
 
-    // Only an installed instance with a persisted URL ref is recoverable
-    // on this path. No instance → the connector isn't installed in this
-    // workspace (nothing to recover). A non-URL (named/stdio) ref needs
-    // the credential-resolving named-spawn path — out of scope here.
-    const ref = this.instances.get(key)?.ref;
-    if (!ref || !("url" in ref)) return false;
+    // Only an installed instance with a persisted ref is recoverable. No
+    // instance → the connector isn't installed in this workspace (nothing to
+    // recover).
+    const instance = this.instances.get(key);
+    const ref = instance?.ref;
+    if (!ref) return false;
+
+    // A rejected credential is not something a re-spawn can fix: only the
+    // user's Reconnect replaces it, and that builds its own source. A source
+    // registered here would fail its start and sit registered and down, which
+    // is what restarted the `HealthMonitor` bursts after every restart.
+    if (instance.connections?.get(WORKSPACE_PRINCIPAL_ID)?.state === "reauth_required") {
+      return false;
+    }
 
     const now = Date.now();
     const last = this.recoveryAttempts.get(key);
@@ -2059,7 +2357,9 @@ export class ConnectorLifecycleManager {
    *      `reauth_required`. The flag outlives the tokens so a restart keeps a
    *      broken connection apart from one the user disconnected, and it is read
    *      before `startError` because the boot that discovers the rejection
-   *      fails with it.
+   *      fails with it. A brokered connection carries the flag when the
+   *      revalidator found its credential gone; its local account survives
+   *      the loss, so the flag alone records `reauth_required`.
    *   3. Boot-start was attempted and threw (`startError`) → record `dead` with
    *      the message. Reconnecting is not the recovery path here (the
    *      credential is fine; the endpoint was unreachable), so this must not
@@ -2094,13 +2394,17 @@ export class ConnectorLifecycleManager {
     const owner = { type: "workspace", wsId } as const;
     // A brokered connector's readiness is its provider's to answer; see below.
     const brokered = brokeredConnectionPresent(this.managedConnectors, ref, wsId, workDir);
-    // Only a connection held in our OAuth records can carry `auth_lost`: a
-    // brokered or static-auth one keeps its credential elsewhere.
-    const oauthRecordAuth = brokered === undefined && !connectorHasStaticAuth(ref);
+    // A connection held in our OAuth records carries `auth_lost` from its
+    // provider, and a brokered one from the lifecycle when the revalidator
+    // found its credential gone (`persistBrokeredCredentialLoss`). A brokered
+    // connection's local account outlives the loss, so the flag alone decides
+    // it. Other static-auth connections keep their credential elsewhere.
+    const isBrokered = brokeredRef(ref) !== undefined;
+    const oauthRecordAuth = !isBrokered && !connectorHasStaticAuth(ref);
     if (
-      oauthRecordAuth &&
+      (isBrokered || oauthRecordAuth) &&
       (await hasMcpOAuthAuthLost(owner, serverName)) &&
-      (startError !== undefined || !(await hasMcpOAuthTokens(owner, serverName)))
+      (isBrokered || startError !== undefined || !(await hasMcpOAuthTokens(owner, serverName)))
     ) {
       this.recordConnectionStateChange(serverName, wsId, "_workspace", "reauth_required", {
         ...(startError ? { lastError: startError } : {}),

@@ -2,7 +2,9 @@ import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadBrand, resolvedBrand } from "../../src/brand/index.ts";
 import { loadConfig } from "../../src/cli/config.ts";
+import { ACME_BRAND } from "../helpers/acme-brand.ts";
 
 const testDir = join(tmpdir(), `nimblebrain-cli-unit-${Date.now()}`);
 
@@ -37,13 +39,13 @@ describe("loadConfig", () => {
   it("loads instance fields from config file", () => {
     const configPath = writeTestConfig("load.json", {
       providers: { anthropic: {} },
-      models: { default: "claude-opus-4-6" },
+      models: { default: "anthropic:claude-opus-4-6" },
       maxIterations: 15,
     });
 
     const config = loadConfig({ config: configPath });
     expect(config.providers).toEqual({ anthropic: {} });
-    expect(config.models).toEqual({ default: "claude-opus-4-6" });
+    expect(config.models).toEqual({ default: "anthropic:claude-opus-4-6" });
     expect(config.maxIterations).toBe(15);
   });
 
@@ -86,30 +88,31 @@ describe("loadConfig", () => {
       http: {},
       workDir: testDir,
       usage: { ledger: { retentionMonths: 6 } },
-      sessionStore: { type: "memory", ttlSeconds: 60 },
       secrets: {},
       telemetry: {},
       features: {},
       connectors: {},
       notifications: { poll: { intervalMs: 30000 } },
+      execution: { default: "native" },
       tasks: {},
       files: {},
+      brand: { name: "ACME" },
     };
     const fileOnly = new Set(["$schema", "version"]);
     const configurable = Object.keys(schema.properties).filter((k) => !fileOnly.has(k));
     expect(configurable.filter((k) => !(k in samples))).toEqual([]);
 
     const configPath = writeTestConfig("every-key.json", samples);
-    const config = loadConfig({ config: configPath }) as unknown as Record<string, unknown>;
+    const config: Record<string, unknown> = { ...loadConfig({ config: configPath }) };
+    loadBrand({});
     expect(configurable.filter((k) => config[k] === undefined)).toEqual([]);
     expect(config.usage).toEqual({ ledger: { retentionMonths: 6 } });
-    expect(config.sessionStore).toEqual({ type: "memory", ttlSeconds: 60 });
     expect(config.notifications).toEqual({ poll: { intervalMs: 30000 } });
   });
 
   it("strips workspace-owned fields from config", () => {
     const configPath = writeTestConfig("strip-workspace.json", {
-      models: { default: "claude-opus-4-6" },
+      models: { default: "anthropic:claude-opus-4-6" },
     });
     // Manually write workspace-owned fields into the JSON (bypasses schema)
     const fs = require("node:fs");
@@ -124,12 +127,12 @@ describe("loadConfig", () => {
     try {
       const config = loadConfig({ config: configPath });
       // Instance fields still loaded
-      expect(config.models).toEqual({ default: "claude-opus-4-6" });
+      expect(config.models).toEqual({ default: "anthropic:claude-opus-4-6" });
       // Workspace-owned fields stripped
       expect("agents" in config).toBe(false);
       expect(config.skillDirs).toBeUndefined();
-      expect(config.preferences).toBeUndefined();
-      expect(config.home).toBeUndefined();
+      expect("preferences" in config).toBe(false);
+      expect("home" in config).toBe(false);
     } finally {
       spy.mockRestore();
     }
@@ -233,11 +236,11 @@ describe("loadConfig", () => {
     const defaultDir = join(testDir, "workdir-test");
     mkdirSync(defaultDir, { recursive: true });
     const cfgPath = join(defaultDir, "nimblebrain.json");
-    writeFileSync(cfgPath, JSON.stringify({ models: { default: "from-workdir" } }));
+    writeFileSync(cfgPath, JSON.stringify({ models: { default: "test:from-workdir" } }));
 
     // Use explicit --config to test the loading behavior
     const config = loadConfig({ config: cfgPath });
-    expect(config.models?.default).toBe("from-workdir");
+    expect(config.models?.default).toBe("test:from-workdir");
     expect(config.configPath).toBe(cfgPath);
   });
 
@@ -254,10 +257,13 @@ describe("loadConfig", () => {
     expect(existsSync(expectedPath)).toBe(false);
 
     // Write and load to verify round-trip
-    writeFileSync(expectedPath, JSON.stringify({ models: { default: "test-model" } }, null, 2));
+    writeFileSync(
+      expectedPath,
+      JSON.stringify({ models: { default: "test:test-model" } }, null, 2),
+    );
     const config = loadConfig({ config: expectedPath });
     expect(config.configPath).toBe(expectedPath);
-    expect(config.models?.default).toBe("test-model");
+    expect(config.models?.default).toBe("test:test-model");
   });
 
   it("explicit --config takes precedence over defaultWorkDir config", () => {
@@ -265,15 +271,15 @@ describe("loadConfig", () => {
     mkdirSync(defaultDir, { recursive: true });
     writeFileSync(
       join(defaultDir, "nimblebrain.json"),
-      JSON.stringify({ models: { default: "from-workdir" } }),
+      JSON.stringify({ models: { default: "test:from-workdir" } }),
     );
 
     const explicitPath = writeTestConfig("explicit.json", {
-      models: { default: "from-explicit" },
+      models: { default: "test:from-explicit" },
     });
 
     const config = loadConfig({ config: explicitPath, defaultWorkDir: defaultDir });
-    expect(config.models?.default).toBe("from-explicit");
+    expect(config.models?.default).toBe("test:from-explicit");
     expect(config.configPath).toBe(explicitPath);
   });
 });
@@ -285,6 +291,63 @@ describe("config validation", () => {
     });
 
     expect(() => loadConfig({ config: configPath })).toThrow("Invalid config");
+  });
+
+  it("refuses a bare model id, naming the qualified form", () => {
+    const configPath = writeTestConfig("bare-model.json", {
+      models: { default: "claude-sonnet-4-6" },
+    });
+
+    expect(() => loadConfig({ config: configPath })).toThrow(
+      '/models/default: Model "claude-sonnet-4-6" has no provider. Write it as provider:model, e.g. "anthropic:claude-sonnet-4-6".',
+    );
+  });
+
+  it("loads a brand block and installs it", () => {
+    const configPath = writeTestConfig("brand-ok.json", { brand: ACME_BRAND });
+    try {
+      const config = loadConfig({ config: configPath });
+      expect(config.brand?.name).toBe("ACME");
+      expect(resolvedBrand().name).toBe("ACME");
+    } finally {
+      loadBrand({});
+    }
+  });
+
+  it("rejects at load a brand that fails a contrast pair", () => {
+    const configPath = writeTestConfig("brand-low-contrast.json", {
+      brand: { colors: { primary: ["#CCCCCC", "#6a8fe4"] } },
+    });
+    expect(() => loadConfig({ config: configPath })).toThrow(
+      "light mode: primary on background (links, accent text)",
+    );
+  });
+
+  it("warns on brand keys outside the schema and does not install them", () => {
+    const configPath = writeTestConfig("brand-unknown.json", {
+      brand: {
+        name: "ACME",
+        colors: { primary: ["#B53707", "#FF8A4C"], success: ["#0D6B45", "#3fbf85"] },
+        fonts: { mono: { stack: "ui-monospace, monospace" } },
+        radius: { md: "0.25rem" },
+      },
+    });
+    const spy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      loadConfig({ config: configPath });
+      const warnings = spy.mock.calls.map((c) => c[0] as string);
+      for (const key of ["success", "mono", "radius"]) {
+        expect(warnings.some((w) => w.includes(`Unknown key "${key}"`))).toBe(true);
+      }
+      expect(resolvedBrand()).toEqual({
+        name: "ACME",
+        colors: { primary: ["#B53707", "#FF8A4C"] },
+        fonts: {},
+      });
+    } finally {
+      spy.mockRestore();
+      loadBrand({});
+    }
   });
 
   it("warns on unknown keys but does not throw", () => {
@@ -311,7 +374,7 @@ describe("config validation", () => {
   it("passes validation on a full valid config", () => {
     const configPath = writeTestConfig("valid-full.json", {
       providers: { anthropic: { apiKey: "sk-test" } },
-      models: { default: "claude-opus-4-6" },
+      models: { default: "anthropic:claude-opus-4-6" },
       maxIterations: 20,
       maxInputTokens: 100000,
       maxOutputTokens: 8192,
@@ -334,7 +397,7 @@ describe("config validation", () => {
     }
   });
 
-  // Keys the loader no longer reads take the unknown-key path like any other:
+  // Keys the loader does not read take the unknown-key path like any other:
   // warned by name, ignored, and never copied into the runtime config.
   for (const [key, value] of [
     ["model", { provider: "anthropic" }],
@@ -348,7 +411,7 @@ describe("config validation", () => {
 
       const spy = spyOn(console, "error").mockImplementation(() => {});
       try {
-        const config = loadConfig({ config: configPath }) as unknown as Record<string, unknown>;
+        const config: Record<string, unknown> = { ...loadConfig({ config: configPath }) };
         const warnings = spy.mock.calls.map((c) => c[0] as string);
         expect(warnings.some((w) => w.includes(`Unknown key "${key}"`))).toBe(true);
         expect(config[key]).toBeUndefined();

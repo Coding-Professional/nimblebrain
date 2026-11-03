@@ -16,14 +16,18 @@ import type {
   Transport,
 } from "@modelcontextprotocol/client";
 import {
+  CLIENT_CAPABILITIES_META_KEY,
   Client,
+  isInputRequiredResult,
   ProtocolError,
+  ProtocolErrorCode,
   SdkErrorCode,
   SdkHttpError,
   UnauthorizedError,
 } from "@modelcontextprotocol/client";
 import { ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/core";
-import type { Server } from "@modelcontextprotocol/server";
+import type { ReadResourceResult, Server } from "@modelcontextprotocol/server";
+import { brandName } from "../brand/index.ts";
 import type { PlacementDeclaration, RemoteTransportConfig } from "../connectors/runtime/types.ts";
 import { textContent } from "../engine/content-helpers.ts";
 import {
@@ -36,13 +40,19 @@ import {
   type ToolResult,
 } from "../engine/types.ts";
 import {
+  collectResourceArgumentUris,
   HOST_RESOURCES_LIST_METHOD,
   HOST_RESOURCES_READ_METHOD,
   type HostResourcesRateLimit,
   type HostResourcesResolver,
   hostExtensions,
+  parseResourceArgumentsDeclaration,
+  RESOURCE_ARGUMENT_SPAN_EVENT,
+  RESOURCE_ARGUMENTS_EXTENSION_ID,
+  type ResourceArgumentsResolver,
+  resourceArgumentsClientExtension,
 } from "../host-resources/index.ts";
-import { requestIdentityAttrs, withSpan } from "../observability/index.ts";
+import { addSpanEvent, requestIdentityAttrs, withSpan } from "../observability/index.ts";
 import { log } from "../observability/log.ts";
 import { facetsClientExtension } from "../services/facets-extension.ts";
 import { lifecycleClientExtension } from "../services/lifecycle-extension.ts";
@@ -52,6 +62,7 @@ import {
   SkillsListResultSchema,
   skillsClientExtension,
 } from "../skills/skills-extension.ts";
+import { appsClientExtension } from "./apps-extension.ts";
 import { coerceInputForSchema } from "./coerce-input.ts";
 import {
   inlineTaskClient,
@@ -70,7 +81,9 @@ import {
   relayableParams,
   type ServerNotification,
 } from "./server-notifications.ts";
+import { withStructuredContentText } from "./structured-content-text.ts";
 import {
+  type McpCaller,
   type ResourceData,
   TaskAlreadyTerminalError,
   TaskNotFoundError,
@@ -79,7 +92,10 @@ import {
   type ToolExecuteOptions,
   type ToolSource,
 } from "./types.ts";
-import type { WorkspaceOAuthProvider } from "./workspace-oauth-provider.ts";
+import {
+  BackgroundReauthRequiredError,
+  type WorkspaceOAuthProvider,
+} from "./workspace-oauth-provider.ts";
 
 /**
  * How long a task handle is kept after its last update when the task declares
@@ -110,6 +126,23 @@ const TASK_CREATED_TIMEOUT_MS = 60_000;
 const LISTEN_RETRY_BASE_MS = 1_000;
 /** Ceiling on the listen retry delay. */
 const LISTEN_RETRY_MAX_MS = 60_000;
+/** Ceiling on a `resources/templates/list` read made while a prompt is assembled. */
+const RESOURCE_TEMPLATES_TIMEOUT_MS = 5_000;
+
+/**
+ * The `_meta` key on a resource template naming the view that shows its records: the
+ * `resourceUri` of one of the server's own placements (ADR-0059).
+ */
+export const TEMPLATE_VIEW_META = "ai.nimblebrain/view";
+
+/** One entry of a server's `resources/templates/list`, as the host keeps it. */
+export interface ResourceTemplateInfo {
+  uriTemplate: string;
+  name: string;
+  title?: string;
+  /** The `ui://` URI of the view that shows this template's records, when the server names one. */
+  view?: string;
+}
 
 /**
  * Per-connector context threaded into McpSource so its Client can answer
@@ -125,6 +158,13 @@ export interface ConnectorMcpContext {
   connectorId: string;
   hostResources: HostResourcesResolver;
   rateLimit: HostResourcesRateLimit;
+  /**
+   * Reads the resources a tool's declared arguments name, from the connector in
+   * this workspace that serves them (`ai.nimblebrain/resource-arguments`). When
+   * set, the connection claims the extension on both eras and every tool call
+   * carries the resolved entries in its `_meta`.
+   */
+  resourceArguments?: ResourceArgumentsResolver;
 }
 
 /**
@@ -150,7 +190,7 @@ export type { ResourceData } from "./types.ts";
  * one concrete class would lie about which transport shapes are valid.
  */
 type AuthFinishableTransport = Transport & {
-  finishAuth?: (authorizationCode: string) => Promise<void>;
+  finishAuth?: (authorizationCode: string, iss?: string) => Promise<void>;
 };
 
 /** Discriminated union for how McpSource connects to its MCP server. */
@@ -159,6 +199,14 @@ export type McpTransportMode =
       type: "remote";
       url: URL;
       transportConfig?: RemoteTransportConfig;
+      /**
+       * Derives `transportConfig` again at every transport build (each start and
+       * restart). A source built from an installed ref passes it so a restart
+       * runs with the config a fresh start would: a minted fleet connector's
+       * credential settings come from its catalog entry, and one the catalog
+       * withdrew throws here, so the restart fails before anything is minted.
+       */
+      resolveTransportConfig?: () => Promise<RemoteTransportConfig | undefined>;
       /**
        * Dev-mode `allowInsecureRemotes` flag, threaded to the SSRF redirect
        * guard in `createRemoteTransport` so http://localhost endpoints work in
@@ -174,6 +222,14 @@ export type McpTransportMode =
        * retries `connect()` exactly once.
        */
       authProvider?: WorkspaceOAuthProvider;
+      /**
+       * Text the server puts in an `isError` result when it rejects the access
+       * token in-band (HTTP 200) instead of with a 401, from the connector's
+       * catalog entry (`inBandAuthErrors`). With an `authProvider`, the
+       * transport answers a matching `tools/call` result as the 401 it should
+       * have been; see `createInBandAuthRejectionFetch`.
+       */
+      inBandAuthErrors?: readonly string[];
     }
   | {
       type: "inProcess";
@@ -307,18 +363,47 @@ export function sanitizeReportedVersion(raw: string): string | undefined {
 }
 
 /**
+ * How long a remote source's memoized `tools/list` is trusted before a read
+ * re-fetches it. A remote server redeployed at the same URL changes its tools
+ * with no signal to an already-connected client: a stateless server loses no
+ * session, and the new process cannot notify a client of the old one. Every
+ * read of a remote source's tools, the agent's run listing and the connector
+ * pages alike, is bounded by this one age.
+ */
+export const REMOTE_TOOL_LIST_MAX_AGE_MS = 60_000;
+
+/**
+ * How long {@link McpSource.tools} waits on a stale remote source's re-fetch
+ * before serving the memo. A run lists tools as it starts, so a source used
+ * less often than the max age would otherwise always start on its old list.
+ * The wait is paid once per max age per source, and only by the read that
+ * starts the re-fetch.
+ */
+export const REMOTE_TOOL_REFRESH_WAIT_MS = 1_500;
+
+/**
  * Whether two mapped tool lists differ in a way the LLM or UI would observe —
- * the set of tool names, or any tool's description / input schema / execution
- * metadata. Order-independent (`tools/list` ordering isn't guaranteed stable
- * across server restarts). Used to gate the `toolsChanged` fan-out so a
- * refresh that returns the identical surface doesn't needlessly invalidate
- * memoized tool unions downstream.
+ * the set of tool names, or any tool's description, input or output schema,
+ * annotations, `_meta` or execution metadata. Order-independent (`tools/list`
+ * ordering isn't guaranteed stable across server restarts). Used to keep the
+ * memo's array when a refresh returns the same surface, so the order the model
+ * sees (and the prompt cache) holds, and to gate the `toolsChanged` fan-out.
  */
 export function toolListChanged(a: readonly Tool[], b: readonly Tool[]): boolean {
   if (a.length !== b.length) return true;
   const signature = (tools: readonly Tool[]) =>
     tools
-      .map((t) => JSON.stringify([t.name, t.description, t.inputSchema, t.execution ?? null]))
+      .map((t) =>
+        JSON.stringify([
+          t.name,
+          t.description,
+          t.inputSchema,
+          t.outputSchema ?? null,
+          t.annotations ?? null,
+          t.meta ?? null,
+          t.execution ?? null,
+        ]),
+      )
       .sort()
       .join("\u0000");
   return signature(a) !== signature(b);
@@ -402,6 +487,9 @@ export class McpSource implements ToolSource {
   /** A {@link refreshTools} in progress, shared so concurrent refreshes reuse
    *  one round-trip AND emit the change signal at most once. */
   private refreshInFlight: Promise<Tool[]> | null = null;
+  /** Bumped by {@link stop}, so a refresh begun on the old connection cannot
+   *  write the new connection's memo when its answer lands. */
+  private toolListGeneration = 0;
   private dead = false;
   /** A restart in progress, shared so concurrent recoveries reuse one
    *  stop()/start() cycle instead of stacking. Resource reads are NOT serialized
@@ -417,6 +505,9 @@ export class McpSource implements ToolSource {
    *  `SESSION_RECOVERY_DELAYS_MS`; overridable so tests exercise the policy
    *  branches without real sleeps. */
   private recoveryDelaysMs?: readonly number[];
+  /** How long {@link tools} waits on a stale remote re-fetch. Defaults to
+   *  `REMOTE_TOOL_REFRESH_WAIT_MS`; overridable so tests need no real wait. */
+  private toolsRefreshWaitMs?: number;
   /** Timestamp of the last FAILED on-demand reconnect ({@link reconnectOnDemand}),
    *  or null when there is no unpaid failure — reset by any successful `start()`
    *  (so a heal via HealthMonitor / recover() clears it too, not just
@@ -448,6 +539,13 @@ export class McpSource implements ToolSource {
    *  Untrusted (the server sets it); display-only. Undefined until start()
    *  completes, if the server reports none, or after stop(). */
   private _serverVersion: string | undefined;
+  /**
+   * The server's `resources/templates/list`, fetched on first ask after each
+   * connect and kept until the next one. Null means not fetched on this
+   * connection. Survives `stop()`, so an idle-closed source still reports
+   * what it published while it was up.
+   */
+  private resourceTemplatesMemo: ResourceTemplateInfo[] | null = null;
   /**
    * For `inProcess` mode only — the linked-pair MCP server that this source
    * speaks to. Owned by McpSource (constructed in `start()` via
@@ -668,6 +766,8 @@ export class McpSource implements ToolSource {
     // the system prompt composer can render it in the apps list.
     const instructions = this.client.getInstructions();
     this._instructions = typeof instructions === "string" ? instructions : undefined;
+    // A fresh connection may publish a different template set; re-read lazily.
+    this.resourceTemplatesMemo = null;
 
     // Capture the server's reported version (serverInfo.version, from the same
     // initialize response). The server is untrusted — a Composio gateway or a
@@ -703,6 +803,9 @@ export class McpSource implements ToolSource {
    */
   private async initTransport(): Promise<void> {
     if (this.mode.type === "remote") {
+      if (this.mode.resolveTransportConfig) {
+        this.mode = { ...this.mode, transportConfig: await this.mode.resolveTransportConfig() };
+      }
       this.transport = await createRemoteTransport(
         this.mode.url,
         this.mode.transportConfig,
@@ -710,6 +813,7 @@ export class McpSource implements ToolSource {
         {
           workspaceId: this.connectorContext?.workspaceId,
           allowInsecure: this.mode.allowInsecure ?? false,
+          inBandAuthErrors: this.mode.inBandAuthErrors,
         },
       );
 
@@ -768,7 +872,7 @@ export class McpSource implements ToolSource {
     const authProvider = this.mode.authProvider;
     const transport = this.transport;
     try {
-      const code = await authProvider.awaitPendingFlow();
+      const { code, iss } = await authProvider.awaitPendingFlow();
       const authable = transport as AuthFinishableTransport;
       const finishAuth = authable.finishAuth?.bind(authable);
       if (typeof finishAuth !== "function") {
@@ -776,7 +880,9 @@ export class McpSource implements ToolSource {
           `[mcp-source] transport does not support finishAuth (got ${transport.constructor.name})`,
         );
       }
-      await authProvider.exchangeAuthorizationCode(() => finishAuth(code));
+      // `iss` goes with the code: the SDK refuses an RFC 9207 server's code
+      // without it, as the mix-up defense the spec requires.
+      await authProvider.exchangeAuthorizationCode(() => finishAuth(code, iss));
       log.debug("mcp", `[oauth] ${this.name}: finishAuth ok, recreating transport for retry`);
 
       // Drop the first-attempt transport+client. Both are single-use after a
@@ -816,6 +922,7 @@ export class McpSource implements ToolSource {
       // path onto the bottom seam instead of early-returning.
       this.emitToolsChanged();
       this.resubscribeResources();
+      this.resourceTemplatesMemo = null;
     } catch (retryErr) {
       await this.cleanupOnStartFailure();
       throw retryErr;
@@ -914,7 +1021,13 @@ export class McpSource implements ToolSource {
     const transport = this.transport;
     if (!client || !transport) return;
     this.protocolEra = client.getProtocolEra() === "modern" ? "modern" : "legacy";
-    const wire = TaskWire.attach(this.name, client, transport, CLIENT_INFO, McpSource.CAPABILITIES);
+    const wire = TaskWire.attach(
+      this.name,
+      client,
+      transport,
+      CLIENT_INFO,
+      this.clientCapabilities(),
+    );
     this.taskClient = wire
       ? taskClientFor(wire)
       : inlineTaskClient((params, signal) => client.callTool(params, { signal }));
@@ -1117,6 +1230,7 @@ export class McpSource implements ToolSource {
       {
         workspaceId: this.connectorContext?.workspaceId,
         allowInsecure: this.mode.allowInsecure ?? false,
+        inBandAuthErrors: this.mode.inBandAuthErrors,
       },
     );
     // onclose is wired in `start()` AFTER the connect succeeds — same
@@ -1141,6 +1255,9 @@ export class McpSource implements ToolSource {
    * that would opt every SDK call in, and the SDK cannot read a task result;
    * the task wire claims it per request instead (`mcp-task-client.ts`).
    *
+   * `io.modelcontextprotocol/ui` (MCP Apps) is claimed on both eras: the web
+   * shell renders a `ui://` resource from any connector, and a server that
+   * checks the claim attaches no UI to a client without it.
    * `io.modelcontextprotocol/skills` (SEP-2640) is claimed on both eras
    * because skill discovery runs on both: {@link listSkills} enumerates, and
    * the runtime verifies each `SKILL.md` it later reads against the listing.
@@ -1153,11 +1270,30 @@ export class McpSource implements ToolSource {
    */
   private static readonly CAPABILITIES: ClientCapabilities = {
     extensions: {
+      ...appsClientExtension(),
       ...skillsClientExtension(),
       ...facetsClientExtension(),
       ...lifecycleClientExtension(),
     },
   };
+
+  /**
+   * `CAPABILITIES`, plus `ai.nimblebrain/resource-arguments` on a source that
+   * resolves them: one whose `connectorContext` carries a resolver. The
+   * extension needs no server→client channel, so it is claimed on both eras,
+   * and only where it is served (ADR-0023).
+   */
+  private clientCapabilities(): ClientCapabilities {
+    const resolver = this.connectorContext?.resourceArguments;
+    if (!resolver) return McpSource.CAPABILITIES;
+    return {
+      ...McpSource.CAPABILITIES,
+      extensions: {
+        ...McpSource.CAPABILITIES.extensions,
+        ...resourceArgumentsClientExtension(resolver.limits),
+      },
+    };
+  }
 
   /**
    * What the 2025 `initialize` handshake claims on top of `CAPABILITIES`: the
@@ -1188,7 +1324,7 @@ export class McpSource implements ToolSource {
   private buildClient(): Client {
     return new EraCapabilitiesClient(
       CLIENT_INFO,
-      { capabilities: McpSource.CAPABILITIES, versionNegotiation: { mode: "auto" } },
+      { capabilities: this.clientCapabilities(), versionNegotiation: { mode: "auto" } },
       this.connectorContext ? McpSource.INITIALIZE_EXTENSIONS : {},
     );
   }
@@ -1594,6 +1730,9 @@ export class McpSource implements ToolSource {
     // Distinct durable marker for "deliberately stopped" (vs the failed-start
     // `stopping` that `cleanupOnStartFailure` also sets). Cleared by `start()`.
     this.stopped = true;
+    // A `start()` parked on an interactive OAuth flow settles now instead of at
+    // the flow's TTL, and a callback that arrives later finds no flow to finish.
+    if (this.mode.type === "remote") this.mode.authProvider?.abandonPendingFlow();
     // Abort any in-flight streams so their drainers unblock and the handle
     // map can be cleared without leaking outstanding `awaitToolTaskResult`
     // callers. Each drainer will reject its terminalDeferred, which is
@@ -1641,6 +1780,7 @@ export class McpSource implements ToolSource {
     this.toolsFetchedAt = null;
     this.toolsFetchInFlight = null;
     this.refreshInFlight = null;
+    this.toolListGeneration += 1;
     this._instructions = undefined;
     this._serverVersion = undefined;
   }
@@ -1649,6 +1789,42 @@ export class McpSource implements ToolSource {
    *  Undefined until start() completes; cleared by stop(). */
   getInstructions(): string | undefined {
     return this._instructions;
+  }
+
+  /**
+   * The resource templates this server advertises (`resources/templates/list`,
+   * first page), memoized per connection. Empty when the server declares no
+   * `resources` capability, does not answer the method, or is not connected and
+   * has never answered. The prompt reads this on every assembly, so a failure is
+   * memoized as empty rather than retried each turn, and the request carries a
+   * short timeout so a slow server cannot stall a turn.
+   */
+  async resourceTemplates(): Promise<ResourceTemplateInfo[]> {
+    if (this.resourceTemplatesMemo) return this.resourceTemplatesMemo;
+    const client = this.client;
+    if (!client?.getServerCapabilities()?.resources) return [];
+    let list: ResourceTemplateInfo[] = [];
+    try {
+      const res = await client.listResourceTemplates(undefined, {
+        timeout: RESOURCE_TEMPLATES_TIMEOUT_MS,
+      });
+      list = res.resourceTemplates.map((t) => {
+        const view = t._meta?.[TEMPLATE_VIEW_META];
+        return {
+          uriTemplate: t.uriTemplate,
+          name: t.name,
+          ...(typeof t.title === "string" ? { title: t.title } : {}),
+          ...(typeof view === "string" && view.length > 0 ? { view } : {}),
+        };
+      });
+    } catch (err) {
+      log.debug(
+        "mcp",
+        `resource-templates source=${this.name} error=${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (this.client === client) this.resourceTemplatesMemo = list;
+    return list;
   }
 
   /** Sanitized `serverInfo.version` from the MCP `initialize` response.
@@ -1781,7 +1957,12 @@ export class McpSource implements ToolSource {
   }
 
   async tools(): Promise<Tool[]> {
-    if (this.cachedTools) return this.cachedTools;
+    if (this.cachedTools) {
+      if (this.isRemote() && this.toolListOlderThan(REMOTE_TOOL_LIST_MAX_AGE_MS)) {
+        return this.revalidateTools(this.cachedTools);
+      }
+      return this.cachedTools;
+    }
     const fetched = await this.fetchToolList();
     this.cachedTools = fetched;
     this.toolsFetchedAt = Date.now();
@@ -1794,9 +1975,9 @@ export class McpSource implements ToolSource {
    * seam for picking up a remote server whose tool surface changed WITHOUT a
    * lifecycle event (redeployed at the same URL, no reconnect, no native
    * `tools/list_changed`). When the resulting surface actually differs from
-   * what was cached, fans out via `emitToolsChanged()` so the workspace tool
-   * union and the engine's LLM tool list converge in lockstep with the UI; a
-   * no-op refresh stays silent to avoid needless union invalidation.
+   * what was cached, fans out via `emitToolsChanged()` so the source's change
+   * listeners re-read it; a no-op refresh keeps the memo's array and stays
+   * silent.
    *
    * Note: does NOT refresh the reported handshake version
    * ({@link getReportedVersion}) — that comes from the `initialize` response,
@@ -1809,15 +1990,20 @@ export class McpSource implements ToolSource {
   async refreshTools(): Promise<Tool[]> {
     if (this.refreshInFlight) return this.refreshInFlight;
     const previous = this.cachedTools;
+    const generation = this.toolListGeneration;
     const p = (async () => {
       const fetched = await this.fetchToolList();
-      this.cachedTools = fetched;
+      // A stop() or restart while the request was out began a new generation:
+      // the memo now belongs to the new connection, so this answer is dropped.
+      if (generation !== this.toolListGeneration) return fetched;
       this.toolsFetchedAt = Date.now();
+      // An unchanged surface keeps the memo's array, so a server that lists the
+      // same tools in another order does not reorder what the model sees.
+      if (previous !== null && !toolListChanged(previous, fetched)) return previous;
+      this.cachedTools = fetched;
       // previous === null means the memo was empty; the connect seam already
       // emits on first population, so only a real surface change re-fans-out.
-      if (previous !== null && toolListChanged(previous, fetched)) {
-        this.emitToolsChanged();
-      }
+      if (previous !== null) this.emitToolsChanged();
       return fetched;
     })();
     this.refreshInFlight = p;
@@ -1853,6 +2039,48 @@ export class McpSource implements ToolSource {
       }
       throw err;
     }
+  }
+
+  /** Whether the memo was fetched more than `maxAgeMs` ago (or never). */
+  private toolListOlderThan(maxAgeMs: number): boolean {
+    return this.toolsFetchedAt === null || Date.now() - this.toolsFetchedAt > maxAgeMs;
+  }
+
+  /**
+   * Re-fetch a stale remote memo for {@link tools}, waiting at most
+   * {@link REMOTE_TOOL_REFRESH_WAIT_MS} before serving `memo`. Only the read
+   * that starts the re-fetch waits: while one is in flight every other read is
+   * served the memo at once, so a hung server costs one wait per max age, not
+   * one per listing. A slow re-fetch still lands in the memo for the next read.
+   *
+   * A failed re-fetch counts as a check, so a server that is down is asked
+   * again after the max age rather than on every listing. A stateful server
+   * redeployed behind the same URL answers with a lost session; that restarts
+   * the source, which reconnects and drops the memo.
+   */
+  private async revalidateTools(memo: Tool[]): Promise<Tool[]> {
+    if (this.refreshInFlight) return memo;
+    const refresh = this.refreshTools().catch((err: unknown) => {
+      this.toolsFetchedAt = Date.now();
+      log.debug(
+        "mcp",
+        `[${this.name}] tool-list revalidation failed, serving cached — ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      if (classifyConnectionFailure(err) === "session-lost") void this.tryRestart();
+      return null;
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const waited = new Promise<null>((resolve) => {
+      timer = setTimeout(
+        () => resolve(null),
+        this.toolsRefreshWaitMs ?? REMOTE_TOOL_REFRESH_WAIT_MS,
+      );
+    });
+    const fresh = await Promise.race([refresh, waited]);
+    clearTimeout(timer);
+    return fresh ?? memo;
   }
 
   /**
@@ -1961,8 +2189,11 @@ export class McpSource implements ToolSource {
     // every call to a server advertising the extension takes the task path,
     // which handles a complete answer as well. Everything else uses the inline
     // path, and so does a call that asks for it (`options.inline`, the host's
-    // lifecycle calls). A 2025-era tool that requires a task is refused here,
-    // before anything is sent.
+    // lifecycle calls). A call made for an outside client (`options.caller`)
+    // carries the client's side only on the inline path: the task path polls
+    // to completion, which an inline call under the request timeout would not.
+    // A 2025-era tool that requires a task is refused here, before anything is
+    // sent.
     const tool = this.findTool(toolName);
     const taskSupport = tool?.execution?.taskSupport;
     const refusal = this.taskRequiredRefusal(toolName, taskSupport);
@@ -1973,6 +2204,9 @@ export class McpSource implements ToolSource {
       TASKS_EXTENSION_ID in this.serverExtensions();
 
     const dispatchArgs = this.prepareDispatchArgs(tool, input, toolName);
+    // Resolved inside the dispatch span, so its audit events land on it, and
+    // kept for the retry in the catch below.
+    let meta: Record<string, unknown> | undefined;
 
     // Answers: "why is this tool call going inline vs task-augmented?" and
     // "is the tool cache populated?". Covers the whole dispatch decision in
@@ -1995,16 +2229,82 @@ export class McpSource implements ToolSource {
           "tool.path": path,
           ...requestIdentityAttrs(),
         },
-        () =>
-          isTaskAugmented
-            ? this.callToolAsTask(toolName, dispatchArgs, signal)
-            : this.callToolInline(toolName, dispatchArgs, signal),
+        async () => {
+          meta = await this.resourceArgumentsMeta(tool, dispatchArgs, signal);
+          return isTaskAugmented
+            ? this.callToolAsTask(toolName, dispatchArgs, signal, meta)
+            : this.callToolInline(toolName, dispatchArgs, signal, options?.caller, meta);
+        },
         // A client cancellation isn't a crash — don't mark the span failed.
         { isExpectedError: () => signal?.aborted === true },
       );
     } catch (err) {
-      return this.handleExecuteError(err, toolName, dispatchArgs, signal, isTaskAugmented);
+      // An error that asks the client to change its request is the outside
+      // client's to act on, so it goes back to the door as it is.
+      if (options?.caller && isClientActionable(err)) throw err;
+      return this.handleExecuteError(
+        err,
+        toolName,
+        dispatchArgs,
+        signal,
+        isTaskAugmented,
+        options?.caller,
+        meta,
+      );
     }
+  }
+
+  /**
+   * The `_meta` a call carries for the `ai.nimblebrain/resource-arguments`
+   * extension, or undefined when there is nothing to carry: the source has no
+   * resolver (an in-process platform source, a personal connector), the tool
+   * declares no resource arguments, or its declared arguments hold no strings.
+   *
+   * Computed once per call, before dispatch, and reused by the retry, so one
+   * call never reads the same resource twice. The workspace is the connection's
+   * own, never one the arguments could name; which of its connectors the call
+   * may read from is the resolver's to decide.
+   *
+   * Each URI's outcome is recorded on the active span (`tool.dispatch` for an
+   * agent's call) as a `resource_argument` event: the URI, the serving
+   * connector, the outcome code and the bytes handed on, never the contents.
+   */
+  private async resourceArgumentsMeta(
+    tool: Tool | undefined,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown> | undefined> {
+    const ctx = this.connectorContext;
+    if (!ctx?.resourceArguments) return undefined;
+    const declaration = parseResourceArgumentsDeclaration(tool?.meta);
+    if (!declaration) return undefined;
+    const uris = collectResourceArgumentUris(declaration, args);
+    if (uris.length === 0) return undefined;
+    const { entries, resolutions } = await ctx.resourceArguments.resolve(uris, {
+      workspaceId: ctx.workspaceId,
+      connectorId: ctx.connectorId,
+      ...(signal ? { signal } : {}),
+    });
+    for (const r of resolutions) {
+      addSpanEvent(RESOURCE_ARGUMENT_SPAN_EVENT, {
+        "resource_argument.uri": r.uri,
+        "resource_argument.outcome": r.outcome,
+        "resource_argument.bytes": r.bytes,
+        ...(r.source ? { "resource_argument.source": r.source } : {}),
+      });
+    }
+    return { [RESOURCE_ARGUMENTS_EXTENSION_ID]: entries };
+  }
+
+  /** A task call's resource-arguments `_meta`: the one its caller resolved, else resolved now. */
+  private async taskCallMeta(
+    toolName: string,
+    args: Record<string, unknown>,
+    given: Record<string, unknown> | null | undefined,
+    signal: AbortSignal,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (given !== undefined) return given ?? undefined;
+    return this.resourceArgumentsMeta(this.findTool(toolName), args, signal);
   }
 
   /**
@@ -2022,7 +2322,7 @@ export class McpSource implements ToolSource {
     return (
       `Tool "${toolName}" on ${this.name} cannot be called: it requires a task ` +
       `(execution.taskSupport "required"), and this server offers tasks only through the ` +
-      `MCP 2025-11-25 tasks utility, which NimbleBrain does not speak (see ADR-0046). ` +
+      `MCP 2025-11-25 tasks utility, which ${brandName()} does not speak (see ADR-0046). ` +
       `It can be called once the server supports the 2026-07-28 tasks extension ` +
       `(${TASKS_EXTENSION_ID}).`
     );
@@ -2051,6 +2351,8 @@ export class McpSource implements ToolSource {
     dispatchArgs: Record<string, unknown>,
     signal: AbortSignal | undefined,
     isTaskAugmented: boolean,
+    caller?: McpCaller,
+    meta?: Record<string, unknown>,
   ): ToolResult | Promise<ToolResult> {
     // Cancellation isn't a crash — the source is healthy, the client just asked
     // to stop. Emit a terminal tool.task_status for task-augmented calls so a
@@ -2077,7 +2379,7 @@ export class McpSource implements ToolSource {
 
     return this.recover<ToolResult>(
       err,
-      () => this.callToolInline(toolName, dispatchArgs, signal),
+      () => this.callToolInline(toolName, dispatchArgs, signal, caller, meta),
       {
         idempotent: !isTaskAugmented,
         // A throw on a tools/call is almost always the transport; recover even
@@ -2291,6 +2593,30 @@ export class McpSource implements ToolSource {
     uri: string,
     opts?: { logFailures?: boolean; reconnect?: boolean; signal?: AbortSignal },
   ): Promise<ResourceData | null> {
+    return this.readResourceAs(uri, opts, (result) => this.toResourceData(result));
+  }
+
+  /**
+   * Read a resource and return the server's `contents` as they came, every
+   * entry, or null where {@link readResource} would return null. For a reader
+   * that hands the result on rather than rendering it: the
+   * `ai.nimblebrain/resource-arguments` resolver passes it to another connector.
+   */
+  async readResourceContents(
+    uri: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<ReadResourceResult["contents"] | null> {
+    return this.readResourceAs(uri, opts, (result) =>
+      result.contents && result.contents.length > 0 ? result.contents : null,
+    );
+  }
+
+  /** The read both public readers share: one recovery policy, one projection each. */
+  private async readResourceAs<T>(
+    uri: string,
+    opts: { logFailures?: boolean; reconnect?: boolean; signal?: AbortSignal } | undefined,
+    project: (result: Awaited<ReturnType<Client["readResource"]>>) => T | null,
+  ): Promise<T | null> {
     if (!this.client) {
       // A torn-down client (a source degraded/crashed without re-creation) is the
       // persistent silent-404 shape — the most likely cause of a read that stays
@@ -2331,19 +2657,19 @@ export class McpSource implements ToolSource {
     // A caller's signal bounds the read and its recovery retry alike.
     const request = opts?.signal ? { signal: opts.signal } : undefined;
     try {
-      return this.toResourceData(await this.client.readResource({ uri }, request));
+      return project(await this.client.readResource({ uri }, request));
     } catch (err) {
       // Route every failure through the shared recovery. A genuine MCP miss
-      // (`shape.miss`) stays a silent null — e.g. a skill:// or app://instructions
-      // probe against a server that has neither. A stale session / mid-roll
+      // (`shape.miss`) stays a silent null — e.g. a skill:// probe against a
+      // server that has none. A stale session / mid-roll
       // gateway blip / torn transport re-initializes and retries (issue #571);
       // an auth loss flips the connection to `reauth_required`. Reads are
       // idempotent, so they retry across the deploy window.
-      return this.recover<ResourceData | null>(
+      return this.recover<T | null>(
         err,
         async () => {
           if (!this.client) throw err; // restart produced no client — keep recovering
-          return this.toResourceData(await this.client.readResource({ uri }, request));
+          return project(await this.client.readResource({ uri }, request));
         },
         {
           idempotent: true,
@@ -2497,17 +2823,35 @@ export class McpSource implements ToolSource {
    * run-scoped abort cancels the in-flight RPC. Inline calls are expected to
    * finish within the stock MCP request timeout (~60s); use task-augmented
    * tools for anything longer.
+   *
+   * A call made for an outside client (`caller`) goes through
+   * `callToolForCaller`, and an `input_required` answer comes back as it is.
    */
   private async callToolInline(
     toolName: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    caller?: McpCaller,
+    meta?: Record<string, unknown>,
   ): Promise<ToolResult> {
-    const result = await this.client?.callTool(
-      { name: toolName, arguments: args },
-      signal ? { signal } : undefined,
-    );
+    const result = caller
+      ? await this.callToolForCaller(toolName, args, caller, signal, meta)
+      : await this.client?.callTool(
+          { name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) },
+          signal ? { signal } : undefined,
+        );
     if (!result) return { content: [], isError: true };
+    if (isInputRequiredResult(result)) {
+      const { inputRequests, requestState } = result;
+      return {
+        content: [],
+        isError: false,
+        inputRequired: {
+          ...(inputRequests ? { inputRequests } : {}),
+          ...(requestState !== undefined ? { requestState } : {}),
+        },
+      };
+    }
     const toolResult: ToolResult = {
       content: Array.isArray(result.content) ? (result.content as ContentBlock[]) : [],
       structuredContent: (result as Record<string, unknown>).structuredContent as
@@ -2525,7 +2869,40 @@ export class McpSource implements ToolSource {
     if (promoted !== toolResult) {
       log.debug("mcp", `lie-normalized source=${this.name} tool=${toolName} path=inline`);
     }
-    return promoted;
+    // An outside client reads `structuredContent` itself; only the agent loop
+    // needs it as text.
+    return caller ? promoted : this.forAgent(toolName, promoted);
+  }
+
+  /**
+   * One inline `tools/call` made for an outside client. It carries that
+   * client's capabilities in its envelope (a `_meta` key the caller sets wins
+   * over the SDK's own), its answers and the connector's echoed state on a
+   * retry, and its progress callback. The SDK hands an `input_required` answer
+   * back as it is (`allowInputRequired`) instead of trying to fulfil it here.
+   */
+  private callToolForCaller(
+    toolName: string,
+    args: Record<string, unknown>,
+    caller: McpCaller,
+    signal?: AbortSignal,
+    meta?: Record<string, unknown>,
+  ) {
+    const { inputResponses, requestState, onProgress } = caller;
+    return this.client?.callTool(
+      {
+        name: toolName,
+        arguments: args,
+        ...(inputResponses ? { inputResponses } : {}),
+        ...(requestState !== undefined ? { requestState } : {}),
+        _meta: { ...meta, [CLIENT_CAPABILITIES_META_KEY]: caller.capabilities },
+      },
+      {
+        allowInputRequired: true,
+        ...(signal ? { signal } : {}),
+        ...(onProgress ? { onprogress: onProgress, resetTimeoutOnProgress: true } : {}),
+      },
+    );
   }
 
   /**
@@ -2546,8 +2923,11 @@ export class McpSource implements ToolSource {
     toolName: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
+    meta?: Record<string, unknown>,
   ): Promise<ToolResult> {
     const start = await this.startToolAsTask(toolName, args, {
+      // Resolved by `execute` already; passed so the task path does not resolve again.
+      meta: meta ?? null,
       // Agent-loop default owner context. The /mcp entry path will pass a
       // workspace-scoped one; inside the agent, all sources are already
       // workspace-scoped at registry-selection time, so an agent-loop
@@ -2580,7 +2960,21 @@ export class McpSource implements ToolSource {
     if (promoted !== toolResult) {
       log.debug("mcp", `lie-normalized source=${this.name} tool=${toolName} path=task`);
     }
-    return promoted;
+    return this.forAgent(toolName, promoted);
+  }
+
+  /**
+   * A remote server's result as the agent loop reads it: its structured data
+   * carried in text, since the model sees text only. In-process platform tools
+   * put what the model should read in `content` already, and a tool with an
+   * MCP Apps UI (`_meta.ui.resourceUri`) sends `structuredContent` to render
+   * that UI, not for the model's context.
+   */
+  private forAgent(toolName: string, result: ToolResult): ToolResult {
+    if (this.mode.type === "inProcess") return result;
+    const ui = this.findTool(toolName)?.meta?.ui as { resourceUri?: unknown } | undefined;
+    if (typeof ui?.resourceUri === "string") return result;
+    return withStructuredContentText(result);
   }
 
   /**
@@ -2608,7 +3002,16 @@ export class McpSource implements ToolSource {
   async startToolAsTask(
     toolName: string,
     args: Record<string, unknown>,
-    opts: { ownerContext: TaskOwnerContext; signal?: AbortSignal },
+    opts: {
+      ownerContext: TaskOwnerContext;
+      signal?: AbortSignal;
+      /**
+       * The call's resource-arguments `_meta`, when the caller resolved it
+       * already (`null`: resolved, nothing to carry). Omitted, it is resolved
+       * here, which is what the `/mcp` door's direct task calls rely on.
+       */
+      meta?: Record<string, unknown> | null;
+    },
   ): Promise<CreateTaskResult> {
     const client = this.client;
     if (!client || this.dead) {
@@ -2629,8 +3032,9 @@ export class McpSource implements ToolSource {
 
     const taskClient = this.taskClient;
     if (!taskClient) throw new Error(`McpSource "${this.name}" has no task client`);
+    const meta = await this.taskCallMeta(toolName, args, opts.meta, abortController.signal);
     const stream = taskClient.callToolStream(
-      { name: toolName, arguments: args },
+      { name: toolName, arguments: args, ...(meta ? { _meta: meta } : {}) },
       { signal: abortController.signal, createTimeoutMs: TASK_CREATED_TIMEOUT_MS },
     );
 
@@ -3157,7 +3561,7 @@ export function isMcpResourceMiss(err: unknown): boolean {
  * `source-absent` (a registry-lookup miss before any call) and `credential-lost`
  * (a `ConnectionRevalidator` probe verdict) are deliberately absent: they are not
  * thrown errors, so they cannot be classified from one. They reach recovery as
- * detector *signals* (handled by the recovery policy in Phase 2), never as
+ * detector *signals* (handled by the recovery policy, `policyFor`), never as
  * outputs of `classifyConnectionFailure`.
  */
 export type ConnectionFailure =
@@ -3169,6 +3573,18 @@ export type ConnectionFailure =
   | "timeout"
   | "unknown"
   | "none";
+
+/**
+ * Whether a connector's error asks the client to change its request: declare a
+ * capability the call needs (`-32021`). Nothing the runtime does on its own side
+ * can answer it. (A URL elicitation is an `input_required` request on
+ * 2026-07-28, which reaches the client as an answer, not an error.)
+ */
+function isClientActionable(err: unknown): boolean {
+  return (
+    err instanceof ProtocolError && err.code === ProtocolErrorCode.MissingRequiredClientCapability
+  );
+}
 
 /**
  * Classify a thrown error into a connection-failure class. Order matters:
@@ -3192,9 +3608,11 @@ export type ConnectionFailure =
  *   next call; only the caller's rate is wrong. Surfaces, never restarts — see the
  *   branch comment for why restarting here is actively harmful.
  * - **transient** — a mid-roll gateway blip (502/503/504, `bad_gateway`). Back off.
- * - **auth-lost** — a rejected credential. Detectable only as `UnauthorizedError`;
+ * - **auth-lost** — a rejected credential: `UnauthorizedError`, the SDK's
+ *   `ClientHttpAuthentication` when the retry after a refresh was refused too,
+ *   or the provider's `BackgroundReauthRequiredError` for a refused refresh;
  *   note its recovery *policy* is config-dependent — a static-auth remote can't
- *   reauth — but that decision is Phase 2's (see the SPEC §3.2), not this function's.
+ *   reauth — but that decision is the recovery policy's (`policyFor`), not this function's.
  * - **transport-dead** — a RECOGNIZED torn-transport shape (closed / refused /
  *   reset / timed out / fetch error / broken pipe).
  * - **none** — the server answered with a standard JSON-RPC *protocol* error
@@ -3288,7 +3706,7 @@ export function classifyConnectionFailure(err: unknown): ConnectionFailure {
   ) {
     return "transient";
   }
-  if (err instanceof UnauthorizedError) return "auth-lost";
+  if (isAuthLost(err, code)) return "auth-lost";
   // Standard JSON-RPC protocol errors the server *answered* with — the transport
   // is fine, restarting won't help.
   if (
@@ -3304,6 +3722,20 @@ export function classifyConnectionFailure(err: unknown): ConnectionFailure {
   if (isTornTransport(code, msg)) return "transport-dead";
   // Couldn't positively classify it — let the caller decide (recover vs surface).
   return "unknown";
+}
+
+/**
+ * A refused credential: the SDK's 401, the retry after a refresh refused too
+ * (`ClientHttpAuthentication`), or a refused refresh in the background, where
+ * the provider has already flipped `reauth_required` rather than open a
+ * browser flow (`BackgroundReauthRequiredError`).
+ */
+function isAuthLost(err: unknown, code: unknown): boolean {
+  return (
+    err instanceof UnauthorizedError ||
+    err instanceof BackgroundReauthRequiredError ||
+    code === SdkErrorCode.ClientHttpAuthentication
+  );
 }
 
 /**

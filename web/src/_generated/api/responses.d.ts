@@ -12,7 +12,7 @@ export interface ApiErrorBody {
     details?: Record<string, unknown>;
 }
 /** Mirrors `OrgRole` (`src/identity/types.ts`). */
-export type OrgRole = "owner" | "admin" | "member";
+export type OrgRole = "admin" | "member";
 /** Mirrors `WorkspaceRole` (`src/workspace/types.ts`). */
 export type WorkspaceRole = "admin" | "member";
 /** Mirrors `UserPreferences` (`src/identity/user.ts`). */
@@ -32,6 +32,17 @@ export interface ModelSlots {
 }
 /** Mirrors `ModelCost` (`src/model/catalog.ts`). USD per 1M tokens. */
 export interface ModelCost {
+    input: number;
+    output: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    reasoning?: number;
+    /** Rate cards for longer prompts, ascending by `aboveInputTokens`. */
+    tiers?: ModelCostTier[];
+}
+/** Mirrors `ModelCostTier` (`src/model/catalog.ts`). */
+export interface ModelCostTier {
+    aboveInputTokens: number;
     input: number;
     output: number;
     cacheRead?: number;
@@ -98,7 +109,6 @@ export interface FileEntry {
     folderId?: string | null;
     ownerId?: string;
     workspaceId?: string;
-    visibility?: "private" | "shared";
     deleted?: true;
     deletedAt?: string;
 }
@@ -139,9 +149,38 @@ export interface ChatToolCall {
     ms: number;
     /** Structured failure reason when `ok === false`. */
     errorReason?: string;
+    /** The call did not run; it waited for guidance the model had not read yet. */
+    held?: true;
 }
 export interface HealthResponse {
     status: "ok";
+}
+/** One typeface role as served. Mirrors `BrandFont` (`web/src/theme/brand.ts`). */
+export interface BrandFontResponse {
+    stack: string;
+    family?: string;
+    url?: string;
+    weight?: string;
+}
+/**
+ * The deployment's validated brand block, `{}` when none is configured: the
+ * value `GET /v1/brand.js` assigns to `window.__NB_BRAND__`. Mirrors
+ * `ResolvedBrand` (`web/src/theme/brand.ts`); each colour is a `[light, dark]`
+ * hex pair.
+ */
+export interface BrandResponse {
+    name?: string;
+    homepageUrl?: string;
+    logo?: {
+        light?: string;
+        dark?: string;
+        mark?: string;
+        raster?: string;
+    };
+    favicon?: string;
+    defaultTheme?: "light" | "dark" | "system";
+    colors?: Partial<Record<"primary" | "ring", readonly [light: string, dark: string]>>;
+    fonts?: Partial<Record<"sans" | "heading" | "reading", BrandFontResponse>>;
 }
 export interface ShellResponse {
     placements: PlacementEntry[];
@@ -267,6 +306,22 @@ export interface WellKnownErrorBody {
     error: string;
     message?: string;
 }
+/** One public run key (RFC 8037 Ed25519), as the run key set publishes it. */
+export interface RunPublicJwk {
+    kty: "OKP";
+    crv: "Ed25519";
+    x: string;
+    kid: string;
+    alg: "EdDSA";
+    use: "sig";
+}
+/**
+ * The installation's run key set: the keys a turn's credentials are signed
+ * with, read by a gateway to verify them (ADR-0057). Public halves only.
+ */
+export interface RunKeySetResponse {
+    keys: RunPublicJwk[];
+}
 export interface JsonRpcErrorBody {
     jsonrpc: "2.0";
     error: {
@@ -276,7 +331,7 @@ export interface JsonRpcErrorBody {
     };
     id: null;
 }
-/** The 2026-07-28 leg's answer to `tasks/get` or `tasks/cancel`, which the SDK does not route. */
+/** `/mcp`'s answer to `tasks/get` or `tasks/cancel`, which the SDK does not route. */
 export type McpTaskAnswer = {
     id: string | number;
 } & ({

@@ -18,11 +18,7 @@ They are different layers. A connector *declares which auth kind it uses*, and t
 | Connector | A catalog entry a workspace installs | Workspace admin, per workspace | The [connectors catalog](/config/connectors-catalog/) |
 
 <Aside type="note">
-**"Operator" here means platform-wide, which the product's own vocabulary predates.** The catalog field is `operatorSetup` and the UI says "Operator setup required" — both for the `auth: static` flow, which this split calls a *workspace-admin* action. Read those two as "someone has to configure this first," not as the platform-wide role.
-</Aside>
-
-<Aside type="note">
-**The auth kind is a deployment choice, not a property of the server.** Gmail is typically catalogued as `auth: composio` because Google requires app verification (`gmail.*`) most operators don't hold on day one — but the same server becomes `auth: static` or `auth: dcr` once you have your own verified OAuth app — see [migrating off the broker](/gateways/composio/#migrating-off-composio-per-toolkit). Nothing about Gmail forces the broker; your verification status does.
+**The auth kind is a deployment choice, not a property of the server.** Gmail is typically catalogued as `auth: composio` because Google requires app verification (`gmail.*`) most operators don't hold on day one — but the same server becomes `auth: static` or `auth: dcr` once you have your own verified OAuth client — see [migrating off the broker](/gateways/composio/#migrating-off-composio-per-toolkit). Nothing about Gmail forces the broker; your verification status does.
 </Aside>
 
 ## Why a provider at all
@@ -30,10 +26,10 @@ They are different layers. A connector *declares which auth kind it uses*, and t
 A broker earns its place when the platform can't hold the vendor relationship itself:
 
 - The vendor's API requires app verification you don't hold yet (Google's restricted `gmail.*` scopes, Microsoft's `Mail.*`).
-- You'd otherwise register and maintain an OAuth app per vendor, per environment.
+- You'd otherwise register and maintain an OAuth client per vendor, per environment.
 - The vendor has no MCP server of its own and the broker supplies one.
 
-If none of those apply, prefer a runtime-native kind. `auth: dcr` needs zero operator setup and puts no third party in the trust path.
+If none of those apply, prefer a runtime-native kind. `auth: dcr` needs zero OAuth client setup and puts no third party in the trust path.
 
 ## Hosted MCP gateways
 
@@ -44,11 +40,14 @@ Composio, Smithery, MCP360, and Glama all describe themselves with overlapping w
 | [Composio](https://composio.dev) | OAuth, API key | Per connection | A provider — [Composio guide](/gateways/composio/) |
 | [Smithery](https://smithery.ai) | OAuth, config, completed on Smithery's own hosted setup page rather than a callback to us | Per connection | A provider — [Smithery guide](/gateways/smithery/) |
 | [MCP360](https://mcp360.ai) | No, one account key | Fixed endpoints | A catalog entry — [gateway endpoints](/config/connectors-catalog/#auth-provider-for-a-gateway-endpoint) |
+| [Obot](https://obot.ai) | Upstream only — between Obot and the servers it fronts | Fixed endpoint per registered server | A catalog entry — [Obot guide](/gateways/obot/) |
 | [Glama](https://glama.ai) | Upstream only — see below | Per connection profile | A [remote connector](/config/connectors/#the-entry-shape) — see below |
 
 The top two are providers, and this page describes their machinery. Configuration — the block, its fields, the broker credential's environment fallback, and why it names a credential provider rather than an env var — is documented once, under [`connectors.providers`](/config/nimblebrain-json/#connectors).
 
 MCP360 publishes fixed endpoints and one account-wide API key. It holds no per-connection state for you to configure, so it never reaches this page's machinery and belongs in the catalog instead — see [gateway endpoints](/config/connectors-catalog/#auth-provider-for-a-gateway-endpoint).
+
+Obot is the self-hosted case of the same shape: an organization's own gateway, one endpoint per server it registers, one API key for the platform. Any OAuth it brokers sits between Obot and the servers behind it, not between Obot and us — see the [Obot guide](/gateways/obot/).
 
 Glama's MCP gateway is a source-agnostic reverse proxy: it fronts servers Glama hosts for you, its own pre-indexed connectors, and any remote MCP endpoint you point it at. You create a **connection profile** in its UI and get a dedicated Streamable HTTP endpoint back:
 

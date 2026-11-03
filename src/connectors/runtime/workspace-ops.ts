@@ -10,6 +10,7 @@
 import type { EventSink } from "../../engine/types.ts";
 import type { ToolRegistry } from "../../tools/registry.ts";
 import { WorkspaceContext } from "../../workspace/context.ts";
+import type { CatalogEntriesReader } from "../catalog/binding.ts";
 import { defaultWorkDir, resolveConnectorDataDirForRef, serverNameFromRef } from "./paths.ts";
 import { type ConnectorMcpDeps, startConnectorSource } from "./startup.ts";
 import type { ConnectorRef, LocalConnectorMeta } from "./types.ts";
@@ -36,7 +37,7 @@ export async function installConnectorInWorkspace(
   // Required — threaded into the new McpSource so task-augmented tools'
   // progress events reach SSE. See mcp-source.ts for the full rationale.
   eventSink: EventSink,
-  opts?: {
+  opts: {
     allowInsecureRemotes?: boolean;
     workDir?: string;
     /**
@@ -46,14 +47,15 @@ export async function installConnectorInWorkspace(
      * `ai.nimblebrain/resources/*` handlers.
      */
     connectorMcp?: ConnectorMcpDeps;
+    /** The operator catalog a minted fleet connector starts from; `NO_CATALOG` when none can be. */
+    readCatalog: CatalogEntriesReader;
   },
 ): Promise<ProcessInventoryEntry> {
-  // Default workDir to `~/.nimblebrain` — previously this function fell
-  // through to `""` and emitted relative paths from cwd (a latent bug),
-  // out of step with every other workspace-scoped entry point. A caller
-  // that explicitly passes `workDir: ""` now hits the `WorkspaceContext`
-  // constructor's empty-string rejection (deliberate — relative paths in
-  // this code path were never correct).
+  // Default workDir to `~/.nimblebrain`, in step with every other
+  // workspace-scoped entry point; `""` would emit relative paths from cwd.
+  // A caller that explicitly passes `workDir: ""` hits the
+  // `WorkspaceContext` constructor's empty-string rejection (deliberate —
+  // relative paths are never correct in this code path).
   const workDir = opts?.workDir ?? defaultWorkDir();
   const wsContext = new WorkspaceContext({ wsId, workDir });
   const serverName = serverNameFromRef(connectorRef);
@@ -80,6 +82,7 @@ export async function installConnectorInWorkspace(
     allowInsecureRemotes: opts?.allowInsecureRemotes,
     workspaceContext: wsContext,
     connectorMcp: opts?.connectorMcp,
+    readCatalog: opts.readCatalog,
   });
 
   return {

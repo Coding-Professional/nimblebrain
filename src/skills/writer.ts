@@ -56,7 +56,9 @@ function nimblebrainToFrontmatter(manifest: SkillManifest): Record<string, unkno
     priority: manifest.priority,
     status: manifest.status,
   };
-  if (manifest.toolAffinity && manifest.toolAffinity.length > 0) {
+  // Written even when empty: `[]` binds a connector skill to no tool, which an
+  // absent field would read back as its whole server.
+  if (manifest.toolAffinity) {
     nb["tool-affinity"] = manifest.toolAffinity;
   }
   if (manifest.triggers && manifest.triggers.length > 0) {
@@ -192,6 +194,15 @@ export function joinSkillBody(existing: string, addition: string): string {
 }
 
 /**
+ * The body an update leaves on disk: the addition joined to the existing body
+ * for `append`, the new body for `replace`. `skills__update` measures this
+ * before writing, so the check and the write cannot disagree.
+ */
+export function mergeSkillBody(existing: string, newBody: string, mode: SkillBodyMode): string {
+  return mode === "append" ? joinSkillBody(existing, newBody) : newBody;
+}
+
+/**
  * Update an existing skill file. Reads the current file, merges any
  * provided partial manifest fields, optionally appends to or replaces the
  * body, and writes back atomically. Throws if the file doesn't exist.
@@ -219,11 +230,7 @@ export function updateSkill(
   }
 
   const body =
-    newBody === undefined
-      ? existing.body
-      : bodyMode === "append"
-        ? joinSkillBody(existing.body, newBody)
-        : newBody;
+    newBody === undefined ? existing.body : mergeSkillBody(existing.body, newBody, bodyMode);
   writeSkill(dir, name, merged, body);
 }
 

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type { ToolCallDisplay } from "../src/hooks/chat-store";
 import { describeCall, registerToolRenderer } from "../src/lib/tool-display";
 import { clearRenderersForTest } from "../src/lib/tool-display/registry";
-import { dominantVerb, inferVerb, phraseFor } from "../src/lib/tool-display/verbs";
+import { inferVerb, phraseFor } from "../src/lib/tool-display/verbs";
 
 afterEach(() => clearRenderersForTest());
 
@@ -89,27 +89,6 @@ describe("inferVerb", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-describe("dominantVerb", () => {
-  it("picks destructive verbs over reads", () => {
-    expect(dominantVerb(["Read", "Edited", "Read"])).toBe("Edited");
-    expect(dominantVerb(["Read", "Deleted"])).toBe("Deleted");
-    expect(dominantVerb(["Opened", "Read"])).toBe("Opened");
-  });
-
-  it("prefers Rewrote over Edited (bigger change)", () => {
-    expect(dominantVerb(["Edited", "Rewrote"])).toBe("Rewrote");
-  });
-
-  it("defaults to 'Ran' on empty input", () => {
-    expect(dominantVerb([])).toBe("Ran");
-  });
-
-  it("returns the only verb when homogeneous", () => {
-    expect(dominantVerb(["Read", "Read", "Read"])).toBe("Read");
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 describe("phraseFor", () => {
   it("produces 'Verb the object' for ok tone", () => {
     expect(phraseFor("Edited", "document", "ok")).toBe("Edited the document");
@@ -171,7 +150,9 @@ describe("describeCall — Tier 0 generic", () => {
   });
 
   it("truncates long summaries", () => {
-    const d = describeCall(call({ name: "search_knowledge_base", input: { query: "x".repeat(200) } }));
+    const d = describeCall(
+      call({ name: "search_knowledge_base", input: { query: "x".repeat(200) } }),
+    );
     expect(d.summary).toContain("…");
     expect(d.summary!.length).toBeLessThanOrEqual(120);
   });

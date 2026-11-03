@@ -54,6 +54,41 @@
         "knowledgeCutoff": "2025-02-28",
         "releaseDate": "2025-10-15"
       },
+      "claude-haiku-5-5": {
+        "id": "claude-haiku-5-5",
+        "name": "Claude Haiku 5.5",
+        "family": "claude-haiku",
+        "cost": {
+          "input": 0.1,
+          "output": 0.5,
+          "cacheRead": 0.01,
+          "cacheWrite": 0.125,
+          "tiers": [
+            {
+              "aboveInputTokens": 100000,
+              "input": 0.5,
+              "output": 2.5,
+              "cacheRead": 0.05,
+              "cacheWrite": 0.625
+            }
+          ]
+        },
+        "limits": {
+          "context": 1000000,
+          "output": 128000
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image", "pdf"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2026-06",
+        "releaseDate": "2026-10-07"
+      },
       "claude-opus-4-5": {
         "id": "claude-opus-4-5",
         "name": "Claude Opus 4.5 (latest)",
@@ -347,7 +382,7 @@
         "cost": {
           "input": 2,
           "output": 10,
-          "cacheRead": 0.2,
+          "cacheRead": 0.1,
           "cacheWrite": 2.5
         },
         "limits": {
@@ -412,7 +447,7 @@
         "capabilities": {
           "toolCall": true,
           "reasoning": false,
-          "attachment": true
+          "attachment": false
         },
         "modalities": {
           "input": ["text"],
@@ -797,32 +832,6 @@
         "knowledgeCutoff": "2025-08-31",
         "releaseDate": "2025-12-11"
       },
-      "gpt-5.2-chat-latest": {
-        "id": "gpt-5.2-chat-latest",
-        "name": "GPT-5.2 Chat",
-        "family": "gpt-codex",
-        "cost": {
-          "input": 1.75,
-          "output": 14,
-          "cacheRead": 0.175
-        },
-        "limits": {
-          "context": 128000,
-          "output": 16384
-        },
-        "capabilities": {
-          "toolCall": true,
-          "reasoning": true,
-          "attachment": true
-        },
-        "modalities": {
-          "input": ["text", "image"],
-          "output": ["text"]
-        },
-        "knowledgeCutoff": "2025-08-31",
-        "releaseDate": "2025-12-11",
-        "deprecated": true
-      },
       "gpt-5.2-pro": {
         "id": "gpt-5.2-pro",
         "name": "GPT-5.2 Pro",
@@ -846,32 +855,6 @@
         },
         "knowledgeCutoff": "2025-08-31",
         "releaseDate": "2025-12-11"
-      },
-      "gpt-5.3-chat-latest": {
-        "id": "gpt-5.3-chat-latest",
-        "name": "GPT-5.3 Chat (latest)",
-        "family": "gpt",
-        "cost": {
-          "input": 1.75,
-          "output": 14,
-          "cacheRead": 0.175
-        },
-        "limits": {
-          "context": 128000,
-          "output": 16384
-        },
-        "capabilities": {
-          "toolCall": true,
-          "reasoning": false,
-          "attachment": true
-        },
-        "modalities": {
-          "input": ["text", "image"],
-          "output": ["text"]
-        },
-        "knowledgeCutoff": "2025-08-31",
-        "releaseDate": "2026-03-03",
-        "deprecated": true
       },
       "gpt-5.3-codex": {
         "id": "gpt-5.3-codex",
@@ -930,7 +913,15 @@
         "cost": {
           "input": 2.5,
           "output": 15,
-          "cacheRead": 0.25
+          "cacheRead": 0.25,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 5,
+              "output": 22.5,
+              "cacheRead": 0.5
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1004,7 +995,14 @@
         "family": "gpt-pro",
         "cost": {
           "input": 30,
-          "output": 180
+          "output": 180,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 60,
+              "output": 270
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1029,7 +1027,15 @@
         "cost": {
           "input": 5,
           "output": 30,
-          "cacheRead": 0.5
+          "cacheRead": 0.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 10,
+              "output": 45,
+              "cacheRead": 1
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1053,7 +1059,14 @@
         "family": "gpt-pro",
         "cost": {
           "input": 30,
-          "output": 180
+          "output": 180,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 60,
+              "output": 270
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1079,7 +1092,16 @@
           "input": 4,
           "output": 20,
           "cacheRead": 0.4,
-          "cacheWrite": 5
+          "cacheWrite": 5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 8,
+              "output": 30,
+              "cacheRead": 0.8,
+              "cacheWrite": 10
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1105,7 +1127,16 @@
           "input": 0.2,
           "output": 1.2,
           "cacheRead": 0.02,
-          "cacheWrite": 0.25
+          "cacheWrite": 0.25,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 0.4,
+              "output": 1.8,
+              "cacheRead": 0.04,
+              "cacheWrite": 0.5
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1131,7 +1162,16 @@
           "input": 4,
           "output": 20,
           "cacheRead": 0.4,
-          "cacheWrite": 5
+          "cacheWrite": 5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 8,
+              "output": 30,
+              "cacheRead": 0.8,
+              "cacheWrite": 10
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1157,7 +1197,16 @@
           "input": 2,
           "output": 12,
           "cacheRead": 0.2,
-          "cacheWrite": 2.5
+          "cacheWrite": 2.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 4,
+              "output": 18,
+              "cacheRead": 0.4,
+              "cacheWrite": 5
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1183,7 +1232,16 @@
           "input": 10,
           "output": 50,
           "cacheRead": 1,
-          "cacheWrite": 12.5
+          "cacheWrite": 12.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 20,
+              "output": 75,
+              "cacheRead": 2,
+              "cacheWrite": 25
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1209,7 +1267,16 @@
           "input": 0.1,
           "output": 0.5,
           "cacheRead": 0.01,
-          "cacheWrite": 0.125
+          "cacheWrite": 0.125,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 0.2,
+              "output": 0.75,
+              "cacheRead": 0.02,
+              "cacheWrite": 0.25
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1235,7 +1302,16 @@
           "input": 2,
           "output": 10,
           "cacheRead": 0.2,
-          "cacheWrite": 2.5
+          "cacheWrite": 2.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 4,
+              "output": 15,
+              "cacheRead": 0.4,
+              "cacheWrite": 5
+            }
+          ]
         },
         "limits": {
           "context": 1050000,
@@ -1252,6 +1328,76 @@
         },
         "knowledgeCutoff": "2026-04-20",
         "releaseDate": "2026-09-22"
+      },
+      "gpt-6.1-sol": {
+        "id": "gpt-6.1-sol",
+        "name": "GPT-6.1 Sol",
+        "family": "gpt-sol",
+        "cost": {
+          "input": 2,
+          "output": 10,
+          "cacheRead": 0.1,
+          "cacheWrite": 2.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 4,
+              "output": 15,
+              "cacheRead": 0.2,
+              "cacheWrite": 5
+            }
+          ]
+        },
+        "limits": {
+          "context": 1050000,
+          "output": 128000
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image", "pdf"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2026-04-30",
+        "releaseDate": "2026-09-29"
+      },
+      "gpt-6.1-terra": {
+        "id": "gpt-6.1-terra",
+        "name": "GPT-6.1 Terra",
+        "family": "gpt-terra",
+        "cost": {
+          "input": 1,
+          "output": 5,
+          "cacheRead": 0.05,
+          "cacheWrite": 1.25,
+          "tiers": [
+            {
+              "aboveInputTokens": 272000,
+              "input": 2,
+              "output": 7.5,
+              "cacheRead": 0.1,
+              "cacheWrite": 2.5
+            }
+          ]
+        },
+        "limits": {
+          "context": 1050000,
+          "output": 128000
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image", "pdf"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2026-06-01",
+        "releaseDate": "2026-10-26"
       },
       "gpt-realtime-2.1": {
         "id": "gpt-realtime-2.1",
@@ -1514,7 +1660,15 @@
         "cost": {
           "input": 2,
           "output": 12,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 18,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 131072,
@@ -1539,7 +1693,15 @@
         "cost": {
           "input": 2,
           "output": 12,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 18,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 131072,
@@ -1563,7 +1725,14 @@
         "family": "gemini-pro",
         "cost": {
           "input": 1.25,
-          "output": 10
+          "output": 10,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 2.5,
+              "output": 15
+            }
+          ]
         },
         "limits": {
           "context": 128000,
@@ -1621,7 +1790,7 @@
         },
         "capabilities": {
           "toolCall": false,
-          "reasoning": true,
+          "reasoning": false,
           "attachment": true
         },
         "modalities": {
@@ -1629,7 +1798,8 @@
           "output": ["text", "image"]
         },
         "knowledgeCutoff": "2024-06",
-        "releaseDate": "2025-08-26"
+        "releaseDate": "2025-08-26",
+        "deprecated": true
       },
       "gemini-2.5-flash-lite": {
         "id": "gemini-2.5-flash-lite",
@@ -1687,7 +1857,15 @@
         "cost": {
           "input": 1.25,
           "output": 10,
-          "cacheRead": 0.125
+          "cacheRead": 0.125,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 2.5,
+              "output": 15,
+              "cacheRead": 0.25
+            }
+          ]
         },
         "limits": {
           "context": 1048576,
@@ -1778,30 +1956,6 @@
         "knowledgeCutoff": "2025-01",
         "releaseDate": "2026-05-28"
       },
-      "gemini-3-pro-image-preview": {
-        "id": "gemini-3-pro-image-preview",
-        "name": "Nano Banana Pro",
-        "family": "gemini-pro",
-        "cost": {
-          "input": 2,
-          "output": 120
-        },
-        "limits": {
-          "context": 131072,
-          "output": 32768
-        },
-        "capabilities": {
-          "toolCall": false,
-          "reasoning": true,
-          "attachment": true
-        },
-        "modalities": {
-          "input": ["text", "image"],
-          "output": ["text", "image"]
-        },
-        "knowledgeCutoff": "2025-01",
-        "releaseDate": "2025-11-20"
-      },
       "gemini-3.1-flash-image": {
         "id": "gemini-3.1-flash-image",
         "name": "Nano Banana 2",
@@ -1825,30 +1979,6 @@
         },
         "knowledgeCutoff": "2025-01",
         "releaseDate": "2026-05-28"
-      },
-      "gemini-3.1-flash-image-preview": {
-        "id": "gemini-3.1-flash-image-preview",
-        "name": "Nano Banana 2",
-        "family": "gemini-flash",
-        "cost": {
-          "input": 0.5,
-          "output": 60
-        },
-        "limits": {
-          "context": 65536,
-          "output": 16384
-        },
-        "capabilities": {
-          "toolCall": false,
-          "reasoning": true,
-          "attachment": true
-        },
-        "modalities": {
-          "input": ["text", "image", "pdf"],
-          "output": ["text", "image"]
-        },
-        "knowledgeCutoff": "2025-01",
-        "releaseDate": "2026-02-26"
       },
       "gemini-3.1-flash-lite": {
         "id": "gemini-3.1-flash-lite",
@@ -1980,7 +2110,15 @@
         "cost": {
           "input": 2,
           "output": 12,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 18,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 1048576,
@@ -2005,7 +2143,15 @@
         "cost": {
           "input": 2,
           "output": 12,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 18,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 1048576,
@@ -2088,7 +2234,7 @@
         "capabilities": {
           "toolCall": false,
           "reasoning": false,
-          "attachment": false
+          "attachment": true
         },
         "modalities": {
           "input": ["audio"],
@@ -2170,6 +2316,31 @@
           "output": ["text"]
         },
         "releaseDate": "2026-09-02"
+      },
+      "gemini-4-argon": {
+        "id": "gemini-4-argon",
+        "name": "Gemini 4 Argon",
+        "family": "gemini",
+        "cost": {
+          "input": 4,
+          "output": 20,
+          "cacheRead": 0.2
+        },
+        "limits": {
+          "context": 1048576,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image", "video", "audio", "pdf"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2026-03",
+        "releaseDate": "2026-10-13"
       },
       "gemini-embedding-001": {
         "id": "gemini-embedding-001",
@@ -2291,6 +2462,39 @@
           "output": ["video"]
         },
         "releaseDate": "2026-06-30"
+      },
+      "gemini-pro-latest": {
+        "id": "gemini-pro-latest",
+        "name": "Gemini Pro Latest",
+        "family": "gemini-pro",
+        "cost": {
+          "input": 2,
+          "output": 12,
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 18,
+              "cacheRead": 0.4
+            }
+          ]
+        },
+        "limits": {
+          "context": 1048576,
+          "output": 65536
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image", "video", "audio", "pdf"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-01",
+        "releaseDate": "2026-02-19"
       }
     }
   },
@@ -2304,7 +2508,15 @@
         "cost": {
           "input": 1.25,
           "output": 2.5,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 2.5,
+              "output": 5,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 1000000,
@@ -2328,7 +2540,15 @@
         "cost": {
           "input": 1.25,
           "output": 2.5,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 2.5,
+              "output": 5,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 1000000,
@@ -2352,7 +2572,15 @@
         "cost": {
           "input": 1.25,
           "output": 2.5,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 2.5,
+              "output": 5,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 1000000,
@@ -2376,7 +2604,15 @@
         "cost": {
           "input": 2,
           "output": 6,
-          "cacheRead": 0.3
+          "cacheRead": 0.3,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 12,
+              "cacheRead": 0.6
+            }
+          ]
         },
         "limits": {
           "context": 500000,
@@ -2400,7 +2636,15 @@
         "cost": {
           "input": 2,
           "output": 6,
-          "cacheRead": 0.5
+          "cacheRead": 0.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 12,
+              "cacheRead": 1
+            }
+          ]
         },
         "limits": {
           "context": 500000,
@@ -2425,7 +2669,15 @@
         "cost": {
           "input": 2,
           "output": 6,
-          "cacheRead": 0.5
+          "cacheRead": 0.5,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 4,
+              "output": 12,
+              "cacheRead": 1
+            }
+          ]
         },
         "limits": {
           "context": 500000,
@@ -2450,7 +2702,15 @@
         "cost": {
           "input": 1,
           "output": 2,
-          "cacheRead": 0.2
+          "cacheRead": 0.2,
+          "tiers": [
+            {
+              "aboveInputTokens": 200000,
+              "input": 2,
+              "output": 4,
+              "cacheRead": 0.4
+            }
+          ]
         },
         "limits": {
           "context": 256000,
@@ -2466,6 +2726,515 @@
           "output": ["text"]
         },
         "releaseDate": "2026-04-16"
+      }
+    }
+  },
+  "greenpt": {
+    "name": "GreenPT",
+    "models": {
+      "deepseek-v4-flash-0731": {
+        "id": "deepseek-v4-flash-0731",
+        "name": "DeepSeek V4 Flash 0731",
+        "family": "deepseek-flash",
+        "cost": {
+          "input": 0.1596,
+          "output": 0.399,
+          "cacheRead": 0.0456
+        },
+        "limits": {
+          "context": 1000000,
+          "output": 384000
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-05",
+        "releaseDate": "2026-07-31"
+      },
+      "deepseek-v4.1-flash": {
+        "id": "deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "family": "deepseek-flash",
+        "cost": {
+          "input": 0.255552,
+          "output": 1.27776,
+          "cacheRead": 0.0127776
+        },
+        "limits": {
+          "context": 1000000,
+          "output": 384000
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-05",
+        "releaseDate": "2026-09-10"
+      },
+      "gemma4": {
+        "id": "gemma4",
+        "name": "gemma4",
+        "family": "gemma",
+        "cost": {
+          "input": 0.57,
+          "output": 1.71
+        },
+        "limits": {
+          "context": 262144,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-04-02"
+      },
+      "glm-5.2": {
+        "id": "glm-5.2",
+        "name": "GLM-5.2",
+        "family": "glm",
+        "cost": {
+          "input": 1.738325,
+          "output": 5.1589,
+          "cacheRead": 0.4486
+        },
+        "limits": {
+          "context": 1000000,
+          "output": 131072
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-06-13"
+      },
+      "glm-5.3": {
+        "id": "glm-5.3",
+        "name": "GLM-5.3",
+        "family": "glm",
+        "cost": {
+          "input": 1.27754,
+          "output": 5.11016,
+          "cacheRead": 0.319385
+        },
+        "limits": {
+          "context": 1000000,
+          "output": 131072
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-08-14"
+      },
+      "glm-5.3-flash": {
+        "id": "glm-5.3-flash",
+        "name": "GLM-5.3-Flash",
+        "family": "glm-flash",
+        "cost": {
+          "input": 0.127754,
+          "output": 0.511016,
+          "cacheRead": 0.0255508
+        },
+        "limits": {
+          "context": 1000000,
+          "output": 131072
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-08-26"
+      },
+      "gpt-oss-120b": {
+        "id": "gpt-oss-120b",
+        "name": "GPT OSS 120B",
+        "family": "gpt-oss",
+        "cost": {
+          "input": 0.228,
+          "output": 0.798
+        },
+        "limits": {
+          "context": 131072,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2024-06",
+        "releaseDate": "2025-08-05"
+      },
+      "green-l": {
+        "id": "green-l",
+        "name": "Green L",
+        "family": "mistral-small",
+        "cost": {
+          "input": 0.285,
+          "output": 0.912
+        },
+        "limits": {
+          "context": 128000,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": false,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-03",
+        "releaseDate": "2025-06-20"
+      },
+      "green-l-raw": {
+        "id": "green-l-raw",
+        "name": "Green L Raw",
+        "family": "mistral-small",
+        "cost": {
+          "input": 0.285,
+          "output": 0.912
+        },
+        "limits": {
+          "context": 128000,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": false,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-03",
+        "releaseDate": "2025-06-20"
+      },
+      "green-r": {
+        "id": "green-r",
+        "name": "Green R",
+        "family": "gpt-oss",
+        "cost": {
+          "input": 0.399,
+          "output": 1.083
+        },
+        "limits": {
+          "context": 131072,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2024-06",
+        "releaseDate": "2025-08-05"
+      },
+      "green-r-raw": {
+        "id": "green-r-raw",
+        "name": "Green R Raw",
+        "family": "gpt-oss",
+        "cost": {
+          "input": 0.399,
+          "output": 1.083
+        },
+        "limits": {
+          "context": 131072,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2024-06",
+        "releaseDate": "2025-08-05"
+      },
+      "kimi-k2.6": {
+        "id": "kimi-k2.6",
+        "name": "Kimi K2.6",
+        "family": "kimi-k2",
+        "cost": {
+          "input": 0.7524,
+          "output": 4.275,
+          "cacheRead": 0.2508
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-01",
+        "releaseDate": "2026-04-20"
+      },
+      "kimi-k2.7-code": {
+        "id": "kimi-k2.7-code",
+        "name": "Kimi K2.7 Code",
+        "family": "kimi-k2",
+        "cost": {
+          "input": 0.863555,
+          "output": 4.317775,
+          "cacheRead": 0.222057
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-01",
+        "releaseDate": "2026-06-12"
+      },
+      "kimi-k3": {
+        "id": "kimi-k3",
+        "name": "Kimi K3",
+        "family": "kimi-k3",
+        "cost": {
+          "input": 3.762,
+          "output": 18.81,
+          "cacheRead": 0.9405
+        },
+        "limits": {
+          "context": 1048576,
+          "output": 131072
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-07-16"
+      },
+      "llama-3.3-70b-instruct": {
+        "id": "llama-3.3-70b-instruct",
+        "name": "Llama-3.3-70B-Instruct",
+        "family": "llama",
+        "cost": {
+          "input": 1.254,
+          "output": 1.254
+        },
+        "limits": {
+          "context": 100000,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": false,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2023-12",
+        "releaseDate": "2024-12-06"
+      },
+      "minimax-m2.5": {
+        "id": "minimax-m2.5",
+        "name": "MiniMax-M2.5",
+        "family": "minimax",
+        "cost": {
+          "input": 0.49346,
+          "output": 2.4673,
+          "cacheRead": 0.123365
+        },
+        "limits": {
+          "context": 204800,
+          "output": 131072
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-02-12"
+      },
+      "mistral-medium-3.5-128b": {
+        "id": "mistral-medium-3.5-128b",
+        "name": "Mistral Medium 3.5",
+        "family": "mistral-medium",
+        "cost": {
+          "input": 2.052,
+          "output": 10.26
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-04-29"
+      },
+      "mistral-small-3.2-24b-instruct-2506": {
+        "id": "mistral-small-3.2-24b-instruct-2506",
+        "name": "Mistral Small 3.2",
+        "family": "mistral-small",
+        "cost": {
+          "input": 0.228,
+          "output": 0.456
+        },
+        "limits": {
+          "context": 128000,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": false,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-03",
+        "releaseDate": "2025-06-20"
+      },
+      "qwen3-235b-a22b-instruct-2507": {
+        "id": "qwen3-235b-a22b-instruct-2507",
+        "name": "Qwen3 235B A22B Instruct 2507",
+        "family": "qwen",
+        "cost": {
+          "input": 1.026,
+          "output": 3.078
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": false,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "knowledgeCutoff": "2025-04",
+        "releaseDate": "2025-07-21"
+      },
+      "qwen3.5-397b-a17b": {
+        "id": "qwen3.5-397b-a17b",
+        "name": "Qwen3.5 397B-A17B",
+        "family": "qwen",
+        "cost": {
+          "input": 0.798,
+          "output": 4.959
+        },
+        "limits": {
+          "context": 262144,
+          "output": 16384
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": false
+        },
+        "modalities": {
+          "input": ["text"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-02-15"
+      },
+      "qwen3.6-35b-a3b": {
+        "id": "qwen3.6-35b-a3b",
+        "name": "Qwen3.6 35B-A3B",
+        "family": "qwen",
+        "cost": {
+          "input": 0.342,
+          "output": 2.052
+        },
+        "limits": {
+          "context": 262144,
+          "output": 32768
+        },
+        "capabilities": {
+          "toolCall": true,
+          "reasoning": true,
+          "attachment": true
+        },
+        "modalities": {
+          "input": ["text", "image"],
+          "output": ["text"]
+        },
+        "releaseDate": "2026-04-17"
       }
     }
   }

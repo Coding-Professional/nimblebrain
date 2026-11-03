@@ -21,17 +21,17 @@ A `dynamic` skill activates through any of:
 <Steps>
 
 1. **Its `description`** — the model sees every skill's name + description in a catalog and activates the relevant one. This is the default path, so write the description to say *what the skill does and when to use it* (include the words a user would say). Always available — no extra field needed.
-2. **`tool-affinity`** — auto-activates when a tool in the active set matches one of its globs. For skills bound to specific tools.
+2. **`tool-affinity`** — the skill governs the tools its globs match, and reaches the model before the first call to one of them in a conversation. It is never composed into the system prompt, so a turn that calls none of its tools pays nothing for it and the cached prompt prefix stays the same whatever tools a turn starts with. It is delivered into the conversation when the tool is promoted, or, when the model calls the tool first, that call is held: it does not run, the model is told why, the skill follows it, and the model calls the tool again. A held call is not shown in the chat and does not count against a task run. Every source binds this way, so a workspace skill bound to a connector's tool arrives on the same call as the connector's own skill.
 3. **`triggers`** — auto-activates on an exact phrase, for deterministic "must-fire" cases (e.g. a compliance rule that must load whenever a regulated action is named).
 </Steps>
 
-A dynamic skill with no `tool-affinity` and no `triggers` loads only when the model activates it on its description.
+A dynamic skill with no `tool-affinity` and no `triggers` loads only when the model activates it on its description. Settings and `skills__list` call this loading **on request** (`on_request`).
 
 ### The skill catalog
 
 Every conversation's system prompt carries a **Skill Catalog** — one line (name + description) per dynamic skill available in that workspace: authored org/workspace/user skills, skills published by installed apps, and curated connector overlays. Always-on skills don't appear (their full text is already in the prompt), and neither do disabled ones.
 
-When a task matches a listed skill, the model loads it with the `nb__use_skill` tool, which returns the skill's full body in the tool result. A skill is delivered at most once per conversation — loading one that's already in context (via `nb__use_skill` or a connector overlay) returns a short "already loaded" note instead of a second copy.
+When a task matches a listed skill, the model loads it with the `nb__use_skill` tool, which returns the skill's body in the tool result. A skill is delivered at most once per conversation — loading one that's already in context (via `nb__use_skill` or a connector overlay) returns a short "already loaded" note instead of a second copy.
 
 ## Skill file format
 
@@ -68,6 +68,16 @@ When asked about meetings:
 Format action items as a checklist.
 ```
 
+### Body length
+
+A skill body is delivered up to **12,000 characters** (frontmatter excluded), however it loads. A longer body is cut from the end, whole sections at a time, so the rules written last are the ones the model never sees.
+
+- `skills__create` refuses a body over the limit, and `skills__update` refuses an edit that would leave the body over the limit and longer than it was. Neither writes anything or takes a snapshot.
+- A skill already over the limit can still be edited as long as the edit does not grow it. The result says how far over it still is.
+- `skills__read` reports `over-limit-by` for a skill over the limit, with the full stored body.
+
+Keep a skill to one job. When it outgrows the limit, fold each new rule into the section it belongs in rather than appending a dated note, or split the skill into two.
+
 ## Frontmatter fields
 
 **Standard (top-level):**
@@ -87,7 +97,7 @@ Format action items as a checklist.
 | `loading-strategy` | `always` \| `dynamic` | Yes | How the skill loads (see above). |
 | `priority` | number | No | Selection / ordering priority, 11–99 (0–10 reserved for core). Default 50. |
 | `status` | `active` \| `disabled` | No | Default `active`. |
-| `tool-affinity` | string[] | No | Globs; a `dynamic` skill auto-loads when a matching tool is active (e.g. `granola__*`). |
+| `tool-affinity` | string[] | No | Globs; a `dynamic` skill reaches the model before the first call to a matching tool (e.g. `granola__*`). |
 | `triggers` | string[] | No | Exact phrases; a `dynamic` skill auto-loads on a case-insensitive substring match. |
 
 <Aside type="note">
@@ -126,7 +136,7 @@ Three core skills are always-on for every workspace and need no setup:
 
 All three ship with the platform, so they can't be edited in place — `skills__update` refuses to write a platform-vendored file. Change one by **authoring your own skill with the same name** in a scope that outranks it.
 
-Skills merge by `name`, with later tiers winning: **user > workspace > org (`~/.nimblebrain/skills/`) > platform**. So a file at `~/.nimblebrain/skills/customer-communication.md` replaces the shipped one for the whole org; the same name under a workspace or a single user narrows it further. Writing an org-scoped skill requires an org admin or owner role.
+Skills merge by `name`, with later tiers winning: **user > workspace > org (`~/.nimblebrain/skills/`) > platform**. So a file at `~/.nimblebrain/skills/customer-communication.md` replaces the shipped one for the whole org; the same name under a workspace or a single user narrows it further. Writing an org-scoped skill requires the org admin role.
 
 `soul` and `capabilities` are reserved names — `skills__create` refuses them, so an override for those two has to be a file you write yourself. `customer-communication` is not reserved, so either route works.
 
@@ -147,15 +157,36 @@ metadata:
   An override written through `skills__create` lands at `priority` 11–99, because 0–10 is reserved for the platform's own core skills — so it sits in contained user context rather than raw identity. A file you write yourself takes whatever `priority` its frontmatter declares, the core band included. Either way it applies.
 </Aside>
 
+## Guidance for one connector
+
+Guidance a workspace wants the agent to follow when it uses one connector (house rules for a CRM's stages, a brand voice for a document tool) is a **workspace skill bound to the connector's tools**. Create it in **This Workspace → Skills**, or with `skills__create`, and give it a `tool-affinity` matching those tools:
+
+```yaml
+---
+name: crm-house-rules
+description: How we use the CRM's stages and fields.
+metadata:
+  nimblebrain:
+    loading-strategy: dynamic
+    tool-affinity:
+      - crm__*
+---
+Move a deal to "Qualified" only after a call is logged.
+```
+
+It reaches the agent before its first call to one of those tools, on the same call as the connector's own skill, and costs nothing on a turn that never touches the connector. For guidance that must hold before the agent picks any tool, make the skill always on instead.
+
+What a connector's author wants every workspace to know is the server's own guidance: its `instructions` and the [skills it publishes](#skills-published-by-an-mcp-server). The host does not read an `app://instructions` resource; text a server publishes there does not reach the prompt.
+
 ## Connector skill overlays
 
 Installing a connector can automatically apply a short **usage overlay** — curated guidance for *that* connector's tools (e.g. "confirm the recipient before sending mail"). Overlays target the connectors you don't author yourself (Composio and other third-party MCP servers), so they're sourced from a NimbleBrain-curated **public overlay repo** keyed by the connector's flat slug (the Composio toolkit, e.g. `gmail`; otherwise the connector slug, e.g. `notion`) at a pinned version.
 
 Overlays differ from authored skills in three ways:
 
-- **Surfaced once into the conversation, not the system prompt.** An authored `dynamic` + `tool-affinity` skill composes into the system prompt for the turn. A connector overlay instead appears in the conversation history exactly once — on the first call to a matching tool — and then rides the (cached, append-only) history for the rest of the conversation. It's relevant (only when the connector's tools are actually used) and cache-friendly (it never re-varies the cached system prefix turn to turn). The tradeoff of this reactive model: the overlay surfaces *after* the first matching tool call, so guidance whose value is preemptive (e.g. "confirm before sending") does not gate that very first call. It does reach the model before its next action in the same turn, so it governs every call after the one that triggered it. For hard preconditions, prefer an authored `always` skill or a tool-side guard.
-- **Bound to the connector's tools.** An overlay is bound to every tool of the connector it is installed for (`<server-name>__*`), or, when its frontmatter declares `metadata.nimblebrain.tool-affinity`, only to the tools it names, read the same way as for a [skill published by the server](#skills-published-by-an-mcp-server). The block needs nothing else: the other runtime fields are stamped on install, and an overlay always loads `dynamic`.
-- **Stored separately.** Materialized overlays live in a `connector-skills/` store, distinct from authored `skills/`. They don't appear in the `skills__list` tool output; list them with the connector tool's `list_bound_skills` action instead.
+- **Surfaced once into the conversation, not the system prompt.** A connector overlay appears in the conversation history exactly once, before the first call to a matching tool runs (that call is held until the overlay has been read, as for any [`tool-affinity`](#how-a-skill-loads--loading-strategy) skill), and then rides the cached, append-only history for the rest of the conversation. It is relevant (only when the connector's tools are used) and cache-friendly (it never re-varies the cached system prefix turn to turn).
+- **Bound to the connector's tools.** An overlay is bound to every tool of the connector it is installed for (`<server-name>__*`), or, when its frontmatter declares `metadata.nimblebrain.tool-affinity`, only to the tools it names (or to none, for `[]`), read the same way as for a [skill published by the server](#skills-published-by-an-mcp-server). The block needs nothing else: the other runtime fields are stamped on install, and an overlay always loads `dynamic`.
+- **Stored separately.** Materialized overlays live in a `connector-skills/` store, distinct from authored `skills/`. They don't appear in the `skills__list` tool output; list them with the connector tool's `list_bound_skills` action instead, or see them under **From connectors** in a workspace's Settings → Skills.
 
 Resolution is **always on and fail-soft**: it fetches at a pinned repo version, records the fetched content hash, and treats a missing overlay (or any fetch error) as a no-op — a connector install never fails because its optional guidance couldn't be fetched, and there's nothing to enable (an overlay exists only if we've curated one). Override the repo / version with `CONNECTOR_SKILLS_REPO` and `CONNECTOR_SKILLS_VERSION`. When a connector has a curated overlay, the platform skips synthesizing the server's own `skill://<name>/SKILL.md` guidance so the model sees one set of instructions, not two.
 
@@ -174,7 +205,7 @@ To publish skills, a server must:
 
 How the platform uses them:
 
-- **Discovery reads the listing only.** The catalog and each skill's loading rules come from the listed frontmatter; no `SKILL.md` is fetched until the skill is needed. An `always` skill is fetched when a turn composes it, a `dynamic` skill when tool-affinity or a trigger selects it or when the agent activates it with `nb__use_skill`.
+- **Discovery reads the listing only.** The catalog and each skill's loading rules come from the listed frontmatter; no `SKILL.md` is fetched until the skill is needed. An `always` skill is fetched when a turn composes it, a `dynamic` skill when a call to a tool it is bound to, a trigger, or the agent's `nb__use_skill` needs it.
 - **Every fetched `SKILL.md` is verified.** Its bytes must match the listed digest and size, and its frontmatter the listed frontmatter, or the skill does not load that turn. A verified body is cached by digest, so an unchanged skill is not fetched again; a server that updates a skill lists the new digest.
 
 The skill's name is its frontmatter `name`. When two skills on one server share a name, each is named by its full skill path instead (`acme/billing/refunds`). The platform reads the **same** `metadata.nimblebrain.*` block documented above off that published frontmatter, so a published skill loads by the rules its author writes rather than a fixed convention:
@@ -184,12 +215,12 @@ The skill's name is its frontmatter `name`. When two skills on one server share 
 | `loading-strategy` | `always` composes it every turn; `dynamic` (the default when omitted) loads it on demand. |
 | `priority` | Ordering, same scale. Defaults to 60. |
 | `triggers` | Phrases that load it deterministically, whether or not the server's tools are in the active tool set. |
-| `tool-affinity` | The server's own tools the skill governs, as bare names or globs (`draft_email`, `draft_*`). The platform prefixes each with `<server-name>__`. Omitted, the skill is bound to every tool of the server (`<server-name>__*`). |
+| `tool-affinity` | The server's own tools the skill governs, as bare names or globs (`draft_email`, `draft_*`). The platform prefixes each with `<server-name>__`. Omitted, the skill is bound to every tool of the server (`<server-name>__*`). A skill bound to every tool of its server does not hold the first call to a tool the server annotates `readOnlyHint`: it is delivered right after that call instead. A skill that names its tools always holds. An explicit empty list (`tool-affinity: []`) binds it to no tool: the skill is listed in the catalog and loads only when the model asks for it, which suits reference material no single tool call needs. A value that is not a list, or a list of only blank entries, counts as omitted. |
 
 Two differences from an on-disk skill:
 
 - **Reading is lenient, not strict.** A malformed or absent `metadata.nimblebrain` block leaves the fields unset and the defaults apply — an unrecognized value never rejects the skill. (An on-disk skill with bad frontmatter is skipped and logged.) Blank trigger phrases are dropped: an empty phrase would match every message.
-- **`tool-affinity` is scoped to the publishing server.** A server cannot know the name it is installed under, so it declares its tools bare and the platform binds them to that install. Matching is anchored after the prefix, so a declared pattern can only narrow within the server's own tools: `*` means all of them, and no declared value reaches another connector's tools. A `dynamic` skill loads, and is delivered when a tool is promoted or called mid-turn, only when a tool it names is involved, so a server that publishes several workflow skills should give each one the tools it governs. A declared pattern that matches none of the tools the connector advertises is logged as a warning (`skills.tool_affinity.unmatched`, naming the connector, the skill, and the patterns); the same check applies to an overlay's patterns. `allowed-tools` is not read from the server.
+- **`tool-affinity` is scoped to the publishing server.** A server cannot know the name it is installed under, so it declares its tools bare and the platform binds them to that install. Matching is anchored after the prefix, so a declared pattern can only narrow within the server's own tools: `*` means all of them, and no declared value reaches another connector's tools. A `dynamic` skill is delivered, when a tool is promoted or called, only when a tool it names is involved, so a server that publishes several workflow skills should give each one the tools it governs. A declared pattern that matches none of the tools the connector advertises is logged as a warning (`skills.tool_affinity.unmatched`, naming the connector, the skill, and the patterns); the same check applies to an overlay's patterns. `allowed-tools` is not read from the server.
 
   ```yaml
   ---
@@ -206,9 +237,25 @@ Two differences from an on-disk skill:
 
 If a connector has a curated overlay, the platform skips synthesizing its published skills — see the section above.
 
+### Auditing what connectors contribute
+
+A workspace's **Settings → Skills** page has a read-only **From connectors** section listing, per connected server, every skill the runtime loads from it: its published skills and any curated overlay. Each row states how the skill loads (always on, on a tool match, on a trigger, or on the first tool call for an overlay). Opening a row shows the body as the model receives it, with its estimated token cost, priority, triggers, and `skill://` URI. The same data comes from the connector tool's `list_bound_skills` action, and one body from `read_bound_skill` (`serverName` + `skillName`).
+
 ## Listing skills
 
 Ask the agent which skills are loaded — it uses the built-in `skills__list` tool to report each skill's name, loading strategy, priority, and source file. To see one skill's full definition, ask the agent for its details.
+
+## Editing a skill in settings
+
+The Skills pages in settings (your profile, a workspace, and the organization) create and edit skills without touching files.
+
+- **Creating** a skill is one explicit action: fill in the name and body, set anything under **Advanced**, and click **Create**. A pasted whole `SKILL.md` works here: its frontmatter sets the fields it declares, and the block isn't stored as text.
+- **Editing** an existing skill has no Save button. Each field saves on its own: the loading strategy when you pick one, the priority when you leave it or press Enter, and the body, tool patterns, and trigger phrases when you leave them. A save shows a notice with **Undo**; one the server refuses stays on the field with the reason, **Retry**, and **Revert**.
+- On an existing skill, the fields set the manifest and the body is only prose. A body that starts with a `---` header is not applied, because it would overwrite fields saved separately: remove the header, or tick **Keep it as body text**.
+- The loading verdict above **Advanced** describes the skill as saved. While an edit hasn't saved yet, it says which one.
+- Emptying the tool patterns or trigger phrases removes them from the skill.
+
+The agent edits a skill with `skills__update`, which takes a patch: a field it leaves out keeps its value, and `null` clears one. A cleared list is removed from the file, and a cleared `loading-strategy` or `priority` returns to its default (`dynamic`, 50). `description` is required, so it takes no `null`.
 
 ## Auditing how skills loaded
 
@@ -219,12 +266,13 @@ Ask the agent and it reports the summary — how many loads, across how many con
 | `loaded_by` | Meaning |
 |---|---|
 | `always` | Composed into the system prompt because the skill declares `loading-strategy: always`. |
-| `tool_affinity` | Composed in because a tool matching its globs was in the active set. |
+| `tool_affinity` | Appears on older recorded runs only: a bound skill composed into the prompt at turn start. A bound skill loads `before_call` or `tool_use`. |
 | `trigger` | Composed in because an exact trigger phrase appeared. |
-| `tool_use` | A connector overlay delivered on the first matching tool call. |
+| `before_call` | A bound skill delivered while the first call to its tool was held. |
+| `tool_use` | A bound skill delivered when its tool was promoted, or after a call that ran. |
 | `activation` | The model loaded a Skill Catalog entry by name with `nb__use_skill`. |
 
-Filter by `conversation_id`, `skill` (name or id), `loaded_by`, or a `since`/`until` window. This is the way to answer questions the catalog alone can't — whether a skill is reaching the model at all, and whether it gets there because the model chose it or because a tool call forced it.
+A row with a `status` is a bound skill that did **not** reach the model on that call: `fetch_failed` (its body could not be fetched, so the call ran without it), `capped` (one delivery carries at most about three skills' worth of guidance, whether it came from a held call or a promotion; the rest arrive later, or the model loads them), or `renamed_unheld` (a policy hook renamed the call after the check). Filter by `conversation_id`, `skill` (name or id), `loaded_by`, or a `since`/`until` window. This is the way to answer questions the catalog alone can't — whether a skill is reaching the model at all, and whether it gets there because the model chose it or because a tool call forced it.
 
 ## Creating a custom skill
 

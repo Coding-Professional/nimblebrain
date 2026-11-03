@@ -126,6 +126,15 @@ describe("workspaceKeysDeclaredBy", () => {
     ).toEqual([]);
   });
 
+  test("a static entry names its OAuth client secret", () => {
+    expect(
+      workspaceKeysDeclaredBy({
+        auth: "static",
+        oauthClientSetup: { clientSecretKey: "acme.client_secret" },
+      }),
+    ).toEqual(["acme.client_secret"]);
+  });
+
   test("gated on provider auth, like every other reader of these fields", () => {
     expect(workspaceKeysDeclaredBy({ auth: "dcr", secretHeaders: HEADERS })).toEqual([]);
   });

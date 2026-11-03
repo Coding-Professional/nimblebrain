@@ -139,7 +139,7 @@ function createHarness(): ToolContext {
     save: (defs) => saveDefs(defs),
     reloadScheduler: () => scheduler.reload(),
     runNow: (id) => scheduler.requestRunNow(WS, OWNER, id),
-    cancelRun: (id) => scheduler.cancelRun(WS, OWNER, id),
+    cancelRun: (runId) => scheduler.cancelRunById(WS, OWNER, runId),
     readRuns: (id, opts) => readRuns(TMP_DIR, WS, OWNER, id, opts),
     readRunsPage: (id, opts) => readRunsPage(TMP_DIR, WS, OWNER, id, opts),
     readAllRuns: (opts) => readAllRuns(TMP_DIR, WS, OWNER, opts),
@@ -180,12 +180,11 @@ describe("task e2e: create -> run -> verify", () => {
         body: "Summarize today's activity",
       },
       ctx,
-    ) as { task: Task; created: boolean };
+    );
 
-    expect(createResult.created).toBe(true);
     expect(createResult.task.id).toBe("daily-summary");
 
-    const run = expectSyncRun(await handleRun({ name: "Daily Summary" }, ctx));
+    const run = expectSyncRun(await handleRun({ taskId: "daily-summary" }, ctx));
     expect(run.status).toBe("success");
     expect(run.taskId).toBe("daily-summary");
 
@@ -199,7 +198,7 @@ describe("task e2e: create -> run -> verify", () => {
     expect(latestRun.status).toBe("success");
     expect(latestRun.toolCalls).toBe(3);
     expect(latestRun.iterations).toBe(2);
-    // A run is no longer a conversation — it leaves a result sidecar instead.
+    // A run is not a conversation — it leaves a result sidecar instead.
     const result = ctx.readRunResult("daily-summary", latestRun.id);
     expect(result).not.toBeNull();
     expect(result!.usage.iterations).toBe(2);
@@ -214,27 +213,27 @@ describe("task e2e: create -> run -> verify", () => {
           name: "Weekly Report",
           schedule: { type: "interval", intervalMs: 3_600_000 },
           description: "Compiles weekly metrics",
-          skill: "reporting",
+          skills: ["reporting"],
           maxIterations: 8,
           maxInputTokens: 100_000,
-          model: "claude-sonnet-4-5-20250929",
+          model: "anthropic:claude-sonnet-4-5-20250929",
         },
         body: "Generate the weekly report",
       },
       ctx,
     );
 
-    await handleRun({ name: "Weekly Report" }, ctx);
+    await handleRun({ taskId: "weekly-report" }, ctx);
 
     expect(executorCalls.length).toBe(1);
     const received = executorCalls[0]!.task;
     expect(received.id).toBe("weekly-report");
     expect(received.name).toBe("Weekly Report");
     expect(received.prompt).toBe("Generate the weekly report");
-    expect(received.skill).toBe("reporting");
+    expect(received.skills).toEqual(["reporting"]);
     expect(received.maxIterations).toBe(8);
     expect(received.maxInputTokens).toBe(100_000);
-    expect(received.model).toBe("claude-sonnet-4-5-20250929");
+    expect(received.model).toBe("anthropic:claude-sonnet-4-5-20250929");
     expect(received.schedule.type).toBe("interval");
     expect(received.schedule.intervalMs).toBe(3_600_000);
 
@@ -261,7 +260,7 @@ describe("task e2e: create -> run -> verify", () => {
     defs.get("scoped-task")!.allowedTools = ["files__*", "reports__generate", "analytics__*"];
     ctx.save(defs);
 
-    await handleRun({ name: "Scoped Task" }, ctx);
+    await handleRun({ taskId: "scoped-task" }, ctx);
 
     expect(executorCalls.length).toBe(1);
     const received = executorCalls[0]!.task;
@@ -302,7 +301,7 @@ describe("task e2e: run records metrics", () => {
       ctx,
     );
 
-    const run = expectSyncRun(await handleRun({ name: "Multi Tool Job" }, ctx));
+    const run = expectSyncRun(await handleRun({ taskId: "multi-tool-job" }, ctx));
 
     expect(run.toolCalls).toBe(7);
     expect(run.iterations).toBe(4);
@@ -324,13 +323,13 @@ describe("task e2e: run records metrics", () => {
       ctx,
     );
 
-    const beforeStatus = handleStatus({ name: "Status Check" }, ctx) as {
+    const beforeStatus = handleStatus({ taskId: "status-check" }, ctx) as {
       task: Task;
     };
     expect(beforeStatus.task.runCount).toBe(0);
     expect(beforeStatus.task.lastRunStatus).toBeUndefined();
 
-    await handleRun({ name: "Status Check" }, ctx);
+    await handleRun({ taskId: "status-check" }, ctx);
 
     // After run: scheduler.updateAfterRun updates the definition on disk.
     const updated = loadDefs().get("status-check")!;

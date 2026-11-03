@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { refreshAuthorization } from "@modelcontextprotocol/client";
 import type { OAuthClientInformationFull, OAuthTokens } from "@modelcontextprotocol/server";
 import { log } from "../../src/observability/log.ts";
 import { requireCredentialStore } from "../../src/tools/credential-store.ts";
@@ -16,6 +17,7 @@ import {
   installTestCredentialStore,
   resetTestCredentialStore,
 } from "../helpers/credential-store.ts";
+import { fakeFetch } from "../helpers/fake-fetch.ts";
 import { seedWorkspaceRoot } from "../helpers/test-workspace.ts";
 
 // Bun.serve-based cases (headless single-hop, headless multi-hop, interactive
@@ -417,6 +419,35 @@ describe("WorkspaceOAuthProvider — Track A: pre-registered client + scopes + e
     );
   });
 
+  it("clientMetadata takes client_name, client_uri and logo_uri from the brand identity", () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      ownerDisplayName: "Engineering Team",
+      clientIdentity: {
+        name: "ACME",
+        clientUri: "https://acme.example",
+        logoUri: "https://static.example.com/brands/acme/mark-128.png",
+      },
+      serverName: "granola",
+      callbackUrl: CALLBACK,
+    });
+    expect(p.clientMetadata.client_name).toBe("ACME (Engineering Team)");
+    expect(p.clientMetadata.client_uri).toBe("https://acme.example");
+    expect(p.clientMetadata.logo_uri).toBe("https://static.example.com/brands/acme/mark-128.png");
+  });
+
+  it("clientMetadata omits client_uri and logo_uri a brand does not set, rather than sending NimbleBrain's", () => {
+    const p = new WorkspaceOAuthProvider({
+      owner: { type: "workspace", wsId: "ws_test" },
+      clientIdentity: { name: "ACME" },
+      serverName: "granola",
+      callbackUrl: CALLBACK,
+    });
+    expect(p.clientMetadata.client_name).toBe("ACME (ws_test)");
+    expect("client_uri" in p.clientMetadata).toBe(false);
+    expect("logo_uri" in p.clientMetadata).toBe(false);
+  });
+
   it("clientMetadata default token_endpoint_auth_method = 'none' (DCR PKCE-only) when no staticClient", () => {
     const p = new WorkspaceOAuthProvider({
       owner: { type: "workspace", wsId: "ws_0076759dbbe19fcc" },
@@ -448,6 +479,68 @@ describe("WorkspaceOAuthProvider — Track A: pre-registered client + scopes + e
       },
     });
     expect(p.clientMetadata.token_endpoint_auth_method).toBe("client_secret_basic");
+  });
+
+  // The SDK chooses client auth from `clientInformation()` alone, so the method
+  // must be on it. A server advertising both methods otherwise gets
+  // `client_secret_basic`, which some reject on the refresh grant.
+  describe("static client refresh request, server advertises basic and post", () => {
+    const metadata = {
+      issuer: "https://as.example.com",
+      authorization_endpoint: "https://as.example.com/authorize",
+      token_endpoint: "https://as.example.com/token",
+      response_types_supported: ["code"],
+      token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"],
+    };
+
+    async function refreshRequest(
+      staticClient: ConstructorParameters<typeof WorkspaceOAuthProvider>[0]["staticClient"],
+    ): Promise<{ headers: Headers; body: URLSearchParams }> {
+      const p = new WorkspaceOAuthProvider({
+        owner: { type: "workspace", wsId: "ws_0076759dbbe19fcc" },
+        serverName: "vendor",
+        callbackUrl: CALLBACK,
+        staticClient,
+      });
+      const clientInformation = await p.clientInformation();
+      if (!clientInformation) throw new Error("static client returned no client information");
+      let sent: { headers: Headers; body: URLSearchParams } | undefined;
+      await refreshAuthorization("https://as.example.com", {
+        metadata,
+        clientInformation,
+        refreshToken: "rt-1",
+        fetchFn: async (_url, init) => {
+          sent = {
+            headers: new Headers(init?.headers),
+            body: new URLSearchParams(String(init?.body)),
+          };
+          return new Response(JSON.stringify({ access_token: "at-2", token_type: "Bearer" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      });
+      if (!sent) throw new Error("refresh sent no request");
+      return sent;
+    }
+
+    it("secret without an override sends client_id and client_secret in the body", async () => {
+      const { headers, body } = await refreshRequest({ clientId: "cid", clientSecret: "s3cret" });
+      expect(body.get("grant_type")).toBe("refresh_token");
+      expect(body.get("client_id")).toBe("cid");
+      expect(body.get("client_secret")).toBe("s3cret");
+      expect(headers.get("Authorization")).toBeNull();
+    });
+
+    it("explicit client_secret_basic sends HTTP Basic", async () => {
+      const { headers, body } = await refreshRequest({
+        clientId: "cid",
+        clientSecret: "s3cret",
+        tokenEndpointAuthMethod: "client_secret_basic",
+      });
+      expect(headers.get("Authorization")).toBe(`Basic ${btoa("cid:s3cret")}`);
+      expect(body.get("client_secret")).toBeNull();
+    });
   });
 
   it("constructor rejects reserved keys in additionalAuthorizationParams", () => {
@@ -606,7 +699,7 @@ describe("WorkspaceOAuthProvider — revokeAndDeleteTokens", () => {
     calls: Array<{ url: string; init?: RequestInit }>;
   } {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+    const fetcher = fakeFetch(async (url, init) => {
       const u = typeof url === "string" ? url : url.toString();
       calls.push({ url: u, init });
       const r = responses[u];
@@ -616,7 +709,7 @@ describe("WorkspaceOAuthProvider — revokeAndDeleteTokens", () => {
         status: r.status,
         headers: { "Content-Type": "application/json" },
       });
-    }) as unknown as typeof fetch;
+    });
     return { fetch: fetcher, calls };
   }
 
@@ -986,7 +1079,7 @@ describe("WorkspaceOAuthProvider — revokeAndDeleteTokens", () => {
   });
 });
 
-describe("WorkspaceOAuthProvider — WorkspaceContext construction (Stage 0)", () => {
+describe("WorkspaceOAuthProvider — WorkspaceContext construction", () => {
   let workDir: string;
 
   beforeEach(() => {
@@ -1220,7 +1313,8 @@ describe("WorkspaceOAuthProvider — auth_lost flag", () => {
 
   /** Wait for the flag write `notifyAuthLost` starts without awaiting. */
   const settled = (p: WorkspaceOAuthProvider) =>
-    (p as unknown as { authLostWrite: Promise<void> }).authLostWrite;
+    // biome-ignore lint/complexity/useLiteralKeys: `authLostWrite` is private; bracket access is TypeScript's typed path to it
+    p["authLostWrite"];
 
   it("test_notifyAuthLost_workspaceOwner_persistsFlag", async () => {
     const p = makeProvider();

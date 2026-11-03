@@ -5,7 +5,7 @@ description: NimbleBrain's ext-apps host implementation — the JSON-RPC protoco
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The MCP App Bridge is NimbleBrain's implementation of the [ext-apps specification (2026-01-26)](https://apps.extensions.modelcontextprotocol.io/api/) — the standard protocol that enables [MCP Apps](/concepts/mcp-apps) to render inside host applications with bidirectional tool access. Where the spec has no method for something the shell needs, NimbleBrain adds an [`ai.nimblebrain/` extension](/extensions/overview/#between-an-app-view-and-the-host): semantic actions, a file picker, keyboard forwarding, and the app's location for the top bar.
+The MCP App Bridge is NimbleBrain's implementation of the [ext-apps specification (2026-01-26)](https://apps.extensions.modelcontextprotocol.io/api/) — the standard protocol that enables [MCP Apps](/concepts/mcp-apps) to render inside host applications with bidirectional tool access. Where the spec has no method for something the shell needs, NimbleBrain adds an [`ai.nimblebrain/` extension](#nimblebrain-extensions-ainimblebrain): semantic actions, a file picker, keyboard forwarding, and the app's location for the top bar.
 
 All messages use `window.postMessage` with JSON-RPC 2.0 envelopes:
 
@@ -63,7 +63,8 @@ These have no spec equivalent. Each name is both the method and the identifier t
 
 | Method | Direction | Description |
 |--------|-----------|-------------|
-| `ai.nimblebrain/action` | App → Host | Request a semantic action from the shell. |
+| `ai.nimblebrain/open` | App → Host | Open what a resource URI names; the host finds what shows it. Answered `{}`. See [below](#ainimblebrainopen). |
+| `ai.nimblebrain/open-connector-settings` | App → Host | Open your connector's own settings page. Answered `{}`. See [below](#ainimblebrainopen-connector-settings). |
 | `ai.nimblebrain/notify` | App → Host | Show the user a notice (success, info, warning or error), labelled with your app; answered `{}`. See [below](#ainimblebrainnotify). |
 | `ai.nimblebrain/request-file` | App → Host | Open native file picker; the host persists each chosen file to the workspace store and returns `{ files: [...] }`. See [below](#ainimblebrainrequest-file). |
 | `ai.nimblebrain/upload-files` | App → Host | Store `File`s the app already holds (dropped on it, say), the way a pick is stored; answered `{ files: [...] }`. Offered only to the platform's Files app. See [below](#ainimblebrainupload-files). |
@@ -112,7 +113,8 @@ Until `initialized` arrives, the host posts the app nothing but the answers to i
       "updateModelContext": { "text": {}, "structuredContent": {} },
       "experimental": {
         "io.modelcontextprotocol/tasks": {},
-        "ai.nimblebrain/action": {},
+        "ai.nimblebrain/open": {},
+        "ai.nimblebrain/open-connector-settings": {},
         "ai.nimblebrain/request-file": {},
         "ai.nimblebrain/keydown": {},
         "ai.nimblebrain/location": {}
@@ -127,6 +129,12 @@ Until `initialized` arrives, the host posts the app nothing but the answers to i
         },
         "css": {
           "fonts": "@font-face { font-family: 'Hanken Grotesk'; src: url('https://app.example.com/assets/hanken-grotesk.woff2') format('woff2'); font-weight: 100 900; font-style: normal; font-display: swap; }"
+        }
+      },
+      "ai.nimblebrain/styles": {
+        "variables": {
+          "--color-text-accent": "#818cf8",
+          "--nb-color-processing": "#a78bfa"
         }
       }
     }
@@ -146,6 +154,10 @@ Until `initialized` arrives, the host posts the app nothing but the answers to i
 **Non-spec capabilities live in `experimental`, keyed by identifier** — the MCP tasks extension at `io.modelcontextprotocol/tasks` (an empty object: the host serves it), the NimbleBrain extensions under `ai.nimblebrain/`. A client that validates the response against the ext-apps schema, such as the official `App`, drops any field the schema does not name and keeps the contents of `experimental` (from ext-apps 1.7.5). That is the whole reason they travel there rather than as siblings.
 
 The spec negotiates extensions under `capabilities.extensions`, not `experimental`. The ext-apps bridge capability object has no `extensions` field, so `experimental` carrying the extension identifier is as close as this channel reaches. When ext-apps adds one, the identifiers move there.
+
+**Theme colours arrive as the spec's `hostContext.styles.variables`**, and only under keys the spec's variable enum names: one key outside it makes a spec client reject the whole host context. Status colours go out as `--color-text-danger`, `--color-text-success`, `--color-text-warning` and `--color-background-info`, and text on a filled accent or danger surface as `--color-text-inverse`, the same keys any MCP Apps host sends. The host sends no `--nb-*` twin of a spec key: the `--nb-*` extensions carry only values the spec has no key for.
+
+**The other tokens that change between light and dark arrive as `hostContext["ai.nimblebrain/styles"].variables`**: `--color-text-accent`, `--nb-color-processing` and `--nb-color-processing-light`. The spec's host context keeps unknown top-level keys, so a strict client passes this field through where it would reject the same keys in `styles.variables`. The host sends it on `ui/initialize` and on every `host-context-changed`, so these follow a theme toggle. The style block injected at load is written once, so it carries only tokens that look the same in both modes, plus a load-time value for the spec keys; see [Theming](/apps/theming/).
 
 **Host fonts arrive as `hostContext.styles.css.fonts`**, a block of `@font-face` CSS the app injects into its own document — an iframe inherits none from the shell, so a `--font-*` variable alone names a typeface the app cannot render. It is read once, at the handshake.
 
@@ -172,7 +184,7 @@ Sent when the agent calls one of your app's tools during a conversation. The par
 
 ### `ui/notifications/host-context-changed`
 
-Sent when the user toggles themes, changes locale, or other host context changes. Theme tokens are nested under `styles.variables`.
+Sent when the user toggles themes, changes locale, or other host context changes. Theme tokens are nested under `styles.variables` (spec keys) and `ai.nimblebrain/styles.variables` (the NimbleBrain tokens that change with the mode).
 
 ```json
 {
@@ -184,6 +196,11 @@ Sent when the user toggles themes, changes locale, or other host context changes
       "variables": {
         "--color-background-primary": "#0f172a",
         "--color-text-primary": "#e2e8f0"
+      }
+    },
+    "ai.nimblebrain/styles": {
+      "variables": {
+        "--color-text-accent": "#818cf8"
       }
     }
   }
@@ -560,34 +577,54 @@ A log line, forwarded to the host's browser console with your app's name. A noti
 }
 ```
 
-### `ai.nimblebrain/action`
+### `ai.nimblebrain/open`
 
-Ask the shell to open an app or a conversation. Your app names what to open and the shell resolves it, so the app never depends on the shell's routes.
+Ask the host to open what a resource URI names. Your app says *what* to show, never *which app* shows it; the host finds that, so your app depends on no other app's name.
+
+```json
+// App → Host
+{ "jsonrpc": "2.0", "id": 7, "method": "ai.nimblebrain/open", "params": { "uri": "files://fl_abc123" } }
+
+// Host → App, once it is on screen
+{ "jsonrpc": "2.0", "id": 7, "result": {} }
+```
+
+The host resolves the URI in this order:
+
+| URI | Opens |
+|-----|-------|
+| `conversation://<id>` | The chat panel, at that conversation. |
+| An app's own `ui://` resource | That app, at its home. |
+| Anything else | The one app in the workspace whose server advertises a resource template (`resources/templates/list`) the URI expands from. The host opens it at the view that template names, or at its first view, and sends it the URI as [`ai.nimblebrain/navigate`](#ainimblebrainnavigate). |
+
+So for your own records to be openable, by other apps and by the agent, advertise their URI shape as a resource template.
+
+Matching stays cheap whatever a server advertises, so some templates and URIs never match:
+
+- **A URI longer than 2,048 characters.**
+- **A template with more than one place where a value's end is ambiguous.** A value's end is fixed when the text after it holds a character the value cannot contain: `/` or `,` after `{x}`, `/` after `{;x}`, `&` after `{?x}`, and nothing after `{+x}` or `{#x}`. So `{kind}/{id}`, `{id}{?cursor}` and `files/{+path}` match, and `{kind}{id}{rev}` does not.
+
+An app with several sidebar views can say which view shows a kind of record: put that view's `ui://` URI (its placement's `resourceUri`) in the template's `_meta` under `ai.nimblebrain/view`. A record then opens there, so the breadcrumb and the sidebar agree, instead of at the app's first view. Only one of your own views counts; any other value is ignored.
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "method": "ai.nimblebrain/action",
-  "params": {
-    "action": "openConversation",
-    "id": "conv_abc123"
-  }
+  "uriTemplate": "outreach://campaigns/{id}",
+  "name": "campaign",
+  "_meta": { "ai.nimblebrain/view": "ui://outreach/campaigns" }
 }
 ```
 
-The `action` field is required. All other fields in `params` are action-specific.
+`{}` means the host put the destination on screen and handed it the URI. Whether an app then shows that view is the app's to decide. When nothing in the workspace shows the URI, or two apps claim it, the host answers an error naming it, with code `-32602`. The agent's `nb__open_app` resolves through the same rules.
 
-| Action | Params | Description |
-|--------|--------|-------------|
-| `openConversation` | `{ id: string }` | Open the chat panel and load a specific conversation. |
-| `openApp` | `{ name: string, target?: string }` | Open an installed app, named by its route, server name or sidebar label. `target` is a view inside it, by the stable address that app reports in [`ai.nimblebrain/location`](#ainimblebrainlocation); the shell sends it to that app as [`ai.nimblebrain/navigate`](#ainimblebrainnavigate) once the app has reported its location, whether it was already open or not. An app opened by this action gets the target at its first report. |
-| `openConnectorSettings` | none | Open this connector's settings page in the current workspace. The connector is always the one that sent the action. |
+### `ai.nimblebrain/open-connector-settings`
 
-The bridge adds `serverName`, the server whose view sent the action, to every action's params, replacing any `serverName` the app passed. It hands every action to the registered `onAction` callback, or dispatches it as an `nb:action` custom event on `window` when no callback is registered. The shell ignores an action it does not know. To put a message into the conversation, use [`ui/message`](#uimessage); to open an external page, [`ui/open-link`](#uiopen-link).
+Ask the host to open your connector's settings page in the current workspace. It takes no params: the connector is always the one whose view sent it.
 
-<Aside type="note">
-`ai.nimblebrain/action` is a NimbleBrain platform extension — it is not part of the ext-apps specification. The host declares it as `experimental["ai.nimblebrain/action"]`.
-</Aside>
+```json
+{ "jsonrpc": "2.0", "id": 8, "method": "ai.nimblebrain/open-connector-settings", "params": {} }
+```
+
+Answered `{}` once open, or an error when the connector has no settings page.
 
 ### `ai.nimblebrain/request-file`
 
@@ -735,6 +772,7 @@ Tell the shell where the app is, so its top bar shows the current view's title a
 - **`id` is the view's stable address.** Use the MCP resource URI of what the view shows when there is one (`people://contacts/123`), otherwise a path-like address of your own (`contacts/123`), never a value that changes between visits such as a list index. The host does not parse it; it hands it back in `ai.nimblebrain/navigate`, and the same address lets anything that knows the resource, such as the agent, open that view.
 - **`label`** is what the bar shows: 1 to 200 characters. A trail holds 1 to 32 entries. A message outside these bounds is dropped.
 - **Depth is the trail's length.** The bar shows the last entry's label as the title and the entries before it as a breadcrumb, each of which goes to its own entry. Past three entries above the title, the middle ones fold into `…`; the root and the parent stay. Where the bar is too narrow for a breadcrumb, a back control goes to the entry before the last. Either way the bar moves up the app's structure, not through browser history.
+- **An app with several sidebar views is named by the host.** Each [view](/host/placements/#an-app-with-several-views) sends its own trail, rooted at the view (`[Campaigns]`, not `[Outreach, Campaigns]`). The host groups the views into one app, so the bar leads with a crumb of the app's catalog title, linked to its first view: **Outreach › Campaigns**. An app with one view gets no such crumb.
 - **Send the trail when a view first renders**, not only on navigation, so a reload or a fresh mount replaces whatever the bar showed before.
 
 It is a notification and takes no answer. The host declares it as `experimental["ai.nimblebrain/location"]`, and the declaration also means **the host shows your title**: drop your view's own title and back link when it is present, and keep them on a host without it.
@@ -743,7 +781,7 @@ A view that sends nothing still gets a title: the bar shows the name of the side
 
 ### `ai.nimblebrain/navigate`
 
-Sent by the host when the user picks an entry in the top bar (a breadcrumb, or back), or when an `openApp` action names a view inside your app, naming the view to go to by its `id`:
+Sent by the host when the user picks an entry in the top bar (a breadcrumb, or back), when the user chooses your view in the sidebar, or when an [`ai.nimblebrain/open`](#ainimblebrainopen) or the agent's `nb__open_app` names a view inside your app, naming the view to go to by its `id`:
 
 ```json
 {
@@ -754,6 +792,8 @@ Sent by the host when the user picks an entry in the top bar (a breadcrumb, or b
 ```
 
 Navigate there, then send the new trail. The `id` is either one of your trail's own or another address your app reports, such as a record the agent read from your tools, so resolve any address you would report, not only the entries on screen.
+
+Choosing a view in the sidebar sends that view's own `ui://` URI, the `resourceUri` of its placement, even when the view is already on screen: the route does not change then, so this is the only signal that the user asked for the view's home. Treat your own `ui://` URI as "go to your home", and root your trail at it.
 
 The host sends it only to an app that has sent a trail, so it needs no declaration of its own. That is also when: an app opened at a view gets it at its first `ai.nimblebrain/location`, because the handshake completes before an app has subscribed to anything, and a notification no handler is waiting for is lost. Subscribe to `navigate` no later than you send your first location (`useTrail` does both in one render).
 
@@ -845,7 +885,7 @@ The bridge enforces four security boundaries:
 
 ## Applying theme tokens
 
-Synapse applies the host's theme tokens for you. Without it, apply them yourself: they arrive in the `ui/initialize` response as `hostContext.styles.variables`, and again in every `ui/notifications/host-context-changed`.
+Synapse applies the host's theme tokens for you. Without it, apply them yourself: they arrive in the `ui/initialize` response as `hostContext.styles.variables` and `hostContext["ai.nimblebrain/styles"].variables`, and again in every `ui/notifications/host-context-changed`.
 
 ```javascript
 window.addEventListener('message', (event) => {
@@ -855,11 +895,13 @@ window.addEventListener('message', (event) => {
   // The handshake response (the id your ui/initialize request used)
   if (msg.id === 'init-1' && msg.result) {
     applyTokens(msg.result.hostContext?.styles?.variables);
+    applyTokens(msg.result.hostContext?.['ai.nimblebrain/styles']?.variables);
   }
 
   // A later change (theme toggle and the like)
   if (msg.method === 'ui/notifications/host-context-changed') {
     applyTokens(msg.params?.styles?.variables);
+    applyTokens(msg.params?.['ai.nimblebrain/styles']?.variables);
   }
 });
 

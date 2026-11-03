@@ -15,14 +15,14 @@ NimbleBrain uses pluggable authentication adapters configured via `instance.json
 
 | Adapter | Use case | Configuration |
 |---------|----------|--------------|
-| **dev** | Local development | `adapter: "dev"`: every request is one built-in owner, no login |
+| **dev** | Local development | `adapter: "dev"`: every request is one built-in admin, no login |
 | **oidc** | Enterprise / SSO | Authorization-code flow against any OIDC provider |
 | **workos** | Enterprise / SSO via WorkOS | AuthKit-hosted login (`adapter: "workos"`) |
 
 The adapter is selected by the `auth.adapter` field in `instance.json`. The server does not start without the file: a missing identity config never selects an adapter.
 
 <Aside type="danger">
-The `dev` adapter checks no credential. Anyone who can reach the server is its org owner, with full access to the agent and every connector installed in its workspaces.
+The `dev` adapter checks no credential. Anyone who can reach the server is its org admin, with full access to the agent and every connector installed in its workspaces.
 </Aside>
 
 ### How authentication works
@@ -69,7 +69,7 @@ The `Secure` flag is automatically omitted for localhost connections (where `htt
 
 ### Logout
 
-`POST /v1/auth/logout` clears `nb_session` and `nb_refresh` by setting `Max-Age=0`. It needs no valid session, so sign-out still works after the access token has expired. It does require `Content-Type: application/json`: that header forces a CORS preflight, which a foreign origin fails, so another site cannot sign a user out with a plain form post. The client should discard any cached auth state.
+`POST /v1/auth/logout` clears `nb_session` and `nb_refresh` by setting `Max-Age=0`. It needs no valid session, so sign-out still works after the access token has expired. Under the WorkOS adapter it also revokes the WorkOS session behind the request, found from the access token or, once that cookie has expired, from `nb_refresh`, so the next sign-in asks for credentials instead of resuming that session; the cookies are cleared even if the revocation fails. It does require `Content-Type: application/json`: that header forces a CORS preflight, which a foreign origin fails, so another site cannot sign a user out with a plain form post. The client should discard any cached auth state.
 
 ## CORS
 
@@ -102,18 +102,27 @@ If you use a custom domain with the web UI, that domain must be in `ALLOWED_ORIG
 These headers are always permitted in CORS requests:
 
 ```
-Content-Type, Authorization, Mcp-Session-Id, Last-Event-ID, Mcp-Protocol-Version
+Content-Type, Authorization, Last-Event-ID, Mcp-Protocol-Version, Mcp-Method, Mcp-Name
 ```
 
 These headers are exposed to client JavaScript:
 
 ```
-Mcp-Session-Id, Mcp-Protocol-Version
+Mcp-Protocol-Version
 ```
 
 ### Cross-origin writes
 
 CORS stops a script on another origin from reading a response, but a plain form or `text/plain` POST needs no preflight, and `SameSite=Lax` sends the session cookie on it when the other origin is on the same site. So any write (a method other than `GET`, `HEAD` or `OPTIONS`, on any route: `/v1/*`, `/mcp/<wsId>`, webhook deliveries) that the browser marks `Sec-Fetch-Site: same-site` or `cross-site` is refused with `403 cross_site_request`, unless its `Origin` is in `ALLOWED_ORIGINS`. Same-origin requests, and clients that are not browsers (MCP clients, webhook senders, services calling the API), send no such header and are unaffected. A browser request that CORS admits after a preflight comes from an allowed origin, so it is unaffected too.
+
+### Browser origins at `/mcp/<wsId>`
+
+A request to `/mcp/<workspaceId>` that carries an `Origin` header is refused with `403 untrusted_origin` unless that origin is one of:
+
+- the instance's public origin, platform host or custom domain, or an origin in `ALLOWED_ORIGINS`;
+- the address the request was sent to, when that address is `localhost` or an IP address (a self-hosted instance opened at its own address).
+
+This is the MCP transport's DNS-rebinding protection: a page on another hostname whose DNS was pointed at your instance sends requests the browser treats as same-origin, and its `Origin` names that hostname. If you reach the web UI by a hostname that is not your public origin (for example, a LAN name for a self-hosted instance), add it to `ALLOWED_ORIGINS`, or apps in the UI cannot call their tools. MCP clients send no `Origin` and are unaffected.
 
 ## Network architecture
 
@@ -132,6 +141,17 @@ Internet → Reverse Proxy (TLS) → Web (27246) → Platform (27247, internal)
 <Aside type="danger">
 Do not add `ports: - "27247:27247"` to the platform service in `docker-compose.yml`. This would expose the API directly, bypassing the web container's reverse proxy.
 </Aside>
+
+### Web UI headers
+
+The web container serves the UI's pages with:
+
+- `Referrer-Policy: strict-origin-when-cross-origin`, so a link or request to another origin carries only your origin, not the page's path or query (which can name the open conversation).
+- `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, so no page, on any origin including your own, can embed the UI in a frame. A portal that iframes the web UI will show a blank frame; link to it instead.
+
+These apply to the UI's pages only. `/v1/*`, `/mcp*`, and static assets keep their own headers.
+
+Stored files (`/v1/files/<id>`) are always served with `Content-Security-Policy: sandbox` and the platform's default policy, even when `NB_CSP` is cleared. An uploaded HTML or SVG file opened in the browser then runs no script on your domain. Images and PDFs display as before.
 
 ### Firewall rules
 

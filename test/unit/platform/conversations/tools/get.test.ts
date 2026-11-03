@@ -36,12 +36,13 @@ function writeConversation(dir: string, id: string, opts: WriteOpts = {}): void 
   const createdAt = opts.createdAt ?? "2025-01-15T10:00:00.000Z";
   const updatedAt = opts.updatedAt ?? createdAt;
 
-  // Line-1 totals are no longer read by the connector; lastModel still is.
+  // Line-1 totals are not read by the connector; lastModel is.
   const meta = JSON.stringify({
+    model: "anthropic:claude-sonnet-4-6",
+    ownerId: "usr_test",
     id,
     createdAt,
     updatedAt,
-    title: opts.title ?? null,
     lastModel: "claude-sonnet-4-5-20250929",
     ...(opts.workspaceId ? { workspaceId: opts.workspaceId } : {}),
   });
@@ -72,6 +73,10 @@ function writeConversation(dir: string, id: string, opts: WriteOpts = {}): void 
 
   const lines = [
     meta,
+    // The title is a `metadata.title` event; line 1 never carries one.
+    ...(opts.title
+      ? [JSON.stringify({ type: "metadata.title", ts: createdAt, title: opts.title })]
+      : []),
     ...conversationEventLines(
       annotated.map((m) => ({ ...m, timestamp: m.timestamp ?? createdAt })) as FixtureTurn[],
     ),
@@ -128,8 +133,9 @@ describe("conversations__get", () => {
     expect(result.messages[4]!.content).toBe("Message 3");
   });
 
-  it("surfaces the conversation's workspaceId in metadata (drives the panel re-scope)", async () => {
-    writeConversation(dir, "conv-ws", { workspaceId: "ws_00164434d8dd7ffb" });
+  it("surfaces the conversation's workspace, taken from its directory (drives the panel re-scope)", async () => {
+    // Line 1 names another workspace; the directory the file is stored under wins.
+    writeConversation(dir, "conv-ws", { workspaceId: "ws_0000000000000000" });
     await index.build(dir);
 
     const result = await handleGet({ id: "conv-ws", expand: "metadata" }, index);
@@ -137,13 +143,13 @@ describe("conversations__get", () => {
     expect(result.metadata.workspaceId).toBe("ws_00164434d8dd7ffb");
   });
 
-  it("omits workspaceId for a legacy record that has none (absence ⇒ don't reconcile)", async () => {
-    writeConversation(dir, "conv-legacy"); // no workspaceId written
+  it("surfaces the directory's workspace for a record whose line 1 names none", async () => {
+    writeConversation(dir, "conv-unstamped");
     await index.build(dir);
 
-    const result = await handleGet({ id: "conv-legacy", expand: "metadata" }, index);
+    const result = await handleGet({ id: "conv-unstamped", expand: "metadata" }, index);
 
-    expect("workspaceId" in result.metadata).toBe(false);
+    expect(result.metadata.workspaceId).toBe("ws_00164434d8dd7ffb");
   });
 
   it("returns only the last N messages when limit is provided", async () => {

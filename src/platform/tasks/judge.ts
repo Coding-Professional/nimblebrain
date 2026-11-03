@@ -112,6 +112,24 @@ export function findJudgeServer(
   };
 }
 
+/**
+ * The judge servers among a workspace's sources, and why a task naming none
+ * would not be judged (none connected, or several): the same
+ * `findJudgeServer` the pipeline uses, so the picker and the pipeline agree.
+ */
+export function judgeServersOf(sources: JudgeSourceView[]): {
+  servers: string[];
+  warning?: { code: JudgeMissing; message: string };
+} {
+  const servers = sources
+    .filter((s) => s.toolNames.includes(JUDGE_TOOL) && s.toolNames.includes(LIST_JUDGES_TOOL))
+    .map((s) => s.name);
+  const found = findJudgeServer(sources, undefined);
+  return "server" in found
+    ? { servers }
+    : { servers, warning: { code: found.code, message: found.reason } };
+}
+
 /** A warning a write returns about a task it saved. */
 export interface JudgeWarning {
   code: JudgeMissing;
@@ -127,8 +145,8 @@ export interface JudgeWarning {
 export async function judgeWarnings(
   task: Pick<Task, "criteria" | "judge" | "workspaceId">,
   port: Pick<JudgePort, "sources">,
-  /** `task`: a create or update saved it. `run`: an inline one-off run of it. */
-  about: "task" | "run" = "task",
+  /** `task`: a create or update saved it. `run`: a run of it. `batch`: a batch of its runs. */
+  about: "task" | "run" | "batch" = "task",
 ): Promise<JudgeWarning[]> {
   if (!task.criteria?.length || !task.workspaceId) return [];
   let sources: JudgeSourceView[];
@@ -144,14 +162,19 @@ export async function judgeWarnings(
   return [
     {
       code: found.code,
-      message:
-        (about === "run"
-          ? "This run's criteria cannot be judged, so it is recorded uncertain and reads Needs review"
-          : "Saved, but its criteria cannot be judged, so its runs are recorded uncertain and read Needs review") +
-        `, until ${until}: ${found.reason}.`,
+      message: `${JUDGE_WARNING_LEAD[about]}, until ${until}: ${found.reason}.`,
     },
   ];
 }
+
+/** How a judge warning begins, by what the call that drew it did. */
+const JUDGE_WARNING_LEAD: Record<"task" | "run" | "batch", string> = {
+  task: "Saved, but its criteria cannot be judged, so its runs are recorded uncertain and read Needs review",
+  run: "This run's criteria cannot be judged, so it is recorded uncertain and reads Needs review",
+  batch:
+    "This batch's criteria cannot be judged, so its runs are recorded uncertain, read Needs " +
+    "review, and never trip stopWhen",
+};
 
 /** Judge error codes worth another try: the judge or its upstream is briefly unavailable. */
 const RETRYABLE_CODES = new Set(["rate_limited", "upstream_unavailable", "upstream_timeout"]);

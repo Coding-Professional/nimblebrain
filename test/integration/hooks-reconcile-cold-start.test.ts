@@ -22,7 +22,7 @@ import { makeTestWorkDir } from "../helpers/test-workdir.ts";
  * whose tools are not enumerable yet, and one that comes back after the single
  * transition to `running` has already been spent.
  *
- * Both are ordinary states of a source, and both used to end with a permanent,
+ * Both are ordinary states of a source, and neither may end with a permanent,
  * false report that the connector declared a registration tool it does not
  * serve. What the connector's server actually advertises is a REGISTRY tool
  * list — every name qualified `<source>__<tool>` — while a declaration names
@@ -276,10 +276,11 @@ describe("a source that is running but has advertised nothing yet", () => {
           connector: CONNECTOR,
           vendor: DECL.vendor,
           kid: "hk_before_delivery_ids",
+          createdAt: "2026-01-01T00:00:00.000Z",
           route: DECL.route,
         },
       },
-    } as never);
+    });
 
     const fake = makeSource([advertised("set_webhook_url")]);
     const provisioned = await ensureHooks(makeDeps(fake.source), wsId, CONNECTOR, {

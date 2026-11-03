@@ -81,12 +81,35 @@ two-pane master/detail collapses into nested unreadable scroll regions the momen
 the chat is docked. Reference: `pages/ContextInspectorPage.tsx`, one scrolling
 column with each layer's body expanding in place.
 
+## The page gutter
+
+The gutter is the host's token, like colour, font and radius: `spacing` in
+`src/theme/palette.ts` holds the wide and narrow values and the breakpoint, all
+equal to the Synapse kit's defaults. Host chrome and pages inset by
+`--page-gutter`, never a hand-picked `px-*`; it narrows when the main column
+(`@container main`) is at or under the breakpoint, the same column an app's
+iframe fills, so the shell's inset and an app's line up at every width.
+A settings page takes it from `SettingsShell`'s content column and sets no
+inset of its own; any other routed page puts it on its outermost content
+container, or on each full-bleed section of a page whose sections run edge to
+edge (`pages/ContextInspectorPage.tsx`). Padding inside a component (a card, a
+row's control, a menu) is not the gutter.
+
+The host never pads an app's slot. An app gets both values (`--nb-gutter-wide`
+and `--nb-gutter-narrow` in its style block) and decides where to inset, because some panes run edge to
+edge. Never send an app `--nb-gutter`: the kit reads it at every width, so it
+would stop the app's gutter narrowing.
+
 ## Settings pages
 
 Every settings page renders in `SettingsShell`, which sets the one content width
 (`max-w-4xl`, left-aligned beside the nav). A page or template sets no width of
 its own, so moving between tabs never moves the content. A page's header title is
 its tab's label in the settings nav.
+
+A settings page's layout steps query the `settings` container, the shell's
+content column (`@xl/settings:grid-cols-3`), never `main`: the side nav takes
+part of `main`, so the main column overstates the page's width.
 
 ## Tooltips
 
@@ -96,6 +119,10 @@ control with a visible text label gets none. The trigger keeps its own
 native `title` on an icon button: it shows late, unstyled, and never with a
 shortcut.
 
+- **Status, not a name:** a control with a visible label may take a tooltip
+  for status that label cannot show, shown only while that status holds
+  (`disabled` otherwise): the workspace switcher names which other workspaces
+  have unread items.
 - **Label:** what the control does, in a few words, sentence case: "Search",
   "Close sidebar", "New chat". Not its icon's name, not a sentence.
 - **Shortcut:** pass the chord from `lib/shortcuts` (`shortcut={SHORTCUTS.chat}`),

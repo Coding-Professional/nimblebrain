@@ -18,6 +18,7 @@ import {
 import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
 import { RefreshTokenError } from "../identity/provider.ts";
 import { getAvailableModels } from "../model/catalog.ts";
+import { ModelNotQualifiedError } from "../model/model-id.ts";
 import { log } from "../observability/log.ts";
 import {
   ConversationAccessDeniedError,
@@ -42,6 +43,7 @@ import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { SseEventManager } from "./events.ts";
 import { mcpResourceUrl } from "./mcp-resource.ts";
 import { artifactResolutionsTotal } from "./metrics.ts";
+import { DEFAULT_CSP } from "./middleware/security-headers.ts";
 import type {
   AuthOkResponse,
   BootstrapResponse,
@@ -80,13 +82,16 @@ function mapChatTurnError(err: unknown): Response | null {
   if (err instanceof ConversationAccessDeniedError) {
     return conversationAccessDeniedResponse(err.conversationId);
   }
-  // Both chat doors can surface this: `store.load` throws it on a
-  // pre-migration (ownerless) conversation. 422 rather than a raw 500.
+  // Both chat doors can surface this: `store.load` throws it on an
+  // ownerless conversation file. 422 rather than a raw 500.
   if (err instanceof ConversationCorruptedError) {
     return conversationCorruptedResponse(err);
   }
   if (err instanceof ModelNotAllowedError) {
     return modelNotAllowedResponse(err);
+  }
+  if (err instanceof ModelNotQualifiedError) {
+    return apiError(400, err.code, err.message, { model: err.model });
   }
   return null;
 }
@@ -609,9 +614,8 @@ export async function handleReadResource(
 
   // Wrap the source's read in a request-scoped context so the
   // AsyncLocalStorage-backed `runtime.requireWorkspaceId()` is available
-  // to any callback-form resource (e.g. `instructions://workspace`'s
-  // `text: () => store.read({ wsId: runtime.requireWorkspaceId() })`).
-  // Without this wrapper, those callbacks throw and `McpSource.readResource`
+  // to any callback-form resource that reads its workspace with
+  // `runtime.requireWorkspaceId()`. Without this wrapper, those callbacks throw and `McpSource.readResource`
   // catches the exception, returning null → 404 to the caller.
   const reqCtx: RequestContext = {
     identity: null,
@@ -1165,8 +1169,24 @@ export async function handleEvents(
   });
 }
 
-/** Handle POST /v1/auth/logout — clear all session cookies. */
-export function handleLogout(): Response {
+/**
+ * Handle POST /v1/auth/logout — end the identity provider's session, then clear
+ * all session cookies. The cookies are cleared even when ending the provider's
+ * session fails: the browser is signed out of this instance either way.
+ */
+export async function handleLogout(
+  request: Request,
+  provider: IdentityProvider,
+): Promise<Response> {
+  if (provider.endSession) {
+    try {
+      await provider.endSession(request);
+    } catch (err) {
+      log.error("[nimblebrain] Sign-out could not end the identity provider session", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   const res = json<AuthOkResponse>({ ok: true });
   // Clear nb_session for both SameSite modes (covers Strict and Lax)
   res.headers.append("Set-Cookie", "nb_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
@@ -1412,9 +1432,18 @@ export async function handleOidcRefresh(
 
 /** Strip characters that could break or inject Content-Disposition headers. */
 export function sanitizeFilename(name: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional security sanitization
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: a control byte in the name could split or inject the Content-Disposition header, so matching them is the point
   return name.replace(/["\r\n\x00-\x1f]/g, "_");
 }
+
+/**
+ * The policy stored bytes are served under, whatever the operator sets as `NB_CSP`. A stored file
+ * is a person's or an agent's upload, served on the shell's origin, so an HTML or SVG file opened
+ * directly must never run script there. `sandbox` gives the document an opaque origin with
+ * scripts, forms and popups off; the rest is the platform's default policy. An image in an
+ * `<img>` and a PDF in the browser's viewer render under it unchanged.
+ */
+export const FILE_BYTES_CSP = `sandbox; ${DEFAULT_CSP}`;
 
 /** Handle GET /v1/files/:fileId — serve a stored file by its globally-unique id.
  * Files are workspace-owned, but the id alone addresses them: the file locator
@@ -1449,6 +1478,7 @@ export async function handleFileServe(
         headers: {
           "Content-Type": file.mimeType,
           "Content-Disposition": `inline; filename="${safeName}"`,
+          "Content-Security-Policy": FILE_BYTES_CSP,
         },
       });
     } catch {
@@ -1534,26 +1564,21 @@ type MultipartForm = Awaited<ReturnType<Request["formData"]>>;
 
 /**
  * Collect uploaded files from a chat multipart body. FormDataEntryValue is
- * `string | File` in Bun; without the DOM lib we duck-type the file parts.
+ * `string | File` in Bun, so a part that is not a string is a `File`.
  */
 async function collectMultipartChatFiles(formData: MultipartForm): Promise<UploadedFile[]> {
   const uploadedFiles: UploadedFile[] = [];
   for (const [_key, value] of formData.entries()) {
     if (typeof value === "string") continue;
-    const entry = value as unknown as {
-      arrayBuffer(): Promise<ArrayBuffer>;
-      name?: string;
-      type?: string;
-    };
-    if (typeof entry.arrayBuffer !== "function") continue;
-    const buffer = Buffer.from(await entry.arrayBuffer());
+    if (typeof value.arrayBuffer !== "function") continue;
+    const buffer = Buffer.from(await value.arrayBuffer());
     uploadedFiles.push({
       data: buffer,
-      filename: entry.name || "unnamed",
+      filename: value.name || "unnamed",
       // Browsers leave the part's Content-Type empty for extensions they
       // don't recognise (.typ etc.); recover a text type from the filename
       // so the file isn't stored as opaque binary. See resolveMimeType.
-      mimeType: resolveMimeType(entry.name, entry.type),
+      mimeType: resolveMimeType(value.name, value.type),
     });
   }
   return uploadedFiles;
@@ -1719,19 +1744,14 @@ async function collectResourceUploads(formData: MultipartForm): Promise<Uploaded
     for (const [key, value] of formData.entries()) {
       if (typeof value === "string") continue;
       if (key !== "file" && key !== "files") continue;
-      const entry = value as unknown as {
-        arrayBuffer(): Promise<ArrayBuffer>;
-        name?: string;
-        type?: string;
-      };
-      if (typeof entry.arrayBuffer !== "function") continue;
+      if (typeof value.arrayBuffer !== "function") continue;
       uploads.push({
-        data: Buffer.from(await entry.arrayBuffer()),
-        filename: entry.name || "unnamed",
+        data: Buffer.from(await value.arrayBuffer()),
+        filename: value.name || "unnamed",
         // Recover a text type from the filename when the browser sent no
         // usable Content-Type (see resolveMimeType) — same recovery as the
         // chat-multipart path.
-        mimeType: resolveMimeType(entry.name, entry.type),
+        mimeType: resolveMimeType(value.name, value.type),
       });
     }
   } catch {

@@ -23,8 +23,8 @@ export interface ResourceLinkInfo {
 /** Mirrors `SkillsLoadedEntry` (`src/engine/schemas/events.ts`). */
 export interface SkillsLoadedEntry {
     id: string;
-    /** Absent on events recorded before the field existed. */
-    name?: string;
+    /** The skill's own name. */
+    name: string;
     /** The MCP server that published the skill, when one did. */
     connector?: string;
     /** Loading mechanism's layer: 0 = always-on, 3 = tool-affinity, 4 = trigger. */
@@ -170,7 +170,8 @@ export interface StreamErrorEvent {
 /** A turn's conversation is resolved and its run is about to start. */
 export interface ChatStartEvent {
     conversationId: string;
-    model?: string;
+    /** The model the conversation is bound to. */
+    model: string;
 }
 /** Streamed model text (`text.delta`) or reasoning (`reasoning.delta`). */
 export interface TextDeltaEvent {
@@ -213,6 +214,8 @@ export interface ToolDoneEvent {
     supervisorTripped?: true;
     trippedTool?: string;
     consecutiveRepeats?: number;
+    /** The call did not run; it waits for guidance the model has not read yet. */
+    held?: true;
     /** The workspace the call ran in. */
     workspaceId?: string;
 }
@@ -228,6 +231,8 @@ export interface LlmDoneEvent {
     estimatedInputTokens: number;
     finishReason: FinishReason;
     finishReasonRaw?: string;
+    /** Content an external agent's turn produced, recorded for replay: not a model call. */
+    transcriptOnly?: boolean;
 }
 /** The skills composed into this turn's prompt. */
 export interface SkillsLoadedEvent {

@@ -2,9 +2,9 @@
  * A placement the catalog gains after a connector was installed reaches that
  * connector at the next boot, without a reinstall.
  *
- * Install stores the catalog's host UI on the connector's record. Boot used to
- * register placements from that stored copy alone, so the placement registry —
- * what the sidebar, the route table and the connector settings page read — kept
+ * Install stores the catalog's host UI on the connector's record. Registering
+ * placements from that stored copy alone would leave the placement registry —
+ * what the sidebar, the route table and the connector settings page read — with
  * the shape the catalog had on the day of install.
  */
 
@@ -71,19 +71,17 @@ afterEach(() => {
 describe("boot takes an installed connector's host UI from the catalog", () => {
   test("registers a settings placement the catalog gained after install", async () => {
     // The record as the install left it: the sidebar placement only.
-    const installed = {
+    const installed: ConnectorRef = {
       url: UNREACHABLE,
       serverName: slugifyServerName(ID),
       transport: { type: "streamable-http", auth: { type: "bearer", token: "test-token" } },
       oauthScope: "workspace",
       ui: {
-        name: "Outbound",
-        icon: "crosshair",
         placements: [
           { slot: "sidebar.apps", resourceUri: "ui://outbound/main", route: "outbound" },
         ],
       },
-    } as unknown as ConnectorRef;
+    };
     const store = new WorkspaceStore(workDir);
     const ws = await store.create("Fleet");
     await store.update(ws.id, { connectors: [installed] });

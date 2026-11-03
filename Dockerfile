@@ -15,7 +15,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 # newest. BUN_VERSION must equal ci.yml's (test/unit/build-pins.test.ts checks it);
 # Renovate bumps every copy together.
 # renovate: datasource=github-releases depName=oven-sh/bun extractVersion=^bun-v(?<version>.+)$
-ARG BUN_VERSION=1.3.14
+ARG BUN_VERSION=1.4.3
 # renovate: datasource=node-version depName=node
 ARG NODE_VERSION=24.21.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -60,6 +60,8 @@ RUN set -e; \
     for p in $pids; do wait "$p"; done
 
 COPY --chown=1000:1000 src/ src/
+# The palette and contrast modules the brand loader imports (`src/brand/`).
+COPY --chown=1000:1000 web/src/theme/ web/src/theme/
 COPY --chown=1000:1000 scripts/ scripts/
 # Out-of-kernel Sentry preload + its bunfig wiring. bunfig.toml must sit at the
 # WORKDIR (the runtime's cwd) so Bun applies `preload` to `bun run src/cli/...`.

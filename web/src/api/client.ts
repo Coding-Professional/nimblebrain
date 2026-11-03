@@ -384,8 +384,8 @@ export async function getResources(
  * `args` is type-checked against the catalog at `@platform/schemas/catalog`.
  * For a `(server, tool)` pair registered there, callers must pass a payload
  * matching the schema-derived type. Unregistered pairs fall through to
- * `Record<string, unknown>` so untyped legacy callers continue to compile
- * while sources migrate one by one.
+ * `Record<string, unknown>`, so a tool with no catalog entry stays callable
+ * untyped.
  */
 export async function callTool<S extends string, T extends string>(
   server: S,
@@ -630,8 +630,7 @@ export async function initiateComposioOAuth(
  * Per-workspace installed view. Returns every connector visible in the
  * workspace. Personal connectors live on the caller's identity, not here.
  *
- * Stage 2: `scope` is always `"workspace"`. The legacy `"user"` arm was
- * removed in T008/T009.
+ * `scope` is always `"workspace"`.
  */
 export interface InstalledConnector {
   serverName: string;
@@ -657,6 +656,13 @@ export interface InstalledConnector {
   interactive: boolean;
   toolCount: number;
   /**
+   * The bare names of this connector's tools the caller may call, decided by
+   * the server with the same gate that refuses a call. Empty when the
+   * connector is not running. Handed to the connector's apps as
+   * `hostContext.connector.allowedTools`.
+   */
+  allowedTools: string[];
+  /**
    * Brand icon URL from the connector's catalog match. Falls through to the
    * deterministic letter avatar when unset (the connector isn't in any
    * enabled registry, or the fetch failed).
@@ -668,16 +674,16 @@ export interface InstalledConnector {
   catalog?: ConnectorCatalogEntry;
   authorizationUrl?: string;
   identity?: { email?: string; name?: string };
-  missingOperatorSetup?: boolean;
+  missingOAuthClient?: boolean;
   /** Last connection error for crashed / dead / reauth_required states. */
   lastError?: string;
   /**
-   * Operator OAuth client config — present only for static-auth
+   * OAuth client config — present only for static-auth
    * connectors the workspace has configured. The Configure page reads
    * this to render the audit line + Edit affordance. Secret never
    * appears here.
    */
-  operatorOAuth?: {
+  workspaceOAuthClient?: {
     clientId: string;
     configuredAt: string;
     configuredBy: string;
@@ -690,7 +696,7 @@ export interface InstalledConnector {
    * detail-page hero, and any future surface read one value.
    *
    *   ready          — works
-   *   needs_setup    — admin must configure the operator OAuth client
+   *   needs_setup    — admin must configure the OAuth client
    *   not_connected  — installed, no connection (never connected, or
    *                     disconnected): at rest, not an error
    *   needs_auth     — a working connection broke (credential revoked or
@@ -759,6 +765,68 @@ export async function getInstalledConnector(
     serverName,
   });
   return unwrapStructured(result, "get_installed");
+}
+
+/** How a skill reaches the model, as the runtime's `resolveLoadingMechanism` decides it. */
+export type SkillLoadingMechanismName = "always" | "tool_affinity" | "trigger" | "on_request";
+
+/**
+ * A curated overlay materialized for a connector: surfaced into the
+ * conversation once, on the first call to a tool it is bound to.
+ */
+export interface ConnectorOverlaySkill {
+  server: string;
+  name: string;
+  description?: string;
+  /** Which curated overlay and pinned version the copy came from. */
+  source?: string;
+  toolAffinity: string[];
+}
+
+/** A skill a connected server publishes through the MCP Skills extension. */
+export interface PublishedConnectorSkill {
+  server: string;
+  name: string;
+  description: string;
+  /** The skill's `SKILL.md` URI on the server. */
+  uri: string;
+  loadingStrategy: "always" | "dynamic";
+  priority: number;
+  toolAffinity: string[];
+  triggers?: string[];
+  mechanism: SkillLoadingMechanismName;
+}
+
+/**
+ * Every skill the workspace's connectors contribute to the model's context,
+ * without bodies. A server with a curated overlay lists only the overlay: the
+ * runtime does not load that server's published skills.
+ */
+export async function listConnectorSkills(
+  workspaceId: string,
+): Promise<{ overlays: ConnectorOverlaySkill[]; published: PublishedConnectorSkill[] }> {
+  const result = await callTool(
+    "nb",
+    "manage_connectors",
+    { action: "list_bound_skills" },
+    { workspaceId },
+  );
+  return unwrapStructured(result, "list_bound_skills");
+}
+
+/** One connector skill's body, as the model receives it. */
+export async function readConnectorSkill(
+  workspaceId: string,
+  serverName: string,
+  skillName: string,
+): Promise<{ kind: "overlay" | "published"; body: string }> {
+  const result = await callTool(
+    "nb",
+    "manage_connectors",
+    { action: "read_bound_skill", serverName, skillName },
+    { workspaceId },
+  );
+  return unwrapStructured(result, "read_bound_skill");
 }
 
 /** A personal connector (a remote MCP connection owned by the caller's identity) + where it's granted. */
@@ -1035,22 +1103,22 @@ export async function listDirectory(): Promise<DirectoryResult> {
 }
 
 /**
- * Configure the workspace's OAuth app for a static-auth catalog
+ * Configure the workspace's OAuth client for a static-auth catalog
  * connector. Upsert — calling this on an already-configured connector
  * rotates both pieces. ws_admin gated.
  */
-export async function setupConnectorOperator(
+export async function setConnectorOAuthClient(
   catalogId: string,
   clientId: string,
   clientSecret: string,
 ): Promise<{ ok: boolean; catalogId: string; clientId: string }> {
   const result = await callTool("nb", "manage_connectors", {
-    action: "setup_operator",
+    action: "set_oauth_client",
     catalogId,
     clientId,
     clientSecret,
   });
-  return unwrapStructured(result, "setup_operator");
+  return unwrapStructured(result, "set_oauth_client");
 }
 
 /**
@@ -1074,8 +1142,8 @@ export async function connectComposioApiKey(
 
 /**
  * The exact redirect URI the platform sends to vendor OAuth servers.
- * OperatorSetupModal shows this to admins so they can register the
- * same value in the vendor's OAuth app config; a mismatch yields a
+ * OAuthClientSetupModal shows this to admins so they can register the
+ * same value in the vendor's OAuth client config; a mismatch yields a
  * vendor-side `redirect_uri does not match` error after the user is
  * already redirected away.
  */

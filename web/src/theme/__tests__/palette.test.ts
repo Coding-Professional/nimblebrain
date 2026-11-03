@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { GUTTER_NARROW_BREAKPOINT } from "@nimblebrain/synapse/host";
 import { getSpecThemeTokens } from "../../bridge/theme.ts";
+import { colors, pick, spacing } from "../palette.ts";
 import { paletteToExtAppsTokens, paletteToRootCss } from "../projections.ts";
 
 /**
@@ -89,11 +91,64 @@ describe("getSpecThemeTokens — protocol boundary", () => {
     // representative spec keys survive the filter
     expect(spec["--color-background-primary"]).toBe("#ffffff");
     expect(spec["--font-sans"]).toContain("Hanken Grotesk");
-    // out-of-spec tokens are injected into the iframe but do NOT cross the boundary
+    // out-of-spec tokens never go out on `styles.variables`; the mode-varying
+    // ones ride the `ai.nimblebrain/styles` extension instead
     expect(spec["--color-text-accent"]).toBeUndefined();
-    // the newly-added brand semantics do NOT cross the boundary
     expect(spec["--nb-color-processing"]).toBeUndefined();
   });
+});
+
+/**
+ * A value goes out under its MCP Apps spec key whenever the spec names one,
+ * because the spec key is the only one that crosses the protocol and the only
+ * one another host (Claude, ChatGPT) can send. A `--nb-*` key is for a value the
+ * spec has no key for, so the host sends exactly this set and no `--nb-*` twin
+ * of a spec key.
+ */
+const NB_EXTENSIONS = [
+  "--nb-color-processing",
+  "--nb-color-processing-light",
+  "--nb-font-heading",
+  "--nb-gutter-narrow",
+  "--nb-gutter-wide",
+];
+
+/** The spec keys that carry the status colours, the info ground and on-fill text. */
+const SPEC_STATUS_KEYS: Record<string, keyof typeof colors> = {
+  "--color-text-danger": "destructive",
+  "--color-text-success": "success",
+  "--color-text-warning": "warning",
+  "--color-background-info": "info-light",
+  "--color-text-inverse": "primary-foreground",
+};
+
+describe("the host sends spec keys, and --nb-* only where the spec has none", () => {
+  for (const mode of ["light", "dark"] as const) {
+    const map = paletteToExtAppsTokens(mode);
+    const wire = getSpecThemeTokens(mode);
+
+    test(`${mode}: the --nb-* keys are exactly the values with no spec equivalent`, () => {
+      expect(
+        Object.keys(map)
+          .filter((k) => k.startsWith("--nb-"))
+          .sort(),
+      ).toEqual([...NB_EXTENSIONS].sort());
+    });
+
+    for (const [spec, color] of Object.entries(SPEC_STATUS_KEYS)) {
+      test(`${mode}: ${spec} crosses the wire with the palette's ${color}`, () => {
+        expect(wire[spec]).toBe(pick(colors[color], mode));
+      });
+    }
+
+    // `--color-text-inverse` is the text on both the accent and the danger fill,
+    // so the two foregrounds must be one colour.
+    test(`${mode}: the accent and danger foregrounds are one colour`, () => {
+      expect(pick(colors["destructive-foreground"], mode)).toBe(
+        pick(colors["primary-foreground"], mode),
+      );
+    });
+  }
 });
 
 describe("paletteToRootCss — shell :root/.dark match current values", () => {
@@ -161,7 +216,33 @@ describe("paletteToRootCss — shell :root/.dark match current values", () => {
     expect(darkBlock).toContain("--nb-shadow-sm: 0 1px 2px rgba(0,0,0,0.3);");
   });
 
-  test("the --radius base is no longer emitted (vestigial after the radius convergence)", () => {
+  test("no --radius base is emitted", () => {
     expect(rootBlock).not.toContain("--radius:");
+  });
+});
+
+describe("the page gutter narrows at the kit's breakpoint", () => {
+  // The kit decides when an app's frame is narrow and the host cannot send that
+  // threshold, so the shell narrows at the same width to keep the two in step.
+  test("the host's breakpoint is the kit's", () => {
+    expect(spacing.narrowBreakpointPx).toBe(GUTTER_NARROW_BREAKPOINT);
+  });
+
+  test("the shell's gutter narrows in the main column at that breakpoint", () => {
+    expect(paletteToRootCss()).toContain(
+      `@container main (max-width: ${GUTTER_NARROW_BREAKPOINT}px) {\n  * {\n    --page-gutter: var(--page-gutter-narrow);`,
+    );
+  });
+});
+
+describe("the gutter widths keep apps on older kits aligned", () => {
+  // The widths are the host's to choose: it sends them as `--nb-gutter-wide` and
+  // `--nb-gutter-narrow`. Apps built on synapse 0.37 or earlier read neither and
+  // have 1.5rem and 1rem baked in, so the host keeps those values and its pages
+  // line up with those apps too. Compared against literals on purpose: this is
+  // the host's policy, not a copy of the current kit's defaults.
+  test("the gutter is 1.5rem wide and 1rem narrow", () => {
+    expect(spacing.gutter).toBe("1.5rem");
+    expect(spacing.gutterNarrow).toBe("1rem");
   });
 });

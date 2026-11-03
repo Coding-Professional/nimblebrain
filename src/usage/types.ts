@@ -24,8 +24,8 @@ import type { LanguageModelV4Usage } from "@ai-sdk/provider";
  *
  * Derived from the request context, never asserted by a caller: `task` when the
  * context is unattended, `chat` when it carries a conversation, `system` for a
- * call with no request scope at all (a detached fast-slot call or a background
- * job). Lives here rather than beside the counters so `api/metrics.ts` can name
+ * call in a workspace with neither (a background job such as the briefing
+ * refresh). Lives here rather than beside the counters so `api/metrics.ts` can name
  * the label type without importing the module that derives it.
  */
 export type LlmCallOrigin = "chat" | "task" | "system";
@@ -53,16 +53,33 @@ export interface UsageRates {
   cacheWrite5m: number;
   cacheWrite1h: number;
   reasoning?: number;
+  /**
+   * Rate cards for longer prompts, ascending by `aboveInputTokens`, flattened
+   * the same way as the base rates. Stored with the line so a replay picks the
+   * card the call was billed on. Absent for a model with one rate card.
+   */
+  tiers?: UsageRateTier[];
+}
+
+/** One prompt-length rate card; see `ModelCostTier` in the model catalog. */
+export interface UsageRateTier {
+  aboveInputTokens: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+  reasoning?: number;
 }
 
 /**
  * One priced LLM call, as written to the durable usage ledger.
  *
- * Usage used to be derived from a storage side effect — a conversation JSONL
- * happening to exist, in a workspace still on disk — so any call path that did
- * not write one was invisible by default, and four such paths existed. A line
- * here is a *fact recorded at the point of spend*, which is what makes the next
- * non-conversation call path visible without anyone remembering to wire it.
+ * Usage derived from a storage side effect — a conversation JSONL happening to
+ * exist, in a workspace still on disk — misses every call path that does not
+ * write one. A line here is a *fact recorded at the point of spend*, which is
+ * what makes a non-conversation call path visible without anyone remembering
+ * to wire it.
  *
  * Written only by `src/usage/record.ts`; read only by `src/usage/aggregate.ts`.
  */
@@ -78,19 +95,20 @@ export interface UsageLedgerEntry {
   usage: TokenUsage;
   llmMs: number;
   /** `identity.id` from the request context. */
-  userId?: string;
+  userId: string;
   /** The one workspace the call was bound to. */
-  workspaceId?: string;
+  workspaceId: string;
   /**
    * The chat thread this call belongs to. Absent for a task run (which has no
-   * conversation) and for a detached background call.
+   * conversation) and for a background job.
    */
   conversationId?: string;
   /**
-   * The engine run this call belongs to — one `run.start`→`run.done` span,
-   * which is one assistant turn. Present for chat and task alike; absent on
-   * the forked fast-slot calls (title, compaction), which emit no
-   * event and are not a turn of their own.
+   * The run this call belongs to — one `run.start`→`run.done` span, which is
+   * one assistant turn — and the run the model gateway charges it to
+   * (`RequestContext.credentialSubject`). Present for chat and task alike,
+   * including the calls a run forks (title, compaction); absent for a call
+   * outside any run.
    */
   runId?: string;
   /**
@@ -101,30 +119,11 @@ export interface UsageLedgerEntry {
    */
   taskRunId?: string;
   /**
-   * @deprecated Legacy read-only. Held whichever id correlated the work — a
-   * conversation for chat, a task run for a task — discriminated by
-   * `origin`. No longer written; `conversationId` / `taskRunId` carry those
-   * two facts under their own names, and `runId` adds the per-turn grain the
-   * single field could not express.
-   *
-   * Readers must keep honouring it until every retained record predating the
-   * split has aged out (see `retentionMonths`, default 24). `aggregate.ts`
-   * normalizes it; nothing else should read it.
+   * The agent runtime that reported this usage, when it was not the native
+   * engine. Such a line is the agent's own count of its model calls, not one
+   * NimbleBrain measured (ADR-0056).
    */
-  sessionId?: string;
-  /**
-   * @deprecated Legacy read-only. Set on records written while the runtime
-   * could spawn a sub-agent from inside a turn: `delegated` marked such a
-   * call and `parentRunId` named the top-level run it belonged to. Neither is
-   * written any more — a run starts one way, and its calls carry `runId`.
-   *
-   * `aggregate.ts` still reads `parentRunId` so a retained record from that
-   * era rolls onto the turn that spawned it (see `retentionMonths`, default
-   * 24). Nothing else should read either field.
-   */
-  delegated?: boolean;
-  /** @deprecated Legacy read-only. See {@link delegated}. */
-  parentRunId?: string;
+  runtime?: string;
   /** Resolved unit prices. Absent when the catalog did not know the model. */
   rates?: UsageRates;
 }

@@ -32,6 +32,7 @@ import {
   reconstructMessages,
 } from "./event-reconstructor.ts";
 import { ConversationIndex, canAccess } from "./index-cache.ts";
+import { parseConversationPath } from "./paths.ts";
 import {
   type ConnectorSkillInjectedEvent,
   type ContextAssembledEvent,
@@ -116,10 +117,12 @@ const CONVERSATION_EVENT_TYPES = new Set([
   "tool.progress",
   "run.done",
   "run.error",
+  "execution.bound",
   "skills.loaded",
   "context.assembled",
   "connector.skill.injected",
   "skill.activated",
+  "skill.not_delivered",
   "skill.suppression",
 ]);
 
@@ -127,19 +130,24 @@ const CONVERSATION_EVENT_TYPES = new Set([
 // Conversation header + derived-metadata helpers
 // ---------------------------------------------------------------------------
 
-/** Build the base Conversation from a parsed line-0 header record (ownerId already validated). */
-function parseConversationHeader(raw: Record<string, unknown>): Conversation {
+/**
+ * Build the base Conversation from a parsed line-0 header record (ownerId already
+ * validated). The title comes from `metadata.title` events (`applyDerivedMeta`),
+ * and the workspace from the directory the file is stored under.
+ */
+function parseConversationHeader(
+  raw: Record<string, unknown>,
+  workspaceId: string | undefined,
+): Conversation {
   return {
     id: raw.id as string,
     createdAt: raw.createdAt as string,
     updatedAt: (raw.updatedAt as string) ?? (raw.createdAt as string),
-    title: (raw.title as string | null) ?? null,
+    title: null,
     lastModel: (raw.lastModel as string | null) ?? null,
     ownerId: raw.ownerId as string,
-    ...(raw.model ? { model: raw.model as string } : {}),
-    ...(raw.format ? { format: raw.format as "events" } : {}),
-    ...(raw.workspaceId ? { workspaceId: raw.workspaceId as string } : {}),
-    ...(raw.visibility ? { visibility: raw.visibility as "private" | "shared" } : {}),
+    model: raw.model as string,
+    ...(workspaceId ? { workspaceId } : {}),
     ...(raw.metadata ? { metadata: raw.metadata as Record<string, unknown> } : {}),
   };
 }
@@ -186,6 +194,18 @@ function forkUserEventLine(msg: StoredMessage): string {
 }
 
 /**
+ * The finish reason for an `llm.response` synthesized from a stored assistant
+ * message: the one its metadata recorded, else what its content implies — a
+ * message carrying tool calls ended to run them, anything else ended normally.
+ * Synthetic writers go through this so no `llm.response` is written without one.
+ */
+function synthesizedFinishReason(msg: StoredMessage): LlmResponseEvent["finishReason"] {
+  if (msg.metadata?.finishReason) return msg.metadata.finishReason;
+  const content = Array.isArray(msg.content) ? msg.content : [];
+  return content.some((c) => c.type === "tool-call") ? "tool-calls" : "stop";
+}
+
+/**
  * Serialize a forked assistant turn as run.start/llm.response/run.done event
  * lines. Each assistant turn must be wrapped in a synthetic run span — without
  * it, reconstructMessages drops the turn (assistant messages are only emitted
@@ -203,6 +223,7 @@ function forkAssistantEventLines(msg: StoredMessage, runId: string): string[] {
       content: msg.content,
       usage: msg.metadata?.usage ?? { inputTokens: 0, outputTokens: 0 },
       llmMs: msg.metadata?.llmMs ?? 0,
+      finishReason: synthesizedFinishReason(msg),
     }),
     JSON.stringify({
       ts: msg.timestamp,
@@ -278,6 +299,7 @@ function mapToolDone(ts: string, d: ToolDonePayload): ToolDoneEvent {
     // fetched on view.
     ...(d.resourceUri !== undefined ? { resourceUri: d.resourceUri } : {}),
     ...(d.resourceLinks && d.resourceLinks.length > 0 ? { resourceLinks: d.resourceLinks } : {}),
+    ...(d.held ? { held: d.held } : {}),
   };
 }
 
@@ -344,6 +366,7 @@ function mapConnectorSkillInjected(
     skillName: d.skillName,
     skillBody: d.skillBody,
     scope: d.scope,
+    ...(d.heldToolCallId !== undefined ? { heldToolCallId: d.heldToolCallId } : {}),
   };
   return e;
 }
@@ -459,13 +482,14 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
       title: null,
       lastModel: null,
       ownerId: options.ownerId,
-      format: "events",
-      ...(options.model ? { model: options.model } : {}),
+      model: options.model,
       ...(options.workspaceId ? { workspaceId: options.workspaceId } : {}),
       ...(options.metadata ? { metadata: options.metadata } : {}),
     };
     const path = this.path(id);
-    await writeFile(path, `${JSON.stringify(conversation)}\n`);
+    // Line 1 holds no workspace: the directory the file is stored under is the binding.
+    const { workspaceId: _workspaceId, ...header } = conversation;
+    await writeFile(path, `${JSON.stringify(header)}\n`);
     this.index.invalidate();
     this.onMutate?.({ id, filePath: path });
     return conversation;
@@ -481,14 +505,19 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
 
     const raw = JSON.parse(lines[0]!) as Record<string, unknown>;
     if (typeof raw.ownerId !== "string" || raw.ownerId.length === 0) {
-      // Stage 1 invariant: every conversation has an ownerId. A file
+      // Invariant: every conversation has an ownerId. A file
       // without one is pre-migration data and unreadable by this code.
       // Throw a typed error so the HTTP layer can map to a clean
       // `422 conversation_corrupted` (with the migration command in
       // the message) instead of bubbling as 500.
       throw new ConversationCorruptedError(id, "missing_owner");
     }
-    const conversation = parseConversationHeader(raw);
+    if (typeof raw.model !== "string" || raw.model.length === 0) {
+      // Every conversation is bound to a model at create. A header without
+      // one predates the binding and was not converted before this release.
+      throw new ConversationCorruptedError(id, "missing_model");
+    }
+    const conversation = parseConversationHeader(raw, parseConversationPath(this.dir)?.wsId);
 
     // Derive mutable metadata from events (source of truth)
     if (lines.length > 1) {
@@ -547,6 +576,7 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
           outputTokens: 0,
         },
         llmMs: message.metadata.llmMs ?? 0,
+        finishReason: synthesizedFinishReason(message),
       };
       const runDone: ConversationEvent = {
         ts: message.timestamp,
@@ -677,7 +707,7 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
       // A fork continues the source conversation, so it inherits the binding.
       // Re-resolving here would silently move the copy onto the current
       // default and replay the source's history to a different provider.
-      ...(source.model ? { model: source.model } : {}),
+      model: source.model,
       ...(source.workspaceId ? { workspaceId: source.workspaceId } : {}),
     });
 
@@ -753,6 +783,8 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
         return mapRunDone(ts, event.data);
       case "run.error":
         return mapRunError(ts, event.data);
+      case "execution.bound":
+        return { ts, type: "execution.bound", ...event.data };
       case "skills.loaded":
         return mapSkillsLoaded(ts, event.data);
       case "context.assembled":
@@ -761,6 +793,8 @@ export class EventSourcedConversationStore implements ConversationStore, EventSi
         return mapConnectorSkillInjected(ts, event.data);
       case "skill.activated":
         return mapSkillActivated(ts, event.data);
+      case "skill.not_delivered":
+        return { ts, type: "skill.not_delivered", ...event.data };
       case "skill.suppression":
         return mapSkillSuppression(ts, event.data);
       default:

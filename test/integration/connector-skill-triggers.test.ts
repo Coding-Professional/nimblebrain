@@ -33,6 +33,7 @@ import { join } from "node:path";
 import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import { Server } from "@modelcontextprotocol/server";
 import { NoopEventSink } from "../../src/adapters/noop-events.ts";
+import type { SkillsLoadedEntry } from "../../src/conversation/types.ts";
 import { DEV_IDENTITY } from "../../src/identity/providers/dev.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import { McpSource } from "../../src/tools/mcp-source.ts";
@@ -40,6 +41,7 @@ import { devProvider } from "../helpers/dev-provider.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 import { type RemoteMcpFixture, startRemoteMcpServer } from "../helpers/remote-mcp-fixture.ts";
 import { SKILLS_EXTENSION_CAPABILITY, serveSkills } from "../helpers/skills-server.ts";
+import { firstStoredEvent } from "../helpers/stored-events.ts";
 import { provisionTestWorkspace, TEST_WORKSPACE_ID } from "../helpers/test-workspace.ts";
 
 /** Reverse-DNS slug, like a real fleet connector — never the skill's own name. */
@@ -157,18 +159,12 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 /** The `skills.loaded` entries persisted for a conversation's latest turn. */
-async function loadedSkills(
-  conversationId: string,
-): Promise<Array<{ id: string; loadedBy: string; reason: string; layer: number }>> {
+async function loadedSkills(conversationId: string): Promise<SkillsLoadedEntry[]> {
   const store = await runtime.resolveConversationStore(conversationId);
   const events = await store!.readEvents(conversationId);
-  const skillsLoaded = events.find((e) => e.type === "skills.loaded");
+  const skillsLoaded = firstStoredEvent(events, "skills.loaded");
   expect(skillsLoaded).toBeDefined();
-  return (
-    skillsLoaded as unknown as {
-      skills: Array<{ id: string; loadedBy: string; reason: string; layer: number }>;
-    }
-  ).skills;
+  return skillsLoaded.skills;
 }
 
 const testDir = join(tmpdir(), `nimblebrain-connector-skill-triggers-${Date.now()}`);
@@ -292,11 +288,11 @@ describe("server-published skill triggers", () => {
     expect(chat.skillName).toBe(WS_SKILL_NAME);
   });
 
-  it("composes the skill ONCE when both tool-affinity and a trigger reach it", async () => {
-    // With the server's tool active, tool-affinity selects the skill into
-    // <layer3-skill> AND the phrase matches. Synthesis stamps
-    // `toolAffinity: ["<server>__*"]` on every published skill, so this overlap
-    // is the ordinary case, not a corner. The body must not be paid for twice.
+  it("composes a bound skill ONCE, by its trigger, when the phrase matches", async () => {
+    // Synthesis stamps `toolAffinity: ["<server>__*"]` on every published
+    // skill, so a triggered skill is also bound to its server's tools. The
+    // trigger composes it; the binding waits for the tool's first call and
+    // does not deliver it a second time (ADR-0053).
     lastPrompt = undefined;
     const chat = await runtime.chat({
       identity: DEV_IDENTITY,
@@ -310,11 +306,11 @@ describe("server-published skill triggers", () => {
 
     const prompt = lastPromptText();
     expect(countOccurrences(prompt, CAPTURE_BODY_MARKER)).toBe(1);
-    // Layer 3 is the surviving channel, matching the load ledger's precedence.
-    expect(prompt).not.toContain("<skill-instructions>");
+    expect(prompt).toContain("<skill-instructions>");
+    expect(prompt).not.toContain("<layer3-skill>");
 
     const entry = loadedFor(await loadedSkills(chat.conversationId), "skill://capture/SKILL.md");
-    expect(entry?.loadedBy).toBe("tool_affinity");
+    expect(entry?.loadedBy).toBe("trigger");
   });
 });
 

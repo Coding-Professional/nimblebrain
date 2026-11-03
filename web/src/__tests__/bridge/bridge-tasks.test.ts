@@ -28,7 +28,7 @@ import type { McpAnswer, McpRequestOptions } from "../../mcp-bridge-client";
 type Params = Record<string, unknown>;
 type Behavior = (method: string, params: Params, options?: McpRequestOptions) => Promise<McpAnswer>;
 
-/** A flat task, as the 2026 leg answers one. */
+/** A flat task, as `/mcp` answers one. */
 function flatTask(fields: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     taskId: "task-1",
@@ -100,8 +100,7 @@ function makeTestIframe(): TestIframe {
   });
 
   function send(data: unknown): void {
-    const WindowMessageEvent = (window as unknown as { MessageEvent: typeof MessageEvent })
-      .MessageEvent;
+    const WindowMessageEvent = window.MessageEvent;
     const event = new WindowMessageEvent("message", { data });
     Object.defineProperty(event, "source", {
       configurable: true,

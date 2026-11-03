@@ -66,9 +66,11 @@ async function seedFile(store: FileStore, name: string, body: string, mime: stri
     mimeType: mime,
     size: saved.size,
     createdAt: new Date().toISOString(),
-    description: undefined,
+    description: null,
     tags: [],
-  } as unknown as FileEntry;
+    source: "manual",
+    conversationId: null,
+  };
   await store.appendRegistry(entry);
   return saved.id;
 }
@@ -109,9 +111,11 @@ describe("FileBackedHostResourcesResolver.read", () => {
       mimeType: "application/octet-stream",
       size: saved.size,
       createdAt: new Date().toISOString(),
-      description: undefined,
+      description: null,
       tags: [],
-    } as unknown as FileEntry);
+      source: "manual",
+      conversationId: null,
+    });
 
     const result = await makeResolver().read(`files://${saved.id}`, ctxA);
     const entry = result.contents[0];
@@ -242,20 +246,22 @@ describe("FileBackedHostResourcesResolver.list", () => {
   });
 
   // Tag-shape validation. A buggy connector sending `tags: "draft"` (string)
-  // instead of `tags: ["draft"]` (array) used to throw `TypeError: .every
-  // is not a function` and surface as a generic dispatch failure — no
-  // useful diagnostic. Now: reject with `-32602`, mirroring the
+  // instead of `tags: ["draft"]` (array) would otherwise throw `TypeError:
+  // .every is not a function` and surface as a generic dispatch failure —
+  // no useful diagnostic. So: reject with `-32602`, mirroring the
   // scheme-filter branch. Silently treating non-array as "no filter"
   // was rejected as misleading (the connector gets all files back instead
   // of a clear error).
   it("rejects non-array tags filter with -32602", async () => {
     let caught: ProtocolError | null = null;
     try {
-      // Pass a string where the type cast expects string[]. Coerced
-      // through `unknown` because the resolver's TS signature would
-      // otherwise reject this at compile time — the runtime guard is
-      // what we're exercising.
-      await makeResolver().list({ filter: { tags: "draft" as unknown as string[] } }, ctxA);
+      // The runtime guard is what this exercises, so the filter carries a
+      // value the resolver's signature rejects.
+      await makeResolver().list(
+        // biome-ignore lint/plugin/double-cast: a `tags` filter that is a string, where the type promises string[]
+        { filter: { tags: "draft" as unknown as string[] } },
+        ctxA,
+      );
     } catch (e) {
       caught = e as ProtocolError;
     }

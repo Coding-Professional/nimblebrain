@@ -22,7 +22,7 @@ import type {
   ToolDonePayload,
   ToolPromotionChangedPayload,
 } from "../engine/schemas/events.ts";
-import type { EngineEvent, EventSink } from "../engine/types.ts";
+import { CUT_OFF_FINISH_RAW, type EngineEvent, type EventSink } from "../engine/types.ts";
 import { log } from "../observability/log.ts";
 import { isSealFailureReason } from "../tools/credential-store.ts";
 import { originOf, recordLlmCall } from "../usage/record.ts";
@@ -74,11 +74,13 @@ export class MetricsEventSink implements EventSink {
 
   /** Record main-loop LLM usage and per-call latency for a completed provider call. */
   private onLlmDone(data: LlmDonePayload): void {
+    // A transcript segment of an external agent's turn is not a call; the
+    // calls it reported arrive as their own `llm.done`.
+    if (data.transcriptOnly) return;
     const { model, usage } = data;
-    // `data` carries the engine's `runId`; `recordLlmCall` reads attribution
-    // off the event and the ambient request scope rather than being told, so a
-    // new call path cannot forget to say who it was for.
-    recordLlmCall({ source: "main", model, usage, llmMs: data.llmMs, event: data });
+    // `recordLlmCall` reads attribution off the ambient request scope rather
+    // than being told, so a new call path cannot forget to say who it was for.
+    recordLlmCall({ source: "main", model, usage, llmMs: data.llmMs });
     // Both latency histograms carry `origin` because latency means different
     // things depending on who is waiting: `chat` is a person watching a spinner,
     // `task` is a task nobody is watching. Blended, a p99 says neither —
@@ -86,8 +88,11 @@ export class MetricsEventSink implements EventSink {
     // user turn.
     const origin = originOf();
     // Per-call latency for the p99 alert; the engine measures it around the
-    // provider call.
-    llmRequestDurationSeconds.observe({ source: "main", model, origin }, data.llmMs / 1000);
+    // provider call. A call a cancel cut off did not run its course, and an
+    // external agent's call is recorded with no latency (0), so neither is one.
+    if (data.finishReasonRaw !== CUT_OFF_FINISH_RAW && data.llmMs > 0) {
+      llmRequestDurationSeconds.observe({ source: "main", model, origin }, data.llmMs / 1000);
+    }
     // Time-to-first-token (connect + prefill), the prefill-vs-decode
     // discriminator. Absent when the call emitted no output part — skip rather
     // than record a misleading 0.

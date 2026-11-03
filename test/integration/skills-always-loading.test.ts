@@ -125,10 +125,10 @@ describe("created strategy-less skill is catalog-only (not auto-loaded)", () => 
   });
 });
 
-describe("dead-state visibility", () => {
-  it("flags a hand-authored strategy-less, trigger-less skill in skills__list", async () => {
-    // Written directly to disk — never through the deriving handler — so it
-    // stays dead, exactly the population the visibility signal exists for.
+describe("catalog-only visibility", () => {
+  it("reports a strategy-less, trigger-less skill as loading on request, not dead", async () => {
+    // Written directly to disk, never through the deriving handler: a dynamic
+    // skill bound to nothing, which the catalog offers the model.
     const dir = join(testDir, "users", DEV_IDENTITY.id, "skills");
     mkdirSync(dir, { recursive: true });
     writeFileSync(
@@ -142,14 +142,14 @@ metadata:
     priority: 50
 ---
 
-This skill can never load.
+This skill loads only when the model asks for it.
 `,
     );
 
     const list = await callToolAsDev("skills__list", { scope: "user" });
     expect(list.isError).toBe(false);
     expect(list.content).toContain(DEAD_SKILL_NAME);
-    expect(list.content).toContain("never loads");
+    expect(list.content).not.toContain("never loads");
   });
 });
 
@@ -158,11 +158,9 @@ This skill can never load.
  * SkillsBrowser sends `type: "context"`; the loader derives
  * `loading-strategy: always`). It rides the always-on CONTEXT channel — the
  * `contextSkills` argument to `composeSystemPrompt`, sourced from the boot
- * cache — which compose injects verbatim with NO status check; the disable
- * filter otherwise lives only on the Layer-3 path (`selectLayer3Skills`). So a
- * rule toggled Off kept being injected: present in output, absent from the
- * Layer-3 `skills.loaded` set (the "Active skills" popover). This pins that the
- * Off toggle now removes the body from the prompt entirely.
+ * cache — which compose injects verbatim with NO status check of its own; the
+ * disable filter lives in `partitionSkillsByRole`. This pins that the Off
+ * toggle removes the body from the prompt entirely.
  *
  * Toggling goes through `skills__deactivate` (not a raw file edit) because the
  * context channel reads `this.contextSkills`, refreshed by `reloadSkills()` on

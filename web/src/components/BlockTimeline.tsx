@@ -199,7 +199,7 @@ export function BlockTimeline({
         const isTailDelta = isCurrentMessage && isLast && streamingState === "streaming";
         if (item.kind === "text") {
           return (
-            // biome-ignore lint/suspicious/noArrayIndexKey: items derived from append-only blocks; identity by position is stable
+            // biome-ignore lint/suspicious/noArrayIndexKey: items fold append-only blocks, so a streamed block grows the last item or adds one and never moves an earlier one
             <div key={`text:${idx}`} className="min-h-[1em]">
               <Streamdown
                 className="streamdown-container presence-assistant-message"
@@ -213,7 +213,7 @@ export function BlockTimeline({
           );
         }
         return (
-          // biome-ignore lint/suspicious/noArrayIndexKey: same as above
+          // biome-ignore lint/suspicious/noArrayIndexKey: items fold append-only blocks, so a streamed block grows the last item or adds one and never moves an earlier one
           <div key={`activity:${idx}`} className="flex flex-col gap-3">
             <ActivityChip
               rows={item.rows}
@@ -377,7 +377,7 @@ function ActivityChip({ rows, isReasoningTailStreaming, displayDetail }: Activit
           <SingleRowBody row={smoothedRows[0]} />
         ) : (
           smoothedRows.map((row, idx) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: rows within a segment are append-only and don't reorder
+            // biome-ignore lint/suspicious/noArrayIndexKey: a segment's rows come from append-only blocks, so rows are only added at the end
             <ActivityRowView key={`row:${idx}`} row={row} />
           ))
         )
@@ -731,11 +731,10 @@ function ToolWidgets({ calls }: { calls: ReadonlyArray<ToolCallDisplay> }) {
     <>
       {widgets.map((tc) => (
         // Pass the full ui:// URI through — InlineAppView strips the scheme
-        // and forwards everything after as the resource path. The legacy
-        // regex `/^ui:\/\/[^/]+\/(.+)$/` dropped the first segment on the
-        // assumption it was a namespace prefix, which breaks two-segment
-        // URIs like `ui://<state>/<method>` where the first segment is
-        // load-bearing (Reboot's convention for state-scoped UI methods).
+        // and forwards everything after as the resource path. Never drop the
+        // first segment as a namespace prefix: in two-segment URIs like
+        // `ui://<state>/<method>` it is load-bearing (Reboot's convention
+        // for state-scoped UI methods).
         <InlineAppView
           key={tc.id}
           appName={tc.appName!}
@@ -854,7 +853,7 @@ function weaveSmoothed(
   );
 }
 
-/** Same heuristic as the old reasoning row — 4 chars/token, k-form ≥2500. */
+/** Approximate token count: 4 chars/token, k-form at ≥2500. */
 function approximateTokenLabel(charCount: number): string {
   if (charCount === 0) return "";
   const tokens = Math.round(charCount / 4);

@@ -20,8 +20,11 @@ import {
   isTaskForbiddenSkillTool,
 } from "../../../../src/platform/skills/source.ts";
 import { runWithRequestContext } from "../../../../src/runtime/request-context.ts";
+import type { Runtime } from "../../../../src/runtime/runtime.ts";
 import { McpSource } from "../../../../src/tools/mcp-source.ts";
+import { makeIdentity } from "../../../helpers/identity.ts";
 import { textOf } from "../../../helpers/resource-contents.ts";
+import { stub } from "../../../helpers/stub.ts";
 
 // ── Fake Runtime ────────────────────────────────────────────────────────
 //
@@ -68,8 +71,11 @@ afterEach(async () => {
 
 async function buildSource(): Promise<McpSource> {
   const runtime = new FakeRuntime(workDir);
-  source = createSkillsSource(runtime as unknown as never, new NoopEventSink());
+  source = createSkillsSource(stub<Runtime>(runtime), new NoopEventSink());
   await source.start();
+  // List first, as the engine does: the SDK client validates a result against
+  // its tool's output schema only once it holds the `tools/list` that declares it.
+  await source.tools();
   return source;
 }
 
@@ -88,11 +94,14 @@ async function buildSourceWithFeatures(
 ): Promise<McpSource> {
   const runtime = new FakeRuntime(workDir);
   source = createSkillsSource(
-    runtime as unknown as never,
+    stub<Runtime>(runtime),
     new NoopEventSink(),
     resolveFeatures({ skillManagement: true, ...overrides }),
   );
   await source.start();
+  // List first, as the engine does: the SDK client validates a result against
+  // its tool's output schema only once it holds the `tools/list` that declares it.
+  await source.tools();
   return source;
 }
 
@@ -137,7 +146,7 @@ describe("skills source — tools list", () => {
     const client = src.getClient()!;
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name);
-    // Phase 4+ tools — author/commit_draft/lint/attribution land later.
+    // author/commit_draft/lint/attribution are not tools of this source.
     expect(names).not.toContain("author");
     expect(names).not.toContain("commit_draft");
     expect(names).not.toContain("lint");
@@ -206,8 +215,8 @@ describe("skills source — resources", () => {
 describe("skills source — unattended-run wall", () => {
   // `set_status` is the durable write and is barred, obviously.
   //
-  // `activate`/`deactivate` are barred too, and stay barred now that they only
-  // mute for one conversation. They no longer touch a file, but "turn the
+  // `activate`/`deactivate` are barred too, though they only mute for one
+  // conversation. They do not touch a file, but "turn the
   // guidance off" is exactly the lever untrusted content would reach for, and
   // an unattended run is where nobody is watching it happen. Not writing to
   // disk makes them safer for a human's chat; it does not make them safe here.
@@ -281,7 +290,7 @@ describe("skills source — unattended-run wall", () => {
     const src = await buildSource();
     const client = src.getClient()!;
     const result = await runWithRequestContext(
-      { identity: { id: "user_test" }, unattended: true } as never,
+      { identity: makeIdentity({ id: "user_test" }), unattended: true },
       () => client.callTool({ name: "create", arguments: VALID_CREATE }),
     );
     expect(result.isError).toBe(true);
@@ -297,7 +306,7 @@ describe("skills source — unattended-run wall", () => {
     const src = await buildSource();
     const client = src.getClient()!;
     const result = await runWithRequestContext(
-      { identity: { id: "user_test" }, unattended: true } as never,
+      { identity: makeIdentity({ id: "user_test" }), unattended: true },
       () => client.callTool({ name: "list", arguments: {} }),
     );
     const text = (result.content as Array<{ type: string; text: string }>)
@@ -316,7 +325,7 @@ describe("skills source — unattended-run wall", () => {
     const src = await buildSourceWithFeatures();
     const client = src.getClient()!;
     const result = await runWithRequestContext(
-      { identity: { id: "user_test" }, unattended: true } as never,
+      { identity: makeIdentity({ id: "user_test" }), unattended: true },
       () => client.callTool({ name: "create", arguments: VALID_CREATE }),
     );
     expect(result.isError).toBe(true);

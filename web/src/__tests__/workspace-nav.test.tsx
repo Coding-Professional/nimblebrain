@@ -24,23 +24,17 @@
 //      installed list; one with a view is never counted there.
 //   9. With nothing installed, the expanded APPS section shows an "Add an app"
 //      row to the catalog, once the installed list names this workspace.
+//  10. Choosing an app's view opens it at its home, the one already on screen
+//      included: the link carries the view's own address as the app target.
 // ---------------------------------------------------------------------------
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { defineHappyDomErrorClasses } from "../../test/happy-dom";
 import { realClient } from "../../test/setup";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-// happy-dom builds its selector-parse errors from `window.SyntaxError`, which
-// its Window does not define, and Base UI's popover probes selectors on open.
-// Same shim as confirm-dialog.test.tsx.
-{
-  const win = (globalThis as unknown as { window: Record<string, unknown> }).window;
-  if (win) {
-    win.SyntaxError ??= SyntaxError;
-    win.TypeError ??= TypeError;
-  }
-}
+defineHappyDomErrorClasses();
 
 let mockedActiveId: string | null = null;
 const setActiveSpy = mock((id: string | null) => {
@@ -68,6 +62,7 @@ const { MAX_INLINE_APPS } = await import("../lib/workspace-apps");
 
 import type { InstalledConnector } from "../api/client";
 import type { WorkspaceInfo } from "../context/WorkspaceContext";
+import { appTargetFrom } from "../lib/open-app";
 import type { PlacementEntry } from "../types";
 
 interface Mounted {
@@ -78,10 +73,14 @@ interface Mounted {
 
 let mounted: Mounted | null = null;
 let navTarget = "/";
+let navState: unknown = null;
+let navKey = "";
 
 function NavigationProbe() {
   const location = useLocation();
   navTarget = location.pathname;
+  navState = location.state;
+  navKey = location.key;
   return null;
 }
 
@@ -222,6 +221,7 @@ function installedConnector(serverName: string, displayName = serverName): Insta
     scope: "workspace",
     interactive: false,
     toolCount: 1,
+    allowedTools: [],
     status: "ready",
   };
 }
@@ -272,7 +272,7 @@ function switcherInput(): HTMLInputElement {
 
 // Events built from happy-dom's own window: its dispatchEvent rejects Bun's
 // global Event classes.
-const win = (globalThis as unknown as { window: typeof globalThis }).window;
+const win = globalThis.window;
 
 async function type(input: HTMLInputElement, value: string) {
   await act(async () => {
@@ -424,6 +424,39 @@ describe("WorkspaceNav — app quick-list", () => {
     const apps = byTestId(mounted.container, "sidebar-workspace-app");
     expect(apps).toHaveLength(2);
     expect(apps.filter((a) => a.hasAttribute("aria-current"))).toHaveLength(0);
+  });
+
+  test("choosing a view opens it at its home, the view already on screen included", async () => {
+    const people = [
+      appPlacement("people", { priority: 10, label: "Contacts", route: "people" }),
+      appPlacement("people", {
+        priority: 11,
+        label: "Organizations",
+        route: "people/organizations",
+        resourceUri: "ui://people/organizations",
+      }),
+    ];
+    mounted = await mount({
+      workspaces: [HELIX],
+      activeId: "ws_003eba8844413cd9",
+      initialPath: "/w/003eba8844413cd9/app/people/organizations",
+      placements: [...people, appPlacement("todos", { priority: 20 })],
+    });
+
+    // The view on screen: same route, so only the target asks the app for its home, and
+    // a new navigation key is what makes the host deliver it again.
+    const before = navKey;
+    const current = byTestId(mounted.container, "sidebar-workspace-app-view")[1];
+    await act(async () => current?.click());
+    expect(navTarget).toBe("/w/003eba8844413cd9/app/people/organizations");
+    expect(appTargetFrom(navState)).toBe("ui://people/organizations");
+    expect(navKey).not.toBe(before);
+
+    // Another app's row opens its first view at that view's home.
+    const todos = byTestId(mounted.container, "sidebar-workspace-app")[1];
+    await act(async () => todos?.click());
+    expect(navTarget).toBe("/w/003eba8844413cd9/app/todos");
+    expect(appTargetFrom(navState)).toBe("ui://todos/main");
   });
 
   test("an app with several views is named by its connector, or its first view until that loads", async () => {

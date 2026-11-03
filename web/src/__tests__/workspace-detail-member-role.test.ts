@@ -35,6 +35,7 @@ describe("memberRoleFor", () => {
     expect(memberRoleFor(MEMBERS, undefined)).toBeUndefined();
     const withBlank = [
       ...MEMBERS,
+      // biome-ignore lint/plugin/double-cast: A record missing the `userId` its type requires, as a malformed member list carries.
       { userId: undefined as unknown as string, role: "admin" as const },
     ];
     expect(memberRoleFor(withBlank, undefined)).toBeUndefined();
@@ -55,8 +56,7 @@ describe("memberRoleFor → canManageWorkspaceMembers — the composed gate", ()
     expect(canManageWorkspaceMembers(undefined, memberRoleFor(MEMBERS, undefined))).toBe(false);
   });
 
-  test("an org admin or owner may manage members of a workspace they are not in", () => {
+  test("an org admin may manage members of a workspace they are not in", () => {
     expect(canManageWorkspaceMembers("admin", memberRoleFor(MEMBERS, "u_org_admin"))).toBe(true);
-    expect(canManageWorkspaceMembers("owner", memberRoleFor(MEMBERS, "u_org_owner"))).toBe(true);
   });
 });

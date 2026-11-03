@@ -7,7 +7,8 @@ metadata:
     loading-strategy: dynamic
     priority: 25
     tool-affinity:
-      - skills__*
+      - skills__create
+      - skills__update
     triggers:
       - "create a skill"
       - "new skill"
@@ -30,8 +31,9 @@ competes for context window space, and so does this guide.
 Skills are created and managed through the `nb__skills` tools:
 
 - `skills__create` — write a new skill at org / workspace / user scope
-- `skills__update` — patch manifest fields and/or change the body. Not `status`:
-  that is the durable off switch and it is refused here
+- `skills__update` — patch manifest fields and/or change the body. An omitted
+  field keeps its value; `null` clears one (`description` takes none). Not
+  `status`: that is the durable off switch and it is refused here
 - `skills__delete` — remove a skill (snapshots to `_versions/` first)
 - `skills__activate` / `skills__deactivate` — mute or un-mute a skill for THIS
   conversation. Nothing is written; other conversations and workspaces are
@@ -97,8 +99,9 @@ Every skill declares exactly one strategy (under `metadata.nimblebrain`):
     write the description to say **what the skill does AND when to use it**
     (fold in the words a user would actually say). Always available; needs
     no extra field.
-  - **`tool-affinity`** — auto-activates when a tool in the active set
-    glob-matches an entry. Use for skills bound to specific tools / connectors.
+  - **`tool-affinity`** — reaches the model before the first call to a tool
+    that glob-matches an entry. Use for skills bound to specific tools /
+    connectors.
   - **`triggers`** — exact-phrase substring match, for deterministic
     "must-fire" activation (e.g. a compliance skill that must load the moment
     a regulated action is named, rather than relying on the model noticing
@@ -119,7 +122,8 @@ skill is never reached for.
 
 ## `tool-affinity` patterns
 
-`tool-affinity` is a list of globs matched against the active tool set:
+`tool-affinity` is a list of globs matched against the name of each tool
+called:
 
 - `synapse-collateral__*` — any tool from one connector.
 - `synapse-collateral__*` plus `synapse-research__*` — across connectors (the

@@ -3,7 +3,7 @@ import Ajv from "ajv";
 import schema from "../../src/connectors/catalog/schemas/host-manifest.schema.json";
 import { hostMetaToUiMeta } from "../../src/connectors/runtime/defaults.ts";
 
-// Keys the schema no longer defines. A catalog that still carries them must
+// Keys the schema does not define. A catalog that still carries them must
 // load, and they must change nothing.
 const REMOVED_KEYS = {
   name: "Hello",
@@ -39,7 +39,7 @@ describe("hostMetaToUiMeta", () => {
       host_version: "1.0",
       ...REMOVED_KEYS,
       placements: [PLACEMENT],
-    } as never);
+    });
     expect(ui).toEqual({ placements: [PLACEMENT] });
   });
 
@@ -48,6 +48,7 @@ describe("hostMetaToUiMeta", () => {
   });
 
   it("returns null when the block declares no placement", () => {
+    // biome-ignore lint/plugin/never-cast: a `name` `HostManifestMeta` no longer has, which the projection must not read
     expect(hostMetaToUiMeta({ host_version: "1.0", name: "Hello" } as never)).toBeNull();
     expect(hostMetaToUiMeta({ host_version: "1.0", placements: [] })).toBeNull();
   });

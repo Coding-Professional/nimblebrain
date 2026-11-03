@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ToolPromotionControls } from "../engine/types.ts";
 import type { UserIdentity } from "../identity/provider.ts";
-import { withRootContext } from "../observability/tracing.ts";
+import { setRequestIdentitySource } from "../observability/identity.ts";
+import { type SpanAttrs, withRootContext } from "../observability/tracing.ts";
 import type { ModelSlots } from "./types.ts";
 
 /**
@@ -40,6 +41,14 @@ export interface RequestContext {
    */
   workspaceModelOverride?: Partial<ModelSlots> | null;
   /**
+   * An unattended run's tool limit (its `allowedTools` predicate), stamped by
+   * the run's tool router on each call it dispatches. Absent ⇒ no limit (a
+   * chat, `/mcp`, REST). Read by whatever reads on a call's behalf beyond the
+   * tool called, so it reads only what the run itself could: the host resolves
+   * a tool's resource arguments only when this allows `nb__read_resource`.
+   */
+  isToolAllowed?: (name: string) => boolean;
+  /**
    * Active conversation id when this context was created inside `runtime.chat()`.
    * Tools that ask "what's happening in the current conversation" (the
    * `conversations__*` tools) read this when their input omits an explicit id.
@@ -71,6 +80,15 @@ export interface RequestContext {
    */
   runId?: string;
   /**
+   * The door's run id for every run, a chat turn included: the subject a model
+   * credential minted inside the run names, so a model gateway attributes and
+   * budgets each call per run. The usage ledger records it as a call's `runId`,
+   * so ledger and gateway name the same run. Not a conversation or task
+   * correlation id (those are {@link conversationId} and {@link runId}).
+   * Undefined outside a run.
+   */
+  credentialSubject?: string;
+  /**
    * The model this turn is actually running on, already resolved and
    * provider-qualified.
    *
@@ -85,6 +103,15 @@ export interface RequestContext {
    * there is no turn to describe.
    */
   model?: string;
+  /**
+   * The agent runtime executing this turn, when its agent reports its own
+   * usage (`RuntimeCapabilities.usage`). Set only around the runtime's
+   * `execute`, so it is on the ledger lines of the usage the agent reports and
+   * not on the calls NimbleBrain makes for the run itself (the fold between
+   * turns, the title), which it measured. Undefined for a measured runtime and
+   * outside a run.
+   */
+  agentRuntime?: string;
   toolPromotion?: ToolPromotionControls;
   /**
    * True when this context belongs to an unattended run (`executeTask` — a
@@ -139,3 +166,29 @@ export function runDetached<T>(fn: () => T): T {
 export function getRequestContext(): RequestContext | undefined {
   return storage.getStore();
 }
+
+/** Whether the current call's tool limit, if it has one, allows `toolName`. */
+export function callMayUseTool(toolName: string): boolean {
+  const limit = storage.getStore()?.isToolAllowed;
+  return !limit || limit(toolName);
+}
+
+/**
+ * The identity attributes spans and log lines carry, from the verified request
+ * context: opaque ids only (user, workspace, conversation, and a task run's
+ * id), never a display name or email.
+ */
+function requestIdentityOf(ctx: RequestContext | undefined): SpanAttrs {
+  if (!ctx) return {};
+  const attrs: SpanAttrs = {};
+  if (ctx.identity?.id) attrs.user_id = ctx.identity.id;
+  if (ctx.workspaceId) attrs.workspace_id = ctx.workspaceId;
+  if (ctx.conversationId) attrs.conversation_id = ctx.conversationId;
+  // A task run is correlated by its run id, under its own attribute name. As
+  // `conversation_id` it would be a value no conversation query can join
+  // against and a label the trace cannot be trusted on.
+  if (ctx.runId) attrs.run_id = ctx.runId;
+  return attrs;
+}
+
+setRequestIdentitySource(() => requestIdentityOf(getRequestContext()));

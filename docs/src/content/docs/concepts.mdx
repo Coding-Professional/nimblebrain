@@ -74,9 +74,9 @@ Each pass through the loop is one **iteration**. Defaults:
 The engine stops for one of these reasons:
 
 - **`complete`** — the model responded without requesting any tool calls
-- **`max_iterations`** — the iteration limit was reached
-- **`max_input_tokens`** — the run has an input-token cap (a task's **Max Input Tokens**), and the next model call would pass it. Before each call the engine projects that call's input as the larger of its estimate of the prompt and the previous call's reported input, so the run ends within the cap unless the estimate undercounts. The cap counts cache reads, so it bounds tokens, not cost. Whatever the run produced before the stop is kept. `maxInputTokens` in `nimblebrain.json` is different: it bounds the context of one model call, not the run.
-- **`spend_limit`** — the run names spend accounts (a task's **Token budget** is two of them, one per cap), and what is left in one cannot pay for the next model call. Before each call the runtime projects the call's input as for `max_input_tokens`, lowers the call's output ceiling to what every account can pay for, and sets that much aside until the call returns; runs naming the same account share one balance, so they cannot together spend past it. The run stops when an account cannot cover the call's input, or would leave it only a few hundred output tokens. Whatever the run produced before the stop is kept.
+- **`max_iterations`** — the iteration limit was reached. The last allowed iteration carries a final-step reminder (no more tools, answer now), so the model can answer first. A run that answers on it ends `complete`, and a task run with more than one allowed iteration then reads **Needs review**, since it was told to stop and may have left work undone.
+- **`max_input_tokens`** — the run has an input-token cap (a task's **Max Input Tokens**), and the next model call would pass it. Before each call the engine projects that call's input as the larger of its estimate of the prompt and the previous call's reported input, so the run ends within the cap unless the estimate undercounts. When this call and one more of its size would pass the cap, the call carries the same final-step reminder as the last iteration, so the model can answer before the cap stops it, with the same result: `complete`, and **Needs review** for a task run. The cap counts cache reads, so it bounds tokens, not cost. Whatever the run produced before the stop is kept. `maxInputTokens` in `nimblebrain.json` is different: it bounds the context of one model call, not the run.
+- **`spend_limit`** — the run names spend accounts (a task's **Token budget** is two of them, one per cap), and what is left in one cannot pay for the next model call. Before each call the runtime projects the call's input as for `max_input_tokens`, lowers the call's output ceiling to what every account can pay for, and sets that much aside until the call returns; runs naming the same account share one balance, so they cannot together spend past it. The run stops when an account cannot cover the call's input, or would leave it only a few hundred output tokens. A run whose calls go through a [model gateway](/config/nimblebrain-json/#through-a-model-gateway) also stops here, at once and without retrying, when the gateway refuses a call because the run's own model budget is spent; its account is then `model-gateway:run`. Whatever the run produced before the stop is kept.
 - **`cancelled`** — the run was stopped before it finished: the user pressed Stop, a task run was cancelled or timed out, or the runtime aborted it (for example on shutdown). The conversation keeps what the turn did before the stop.
 
 All tool calls within a single iteration run in parallel via `Promise.all()`.
@@ -232,19 +232,18 @@ Tools come from two places: connectors and built-in system tools.
 
 ### System tools
 
-Every NimbleBrain instance has these `nb__*` tools available:
+Every NimbleBrain instance gives the agent these `nb__*` tools:
 
 | Tool | Description |
 |------|-------------|
 | `nb__search` | Search installed tools (`scope: "tools"`) or the connector catalog (`scope: "catalog"`) |
 | `nb__status` | Platform status; `scope: "connectors"` for per-connector health, `scope: "skills"` for loaded skills, `scope: "config"` for model and limits |
 | `nb__read_resource` | Read an MCP resource by URI |
-| `nb__open_app` | Open an app on the user's screen, optionally at a view inside it (by its resource URI) |
-| `manage_connectors` | List the connector catalog, install/disconnect remote MCP connectors per workspace or per user |
-| `manage_workspaces` | Create and manage workspaces and their members |
-| `manage_users` | Manage users (when a managed identity adapter is configured) |
+| `nb__open_app` | Open an app at its home, or what a resource URI names (a record, a file, a conversation) in whichever app shows it |
 
-App-platform capabilities are exposed through prefixed tool families: `conversations__*`, `files__*`, `tasks__*`, `skills__*`, `usage__report`, and `compose__effective_context`. (Workspace instructions are edited in the settings UI; the tool behind that UI is internal and not part of the agent's surface.)
+Administration tools are app-only: `nb__manage_connectors` (install and disconnect connectors), `nb__manage_workspaces` (create workspaces and manage their members), and `nb__manage_users` are called by the settings pages and never appear in the agent's tool list. The agent can find a connector in the catalog with `nb__search`, but installing it and creating a workspace happen in the UI.
+
+App-platform capabilities are exposed through prefixed tool families: `conversations__*`, `files__*`, `tasks__*`, `skills__*`, `usage__report`, and `compose__effective_context`.
 
 ### Tool surfacing strategy
 
@@ -278,15 +277,18 @@ The owner (`ownerId`) is the authorization principal — only they can read or r
 
 ### JSONL format
 
-Each conversation is a single `.jsonl` file:
+Each conversation is a single append-only `.jsonl` event log:
 
 ```
-{"id":"conv_abc123","createdAt":"2025-03-15T10:30:00Z"}
-{"role":"user","content":"What files are in my home directory?","ts":"..."}
-{"role":"assistant","content":"Let me check...","ts":"...","toolCalls":[...]}
+{"id":"conv_abc123","ownerId":"user_abc123","createdAt":"2025-03-15T10:30:00Z", ...}
+{"ts":"...","type":"user.message","content":[...]}
+{"ts":"...","type":"run.start","runId":"run_1","model":"anthropic:claude-sonnet-4-6"}
+{"ts":"...","type":"llm.response","runId":"run_1","content":[...],"usage":{...}}
+{"ts":"...","type":"tool.done","runId":"run_1", ...}
+{"ts":"...","type":"run.done","runId":"run_1","stopReason":"complete"}
 ```
 
-Line 1 is metadata (ID, creation timestamp). Lines 2+ are `StoredMessage` objects with role, content, timestamp, and optional tool call records.
+Line 1 is the conversation header (ID, owner, workspace, creation time). Every later line is one event. Messages, the title, and token usage are derived from the events when the conversation is read, which is what lets a run replay after a crash and lets history be compacted.
 
 ### Resuming conversations
 

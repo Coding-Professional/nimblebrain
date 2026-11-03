@@ -13,9 +13,18 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { saveComposioConnection } from "../../src/connectors/providers/composio/connection.ts";
+import type { AccountLookup } from "../../src/connectors/catalog/account-lookup.ts";
+import type { ConnectorCatalog } from "../../src/connectors/catalog/catalog.ts";
+import type { ConnectorCatalogEntry } from "../../src/connectors/catalog/types.ts";
+import {
+  readComposioConnection,
+  saveComposioConnection,
+} from "../../src/connectors/providers/composio/connection.ts";
 import { createComposioProvider } from "../../src/connectors/providers/composio/provider.ts";
+import type { ManagedConnectorRegistry } from "../../src/connectors/providers/registry.ts";
+import type { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import { slugifyServerName } from "../../src/connectors/runtime/paths.ts";
+import type { ConnectorInstance } from "../../src/connectors/runtime/types.ts";
 import { IdentityConnectorStore } from "../../src/identity/connector-store.ts";
 import type { UserIdentity } from "../../src/identity/provider.ts";
 import { PermissionStore } from "../../src/permissions/permission-store.ts";
@@ -25,12 +34,14 @@ import {
   type ManageConnectorsContext,
 } from "../../src/tools/connector-tools.ts";
 import { McpOAuthRecords } from "../../src/tools/mcp-oauth-records.ts";
+import type { ToolRegistry } from "../../src/tools/registry.ts";
 import type { ToolSource } from "../../src/tools/types.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
 import {
   installTestCredentialStore,
   resetTestCredentialStore,
 } from "../helpers/credential-store.ts";
+import { stub } from "../helpers/stub.ts";
 import { seedWorkspace } from "../helpers/test-workspace.ts";
 
 const ALICE: UserIdentity = {
@@ -69,6 +80,10 @@ async function buildHarness(opts: {
    * whose tools/list throws. Absent → no such source.
    */
   identityTools?: Record<string, string[] | "fails" | "unstarted">;
+  /** The operator's catalog entries. Absent → an empty catalog. */
+  catalog?: ConnectorCatalogEntry[];
+  /** What the lifecycle's account lookup answers for a live source; counts its calls. */
+  lookUpAccount?: (serverName: string, lookup: AccountLookup) => Promise<string | null>;
 }): Promise<Harness> {
   const workDir = mkdtempSync(join(tmpdir(), "nb-connector-grants-"));
   // `list_personal_connectors` derives `authed` from the OAuth token record,
@@ -107,42 +122,51 @@ async function buildHarness(opts: {
   }
   const composio = createComposioProvider();
 
-  const runtime = {
+  const runtime = stub<Runtime>({
     getWorkDir: () => workDir,
-    getManagedConnectorRegistry: () => ({
-      get: (id: string) => (id === "composio" ? composio : undefined),
-    }),
+    getManagedConnectorRegistry: () =>
+      stub<ManagedConnectorRegistry>({
+        get: (id: string) => (id === "composio" ? composio : undefined),
+      }),
     getPermissionStore: () => store,
     getWorkspaceStore: () => workspaceStore,
     // list_personal_connectors enriches display metadata from the catalog; an
     // empty catalog is fine here (the assertions key on serverName + grants).
-    getConnectorCatalog: () => ({ catalogEntries: async () => [] }),
+    getConnectorCatalog: () =>
+      stub<ConnectorCatalog>({ catalogEntries: async () => opts.catalog ?? [] }),
     // Same-pod connection-state probe — nothing warm in this unit context, so
     // every connector reports the resting state.
-    getLifecycle: () => ({
-      isIdentityConnectorRunning: () => opts.connectorRunning === true,
-      getInstance: (serverName: string, wsId: string) =>
-        opts.workspaceInstalls?.[serverName]?.includes(wsId) ? { serverName } : undefined,
-    }),
+    getLifecycle: () =>
+      stub<ConnectorLifecycleManager>({
+        isIdentityConnectorRunning: () => opts.connectorRunning === true,
+        lookUpAccount: async (_owner, serverName: string, lookup: AccountLookup) =>
+          (await opts.lookUpAccount?.(serverName, lookup)) ?? null,
+        getInstance: (serverName: string, wsId: string) =>
+          opts.workspaceInstalls?.[serverName]?.includes(wsId)
+            ? stub<ConnectorInstance>({ serverName })
+            : undefined,
+      }),
     // A workspace source runs only where `workspaceTools` names one; otherwise
     // tool listings take the installed-but-not-running path.
-    getRegistryForWorkspace: () => ({
-      getSource: (serverName: string) => fakeSource(serverName, opts.workspaceTools?.[serverName]),
-    }),
+    getRegistryForWorkspace: () =>
+      stub<ToolRegistry>({
+        getSource: (serverName: string) =>
+          fakeSource(serverName, opts.workspaceTools?.[serverName]),
+      }),
     getIdentityConnectorSource: async (userId: string, serverName: string) => {
       const tools = opts.identityTools?.[serverName];
       if (tools === "fails") throw new Error("not authenticated");
       if (tools === "unstarted") {
-        return {
+        return stub<ToolSource>({
           name: serverName,
           tools: async () => {
             throw new Error(`McpSource "${serverName}" not started`);
           },
-        } as unknown as ToolSource;
+        });
       }
       return userId === ALICE.id ? fakeSource(serverName, tools) : undefined;
     },
-  } as unknown as Runtime;
+  });
 
   const ctx: ManageConnectorsContext = {
     runtime,
@@ -155,15 +179,16 @@ async function buildHarness(opts: {
 /** A running source that lists `tools` under the registry's `<server>__` prefix. */
 function fakeSource(serverName: string, tools: string[] | undefined): ToolSource | undefined {
   if (!tools) return undefined;
-  return {
+  return stub<ToolSource>({
     name: serverName,
     tools: async () =>
       tools.map((t) => ({
         name: `${serverName}__${t}`,
         description: t,
         inputSchema: { type: "object" },
+        source: `mcp:${serverName}`,
       })),
-  } as unknown as ToolSource;
+  });
 }
 
 function sc(result: { structuredContent?: unknown }): {
@@ -176,7 +201,7 @@ function sc(result: { structuredContent?: unknown }): {
     identity?: Record<string, unknown>;
   }>;
 } {
-  return (result.structuredContent ?? {}) as never;
+  return result.structuredContent ?? {};
 }
 
 describe("manage_connectors — personal-connector grants", () => {
@@ -321,6 +346,159 @@ describe("manage_connectors — personal-connector grants", () => {
     expect(gmail?.identity).toEqual({ name: "alice@mail.example" });
     expect(slack?.state).toBe("running");
     expect(slack?.identity).toBeUndefined();
+  });
+
+  describe("a connection whose sign-in named no account is asked through its catalog entry", () => {
+    const owner = { type: "user", userId: ALICE.id } as const;
+    const CLOSE = "com-example-close";
+    const ZOOM_ID = "us.example/zoom";
+    const lookup = { tool: "org_info", arguments: {}, field: "user.email" };
+    const catalog: ConnectorCatalogEntry[] = [
+      {
+        id: "com.example/close",
+        name: "Close",
+        description: "CRM",
+        url: `https://mcp.example.com/${CLOSE}`,
+        auth: "dcr",
+        account: lookup,
+      },
+      {
+        id: ZOOM_ID,
+        name: "Zoom",
+        description: "Meetings",
+        url: "https://broker.example/mcp",
+        auth: "composio",
+        account: { tool: "ZOOM_GET_USER", arguments: { userId: "me" }, field: "data.email" },
+      },
+    ];
+    const connection = {
+      connectedAccountId: "ca_1",
+      toolkit: "zoom",
+      userId: "user:usr_alice",
+      connectedAt: "2026-01-01T00:00:00.000Z",
+      status: "ACTIVE",
+    };
+    const tokens = { access_token: "at", token_type: "Bearer" };
+    const listed = async (serverName: string) =>
+      (sc(await h.tool.handler({ action: "list_personal_connectors" })).connectors ?? []).find(
+        (c) => c.serverName === serverName,
+      );
+
+    test("an OAuth connector is asked once, and the answer is kept with its records", async () => {
+      const asked: string[] = [];
+      h = await buildHarness({
+        personalConnectors: [CLOSE],
+        catalog,
+        lookUpAccount: async (serverName, l) => {
+          asked.push(`${serverName}:${l.tool}:${l.field}`);
+          return "alice@close.example";
+        },
+      });
+      await new McpOAuthRecords({ owner, serverName: CLOSE }).write("tokens", tokens);
+
+      expect((await listed(CLOSE))?.identity).toEqual({ name: "alice@close.example" });
+      // The second listing reads what the first one stored.
+      expect((await listed(CLOSE))?.identity).toEqual({ name: "alice@close.example" });
+      expect(asked).toEqual([`${CLOSE}:org_info:user.email`]);
+    });
+
+    test("a brokered connector is asked once, and the answer is kept on its connection", async () => {
+      let asks = 0;
+      h = await buildHarness({
+        composioConnectors: [ZOOM_ID],
+        catalog,
+        lookUpAccount: async () => {
+          asks++;
+          return "alice@zoom.example";
+        },
+      });
+      await saveComposioConnection(h.workDir, owner, ZOOM_ID, connection);
+      const serverName = slugifyServerName(ZOOM_ID);
+
+      expect((await listed(serverName))?.identity).toEqual({ name: "alice@zoom.example" });
+      expect((await listed(serverName))?.identity).toEqual({ name: "alice@zoom.example" });
+      expect(asks).toBe(1);
+      expect((await readComposioConnection(h.workDir, owner, ZOOM_ID))?.displayName).toBe(
+        "alice@zoom.example",
+      );
+    });
+
+    test("a brokered connector is asked only once its connection exists, warm source or not", async () => {
+      let asks = 0;
+      h = await buildHarness({
+        composioConnectors: [ZOOM_ID],
+        catalog,
+        connectorRunning: true,
+        lookUpAccount: async () => {
+          asks++;
+          return "alice@zoom.example";
+        },
+      });
+      const serverName = slugifyServerName(ZOOM_ID);
+
+      // Installed and warm (a tools listing started it), but not signed in:
+      // there is no account to ask about, and nothing to remember a failure of.
+      expect((await listed(serverName))?.identity).toBeUndefined();
+      expect(asks).toBe(0);
+
+      await saveComposioConnection(h.workDir, owner, ZOOM_ID, connection);
+      expect((await listed(serverName))?.identity).toEqual({ name: "alice@zoom.example" });
+      expect(asks).toBe(1);
+    });
+
+    test("an account the sign-in recorded is not asked for again", async () => {
+      let asks = 0;
+      h = await buildHarness({
+        personalConnectors: [CLOSE],
+        catalog,
+        lookUpAccount: async () => {
+          asks++;
+          return "someone-else@close.example";
+        },
+      });
+      const records = new McpOAuthRecords({ owner, serverName: CLOSE });
+      await records.write("tokens", tokens);
+      await records.write("identity", { email: "alice@vendor.example" });
+
+      expect((await listed(CLOSE))?.identity).toEqual({ email: "alice@vendor.example" });
+      expect(asks).toBe(0);
+    });
+
+    test("nothing is asked of a connector that is not the catalog entry's server, or not signed in", async () => {
+      let asks = 0;
+      const lookUpAccount = async () => {
+        asks++;
+        return "alice@close.example";
+      };
+      // Same name as the entry, another URL: the entry's lookup is not its to use.
+      h = await buildHarness({
+        personalConnectors: [CLOSE],
+        catalog: [{ ...catalog[0], url: "https://mcp.example.com/elsewhere" }],
+        lookUpAccount,
+      });
+      await new McpOAuthRecords({ owner, serverName: CLOSE }).write("tokens", tokens);
+      expect((await listed(CLOSE))?.identity).toBeUndefined();
+      rmSync(h.workDir, { recursive: true, force: true });
+      resetTestCredentialStore();
+
+      // The entry's server, with no tokens: there is no connection to ask.
+      h = await buildHarness({ personalConnectors: [CLOSE], catalog, lookUpAccount });
+      expect((await listed(CLOSE))?.identity).toBeUndefined();
+      expect(asks).toBe(0);
+    });
+
+    test("an answer that names no account leaves the row unlabelled and stores nothing", async () => {
+      h = await buildHarness({
+        personalConnectors: [CLOSE],
+        catalog,
+        lookUpAccount: async () => null,
+      });
+      const records = new McpOAuthRecords({ owner, serverName: CLOSE });
+      await records.write("tokens", tokens);
+
+      expect((await listed(CLOSE))?.identity).toBeUndefined();
+      expect(await records.has("identity")).toBe(false);
+    });
   });
 
   test("all grant actions require authentication", async () => {

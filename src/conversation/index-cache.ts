@@ -1,7 +1,6 @@
 import { readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { log } from "../observability/log.ts";
 import { estimateCost } from "../usage/cost.ts";
 import type { TokenUsage } from "../usage/types.ts";
 import { previewTextOf } from "./preview.ts";
@@ -28,8 +27,8 @@ interface ConversationMetadata {
  */
 /**
  * Access-control metadata stored alongside each summary in the index.
- * Stage 1: single-owner only — `ownerId` is the entire authorization
- * surface. Stage 4 reintroduces sharing via explicit policy.
+ * Conversations are single-owner: `ownerId` is the entire authorization
+ * surface.
  */
 interface IndexedAccessMeta {
   ownerId?: string;
@@ -55,12 +54,6 @@ export class ConversationIndex {
       return;
     }
 
-    // Count ownerless files separately from generic "couldn't parse"
-    // failures. Ownerless files are pre-invariant state needing manual
-    // triage (no migration stamps an owner); surface a single line so
-    // they aren't a silent oracle ("the dashboard is missing N
-    // conversations and no one sees why").
-    let ownerlessSkipped = 0;
     for (const file of files) {
       try {
         const content = await readFile(join(dir, file), "utf-8");
@@ -68,18 +61,10 @@ export class ConversationIndex {
         if (parsed) {
           this.entries.set(parsed.summary.id, parsed.summary);
           this.accessMeta.set(parsed.summary.id, parsed.access);
-        } else if (isLikelyOwnerlessFile(content)) {
-          ownerlessSkipped++;
         }
       } catch {
         // Skip corrupt or unreadable files
       }
-    }
-
-    if (ownerlessSkipped > 0) {
-      log.warn(
-        `[index] excluded ${ownerlessSkipped} ownerless conversation file(s) in ${dir} — these predate the ownership invariant and need manual triage (stamp an ownerId on line 1, or remove); no migration stamps them.`,
-      );
     }
 
     this.populated = true;
@@ -134,14 +119,13 @@ export class ConversationIndex {
 
     // Cursor pagination: skip entries up to and including the cursor ID.
     //
-    // Edge case (future hardening, not Stage 1): if the cursor names a
-    // conversation that no longer satisfies the current `access`
-    // filter — owner changed (Stage 4 sharing), or the conversation
-    // was deleted between calls — `findIndex` returns -1 and the
-    // slice is a no-op, so the caller re-sees page 1 instead of
-    // getting an empty / shifted page. Stage 1 single-owner doesn't
-    // hit this (ownership can't change), but the cursor model should
-    // be revisited when sharing returns. Options: opaque
+    // Edge case: if the cursor names a conversation that no longer
+    // satisfies the current `access` filter — the conversation was
+    // deleted between calls — `findIndex` returns -1 and the slice is a
+    // no-op, so the caller re-sees page 1 instead of getting an empty /
+    // shifted page. Ownership cannot change, so the filter itself never
+    // drops the cursor's entry; a model where access can change needs a
+    // cursor that does not depend on the filtered result. Options: opaque
     // ({createdAt}, last-id) cursors that don't depend on the filtered
     // result, or return an explicit `cursor_invalid` signal.
     if (options?.cursor) {
@@ -161,14 +145,13 @@ export class ConversationIndex {
 /**
  * Check if a user can access a conversation.
  *
- * Stage 1: single-owner. A conversation is accessible iff the caller
- * is its owner. Workspace-admin overrides and shared-with-participants
- * semantics are gone — Stage 4 reintroduces them with explicit policy
- * gates and audit trails.
+ * Conversations are single-owner. A conversation is accessible iff the
+ * caller is its owner; there is no workspace-admin override and no
+ * sharing with participants.
  *
  * A `meta` of `undefined` or one without `ownerId` is treated as
- * inaccessible — Stage 1 enforces "every conversation has an owner"
- * at write time, so unset means the index hasn't caught up.
+ * inaccessible — every conversation is given an owner at write time,
+ * so unset means the index hasn't caught up.
  */
 export function canAccess(
   meta: IndexedAccessMeta | undefined,
@@ -176,28 +159,6 @@ export function canAccess(
 ): boolean {
   if (!meta?.ownerId) return false;
   return meta.ownerId === access.userId;
-}
-
-/**
- * Heuristic check: did parseFileHeader bail because the file is
- * structurally OK but lacks `ownerId`? Used by `populate` to count
- * ownerless skips so operators see a "you have N pre-migration files"
- * line — vs corrupt files which silently fail.
- *
- * Doesn't re-derive everything: just peeks at line 1, parses it, and
- * checks whether `id` is present and `ownerId` is absent. Worst case
- * if we're wrong (file IS corrupt with a plausible-looking line 1)
- * the count is off by one; the operator action is the same either way.
- */
-function isLikelyOwnerlessFile(content: string): boolean {
-  const firstLine = content.split("\n", 1)[0];
-  if (!firstLine) return false;
-  try {
-    const meta = JSON.parse(firstLine) as Partial<ConversationMetadata>;
-    return typeof meta.id === "string" && !meta.ownerId;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -219,9 +180,13 @@ interface EventLine {
   type?: string;
   ts?: string;
   content?: unknown;
-  usage?: TokenUsage;
-  model?: string;
   title?: string | null;
+}
+
+/** The fields an `llm.response` line always carries (see `LlmResponseEvent`). */
+interface LlmResponseLine {
+  usage: TokenUsage;
+  model: string;
 }
 
 /** Zero-valued metrics accumulator. */
@@ -264,10 +229,11 @@ function applyEventLine(metrics: DerivedMetrics, line: string): void {
     }
   } else if (event.type === "run.done") {
     metrics.messageCount++;
-  } else if (event.type === "llm.response" && event.usage && event.model) {
-    metrics.inputTokens += event.usage.inputTokens;
-    metrics.outputTokens += event.usage.outputTokens;
-    metrics.costUsd += estimateCost(event.model, event.usage);
+  } else if (event.type === "llm.response") {
+    const { usage, model } = event as EventLine & LlmResponseLine;
+    metrics.inputTokens += usage.inputTokens;
+    metrics.outputTokens += usage.outputTokens;
+    metrics.costUsd += estimateCost(model, usage);
   } else if (event.type === "metadata.title") {
     metrics.title = event.title;
   }
@@ -289,15 +255,9 @@ export function parseFileHeader(
   // Totals are always derived from events; line-1 totals are never read.
   const metrics = scanLines(lines);
 
-  // Stage 1 invariant: every conversation has an ownerId. A file
-  // without one is pre-migration data — load() already throws when
-  // it encounters such a file directly, and the index honors the same
-  // invariant by EXCLUDING ownerless entries entirely. Including them
-  // with an absent / empty ownerId would be a category error: the
-  // application's view of "conversations that exist" would include
-  // entries that load() can't actually return. Operators see
-  // ownerless files via filesystem inspection or the migration
-  // script's report, not via the index.
+  // Invariant: every conversation has an ownerId. load() throws on a file
+  // without one, and the index honors the same invariant by excluding it, so
+  // the index never lists a conversation load() can't return.
   if (!meta.ownerId) return null;
 
   return {
@@ -305,7 +265,7 @@ export function parseFileHeader(
       id: meta.id,
       createdAt: meta.createdAt,
       updatedAt: metrics.lastEventTs ?? meta.updatedAt ?? meta.createdAt,
-      title: metrics.title ?? meta.title ?? null,
+      title: metrics.title ?? null,
       messageCount: metrics.messageCount,
       preview: metrics.preview,
       totalInputTokens: metrics.inputTokens,

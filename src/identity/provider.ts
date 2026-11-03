@@ -53,7 +53,15 @@ export interface ProviderCapabilities {
   managedUsers: boolean;
   /** Provider is also an OAuth authorization server external clients can discover. */
   authorizationServer: boolean;
+  /**
+   * User fields the provider owns and `manage_users` must not change, because
+   * the provider signs the user in by them. Absent means none.
+   */
+  providerOwnedUserFields?: readonly UserEditField[];
 }
+
+/** The fields of an existing user that `manage_users` can change. */
+export type UserEditField = "email" | "displayName" | "orgRole";
 
 // ── Authorization server ───────────────────────────────────────────
 
@@ -201,6 +209,16 @@ export interface IdentityProvider {
    */
   refreshToken?(refreshToken: string): Promise<TokenResult>;
 
+  /**
+   * End the provider's own session behind the request's credential, so the
+   * next sign-in asks for credentials instead of resuming it. Clearing this
+   * instance's cookies ends only the local session. Called on sign-out, often
+   * with an access token that has expired. A provider that keeps no session of
+   * its own omits it. Throws on failure; the caller signs the browser out
+   * either way.
+   */
+  endSession?(req: Request): Promise<void>;
+
   // ── User management ──────────────────────────────────────────────
 
   /** List all users known to this provider. */
@@ -209,7 +227,12 @@ export interface IdentityProvider {
   /** Create a new user. */
   createUser(data: CreateUserInput): Promise<CreateUserResult>;
 
-  /** Update a user by ID. Returns the updated user, or null if not found. */
+  /**
+   * Update a user by ID, writing the provider's own directory as well as the
+   * local profile. Returns the updated user, or null if not found. A provider
+   * whose directory is the local `UserStore` omits it, and the caller writes
+   * the store directly.
+   */
   updateUser?(userId: string, data: UpdateUserInput): Promise<User | null>;
 
   /** Delete a user by ID. Returns true if deleted, false if not found. */

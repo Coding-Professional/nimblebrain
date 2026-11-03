@@ -12,6 +12,8 @@ import { mcpRoutes } from "../../../src/api/routes/mcp.ts";
 import type { AppContext } from "../../../src/api/types.ts";
 import { resolveFeatures } from "../../../src/config/features.ts";
 import { TransientAuthError } from "../../../src/identity/provider.ts";
+import type { Runtime } from "../../../src/runtime/runtime.ts";
+import { stub } from "../../helpers/stub.ts";
 
 // ── Test helpers ──────────────────────────────────────────────────
 
@@ -38,23 +40,23 @@ function makeCtx(opts: { issuer?: string; verify?: () => Promise<null> } = {}): 
     authorizationServer: () => authServer,
   };
 
-  return {
+  return stub<AppContext>({
     provider,
     authOptions: {
       provider,
       eventSink: { emit: () => {} },
     },
-    runtime: {
+    runtime: stub<Runtime>({
       getFeatures: () => resolveFeatures(),
-    },
+    }),
     workspaceStore: null,
-  } as unknown as AppContext;
+  });
 }
 
 function createApp(opts: { issuer?: string; verify?: () => Promise<null> } = {}) {
   const ctx = makeCtx(opts);
   const app = new Hono();
-  app.route("/", mcpRoutes(ctx));
+  app.route("/", mcpRoutes(ctx, null));
   return app;
 }
 

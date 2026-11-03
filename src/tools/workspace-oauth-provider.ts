@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
 import type {
-  AuthorizationServerMetadata,
   OAuthClientInformationContext,
   OAuthClientInformationFull,
   OAuthClientInformationMixed,
@@ -8,19 +7,17 @@ import type {
   OAuthClientProvider,
   OAuthTokens,
 } from "@modelcontextprotocol/client";
-import {
-  type FetchLike,
-  selectClientAuthMethod,
-  UnauthorizedError,
-} from "@modelcontextprotocol/client";
+import { type FetchLike, UnauthorizedError } from "@modelcontextprotocol/client";
+import { DEFAULT_OAUTH_CLIENT_IDENTITY, type OAuthClientIdentity } from "../brand/index.ts";
 import { validateConnectorUrl } from "../connectors/runtime/url-validator.ts";
 import type { ConnectorOwner } from "../identity/connector-owner.ts";
-import { buildTenantAssertion } from "../oauth/fleet-assertion.ts";
 import { log } from "../observability/log.ts";
 import { validateAdditionalAuthorizationParams } from "../util/oauth-params.ts";
 import type { WorkspaceContext } from "../workspace/context.ts";
 import { McpOAuthRecords } from "./mcp-oauth-records.ts";
 import {
+  type AuthorizationResponse,
+  abandonFlow as abandonInteractiveFlow,
   DEFAULT_FLOW_TTL_MS,
   type FlowOwner,
   register as registerInteractiveFlow,
@@ -34,8 +31,14 @@ import {
   type IdentityMetadata,
   identityScopesToAdd,
   namesAccount,
-  pickIdentityClaims,
+  parseIdTokenClaims,
 } from "./oauth-identity.ts";
+import {
+  refreshTokenHash,
+  refreshTokenRefusal,
+  refreshTokenTag,
+  spentRefreshTokenHash,
+} from "./oauth-refresh-fetch.ts";
 import { createSsrfGuardedFetch } from "./ssrf-guarded-fetch.ts";
 
 /**
@@ -91,7 +94,7 @@ export interface WorkspaceOAuthProviderOptions {
   owner: OAuthOwnerContext;
   /**
    * Human-readable label for the owner, used verbatim in the OAuth
-   * `client_name` the vendor renders on its consent screen ("NimbleBrain
+   * `client_name` the vendor renders on its consent screen ("<brand name>
    * (<ownerDisplayName>) would like access…"). When omitted, the provider
    * falls back to the raw owner id (`owner.wsId` / `user:<userId>`), which
    * is an opaque token the end user can't read and a tenant identifier we'd
@@ -101,9 +104,18 @@ export interface WorkspaceOAuthProviderOptions {
    * regardless — so a missing name degrades gracefully to the id.
    */
   ownerDisplayName?: string;
+  /**
+   * The platform's name, homepage and logo, sent in dynamic client
+   * registration as `client_name` / `client_uri` / `logo_uri` so a vendor
+   * that honors RFC 7591 shows them on its consent screen. Callers pass the
+   * deployment's brand (`oauthClientIdentity()`); omitted, it is NimbleBrain's.
+   * A vendor keeps what it was sent at first registration, so a change reaches
+   * an existing connection only when it registers again.
+   */
+  clientIdentity?: OAuthClientIdentity;
   serverName: string;
   /**
-   * Workspace-bound context, optional. It no longer decides where anything
+   * Workspace-bound context, optional. It does not decide where anything
    * lands — the credential store resolves the owner's scope itself — but when
    * present the provider asserts `workspaceContext.workspaceId ===
    * owner.wsId`, so a caller cannot pair a context bound to ws_A with
@@ -219,17 +231,6 @@ export interface WorkspaceOAuthProviderOptions {
    * the connector is known-headless.
    */
   headlessAuthProbe?: boolean;
-  /**
-   * Issuer URL of the MCP fleet authorizer, e.g.
-   * `https://fleet-authorizer.internal`. When set, the provider attaches a
-   * signed tenant assertion to the `/token` request — but ONLY when
-   * the token endpoint belongs to this issuer. It is NEVER attached to a vendor
-   * authorization server (Granola, Google, …): a tenant key signature must not
-   * leak to a third party. Leave unset for every provider except the one
-   * driving the fleet-token flow; the assertion also no-ops when the tenant key
-   * (`NB_MCP_AUTHORIZER_TENANT_KEY`) isn't provisioned (rollout phase 1).
-   */
-  fleetAuthorizerIssuer?: string;
 }
 
 /**
@@ -266,62 +267,6 @@ function applyConfiguredScopes(url: URL, scopes: string[] | undefined): void {
   const joinable = !prompt.includes("consent") && !prompt.includes("none");
   if (scopes.includes("offline_access") && joinable) {
     url.searchParams.set("prompt", [...prompt, "consent"].join(" "));
-  }
-}
-
-/** Lowercased origin of a URL string, or undefined if it doesn't parse. */
-function originOf(value: string | URL): string | undefined {
-  try {
-    return new URL(value).origin.toLowerCase();
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Apply OAuth 2.1 client authentication to a token request. This mirrors the
- * MCP SDK's internal `applyClientAuthentication` (in
- * `@modelcontextprotocol/client`), which the SDK runs by default
- * but which is NOT exported. We reproduce it because defining
- * `addClientAuthentication` on the provider REPLACES the SDK's default for
- * every token endpoint — so the provider must re-apply client auth itself.
- * The method-selection half (`selectClientAuthMethod`) IS exported and is
- * reused. Kept faithful to RFC 6749 §2.3.1; pinned against the SDK by
- * fleet-assertion.test.ts ("fleet hook — SDK client-auth parity"), which
- * exercises all three auth methods. If the SDK changes its apply logic, update
- * this mirror and those tests together.
- */
-function applyClientAuthentication(
-  method: ReturnType<typeof selectClientAuthMethod>,
-  clientInformation: OAuthClientInformationMixed,
-  headers: Headers,
-  params: URLSearchParams,
-): void {
-  const { client_id, client_secret } = clientInformation;
-  switch (method) {
-    case "client_secret_basic":
-      if (!client_secret) {
-        throw new Error("client_secret_basic authentication requires a client_secret");
-      }
-      headers.set("Authorization", `Basic ${btoa(`${client_id}:${client_secret}`)}`);
-      return;
-    case "client_secret_post":
-      params.set("client_id", client_id);
-      if (client_secret) params.set("client_secret", client_secret);
-      return;
-    case "none":
-      params.set("client_id", client_id);
-      return;
-    default: {
-      // Compile-time drift canary. `method` is the SDK's exported
-      // `ClientAuthMethod` union; once the three cases above are handled it
-      // narrows to `never` here. If a future SDK bump adds an auth method, this
-      // assignment stops compiling and the typecheck job fails — forcing this
-      // mirror to be updated alongside the SDK, rather than silently throwing at
-      // runtime in a fleet deployment.
-      const unsupported: never = method;
-      throw new Error(`Unsupported client authentication method: ${String(unsupported)}`);
-    }
   }
 }
 
@@ -438,62 +383,6 @@ async function postRevoke(
 }
 
 /**
- * Parse an OIDC id_token's payload claims. Returns the relevant subset
- * (`sub`, `email`, `name`) or `null` if the token doesn't look like a
- * JWT or the payload isn't valid JSON.
- *
- * Deliberately does NOT verify the signature. Two reasons:
- *
- *   1. The token came directly from the AS over TLS (the SDK fetches
- *      the token endpoint), which is the trust anchor we already rely
- *      on for the access_token itself.
- *   2. We treat the parsed claims as informational only — they're shown
- *      in the Connections page UI, never used for access decisions.
- *
- * Catching `email_verified=false` is also out of scope: the upstream AS
- * controls verification and we surface what they tell us.
- */
-/**
- * Hard ceiling on id_token byte length we'll attempt to parse. JWT payloads
- * in practice run well under 4KB; 16KB leaves headroom for AS-specific
- * extensions while bounding the cost of malicious or malformed tokens. A
- * 1MB id_token would cost real CPU through atob + JSON.parse otherwise.
- */
-const ID_TOKEN_MAX_LENGTH = 16 * 1024;
-
-function parseIdTokenClaims(idToken: string): IdentityClaims | null {
-  if (idToken.length > ID_TOKEN_MAX_LENGTH) return null;
-  // JWT shape: header.payload.signature — three base64url segments
-  // separated by dots. We only need the payload (segment index 1).
-  const parts = idToken.split(".");
-  if (parts.length !== 3) return null;
-  const payloadB64 = parts[1];
-  if (!payloadB64) return null;
-  // base64url → base64 (replace url-safe chars + pad)
-  const padded = payloadB64.replace(/-/g, "+").replace(/_/g, "/");
-  const padding = padded.length % 4 === 0 ? "" : "=".repeat(4 - (padded.length % 4));
-  let payloadJson: string;
-  try {
-    // atob returns a binary string treating bytes as Latin-1; that mangles
-    // multibyte UTF-8 names (e.g. "山田太郎"). Decode through Uint8Array +
-    // TextDecoder so the JSON parses as the bytes the AS actually sent.
-    const binary = atob(padded + padding);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    payloadJson = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-  } catch {
-    return null;
-  }
-  let claims: Record<string, unknown>;
-  try {
-    claims = JSON.parse(payloadJson) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  return pickIdentityClaims(claims);
-}
-
-/**
  * Validate a member id before it composes into a filesystem path. Same
  * shape as the credential-store key validator (alphanumerics + `._-`,
  * length-bounded, no `..` / `.`). Reuses the same allowed-character set
@@ -533,21 +422,8 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-/**
- * Brand metadata sent in the DCR registration so vendors that honor RFC 7591
- * `client_uri` / `logo_uri` render NimbleBrain's homepage link and logo on
- * their consent screen instead of a bare name. Hardcoded to match the
- * likewise-hardcoded "NimbleBrain" in `client_name`; a future white-label
- * effort would make all three configurable together. The logo is the
- * NimbleBrain brand mark from the platform's public asset CDN
- * (`static.nimblebrain.ai`), built by the logos pipeline into the canonical
- * per-brand path. We point at the 128px raster rather than the SVG variant
- * because several OAuth/identity providers refuse to render an SVG `logo_uri`
- * (scriptable-image hardening); the mark is transparent and reads on both
- * light and dark consent screens.
- */
-const NIMBLEBRAIN_CLIENT_URI = "https://nimblebrain.ai";
-const NIMBLEBRAIN_LOGO_URI = "https://static.nimblebrain.ai/logos/nimblebrain/light-128.png";
+/** How many recently served refresh tokens a provider remembers (see `servedRefreshTokens`). */
+const SERVED_REFRESH_TOKENS_KEPT = 8;
 
 /**
  * OAuthClientProvider scoped to an `(owner, serverName)` pair. It owns the
@@ -588,6 +464,7 @@ const NIMBLEBRAIN_LOGO_URI = "https://static.nimblebrain.ai/logos/nimblebrain/li
 export class WorkspaceOAuthProvider implements OAuthClientProvider {
   private readonly owner: OAuthOwnerContext;
   private readonly ownerDisplayName?: string;
+  private readonly clientIdentity: OAuthClientIdentity;
   private readonly serverName: string;
   /**
    * This connection's four records, at the owner's credential scope. Each
@@ -664,18 +541,23 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
   private readonly additionalAuthorizationParams?: Record<string, string>;
   private readonly abortSignal?: AbortSignal;
   private readonly headlessAuthProbe: boolean;
-  /** Canonical origin of the fleet authorizer issuer, or undefined (off). */
-  private readonly fleetAuthorizerOrigin?: string;
-  /**
-   * SDK token-auth hook. Left `undefined` unless the fleet feature is
-   * configured (see constructor) — when unset, the SDK runs its own default
-   * client authentication and NO fleet code touches the token path. Assigned
-   * to {@link fleetTokenAuth} only when `fleetAuthorizerOrigin` is pinned.
-   */
-  addClientAuthentication?: NonNullable<OAuthClientProvider["addClientAuthentication"]>;
   /** Cached DCR result + tokens to avoid redundant store reads within a flow. */
   private cachedClientInfo: OAuthClientInformationFull | null = null;
   private cachedTokens: OAuthTokens | null = null;
+  /**
+   * The tail of this provider's token saves. Saves run one at a time, so a
+   * save's stale check never reads the store before a sibling's write lands:
+   * a sibling sets `cachedTokens` before its write, and a caller that refreshed
+   * from that cache would otherwise see the older stored token, drop the newer
+   * result as stale, and let the sibling's older write win.
+   */
+  private savingTokens: Promise<void> = Promise.resolve();
+  /**
+   * The refresh tokens recent `tokens()` calls handed the SDK, most recent last.
+   * An `invalid_grant` the SDK answers by invalidating was for one of these; the
+   * refresh fetch records which (`refreshTokenRefusal`).
+   */
+  private readonly servedRefreshTokens = new Set<string>();
   /**
    * In-flight DCR coalesce. Set in `clientInformation()` just before it
    * returns `undefined` (which tells the SDK to do DCR). Resolved by the
@@ -717,12 +599,14 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
    * it atomic — no lock primitives needed.
    */
   private pendingFlow: {
-    promise: Promise<string>;
-    deferred?: Deferred<string>;
+    promise: Promise<AuthorizationResponse>;
+    deferred?: Deferred<AuthorizationResponse>;
     /** First saveCodeVerifier wins; subsequent concurrent calls no-op. */
     verifier?: string;
     /** First redirectToAuthorization wins; subsequent calls throw without re-capturing. */
     urlCaptured?: boolean;
+    /** The state the interactive branch registered with `oauth-flow-registry`. */
+    registeredState?: string;
   } | null = null;
   /**
    * The latest state value generated by `state()`. Captured so the
@@ -735,6 +619,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
   constructor(opts: WorkspaceOAuthProviderOptions) {
     this.owner = opts.owner;
     this.ownerDisplayName = opts.ownerDisplayName;
+    this.clientIdentity = opts.clientIdentity ?? DEFAULT_OAUTH_CLIENT_IDENTITY;
     this.serverName = opts.serverName;
     this.callbackUrl = opts.callbackUrl;
     this.canonicalCallback = canonicalEndpoint(new URL(opts.callbackUrl));
@@ -749,26 +634,6 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     this.additionalAuthorizationParams = opts.additionalAuthorizationParams;
     this.abortSignal = opts.abortSignal;
     this.headlessAuthProbe = opts.headlessAuthProbe === true;
-    // Pin the fleet authorizer's origin once, at construction — the token-auth
-    // hook compares against this and never against caller-supplied values, so a
-    // vendor token endpoint can't trick the provider into attaching the assertion.
-    this.fleetAuthorizerOrigin = opts.fleetAuthorizerIssuer
-      ? originOf(opts.fleetAuthorizerIssuer)
-      : undefined;
-    if (opts.fleetAuthorizerIssuer && !this.fleetAuthorizerOrigin) {
-      // Configured but unparseable: the feature disables itself (fails closed).
-      // Warn so a misconfigured NB_FLEET_AUTHORIZER_ISSUER is visible, not silent.
-      log.warn(
-        `[oauth] fleetAuthorizerIssuer is set but not a valid URL (${opts.fleetAuthorizerIssuer}) — fleet tenant assertion disabled`,
-      );
-    }
-    // Install the token-auth hook ONLY when the fleet feature is active. The SDK
-    // uses this hook IN PLACE OF its default client auth, so leaving it undefined
-    // for non-fleet (every local / self-host) deployments keeps them on the SDK's
-    // own tested path — no fleet code in the token exchange at all.
-    if (this.fleetAuthorizerOrigin) {
-      this.addClientAuthentication = this.fleetTokenAuth;
-    }
 
     // Owner id and server name both compose into a credential-store key.
     // Callers pre-validate (`validateServerName` /
@@ -776,7 +641,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     // verify in depth, at the boundary.
     assertSafeOwnerId(opts.serverName);
     assertSafeOwnerId(opts.owner.type === "workspace" ? opts.owner.wsId : opts.owner.userId);
-    // A `workspaceContext` no longer decides where anything lands — the store
+    // A `workspaceContext` does not decide where anything lands — the store
     // resolves the owner's scope on its own — but pairing one with a
     // user-scoped owner is still a category error worth refusing, and a
     // context bound to ws_A alongside `owner: {wsId: ws_B}` is a caller bug
@@ -825,20 +690,31 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     return this.cachedClientInfo?.redirect_uris?.[0] ?? this.callbackUrl;
   }
 
+  /**
+   * How this client authenticates at the token endpoint: the static client's
+   * configured method, else `client_secret_post` when it has a secret, else
+   * `none` (public PKCE client, and every DCR registration). One source for
+   * both `clientMetadata` and the static `clientInformation()`.
+   */
+  private get tokenEndpointAuthMethod(): "none" | "client_secret_post" | "client_secret_basic" {
+    return (
+      this.staticClient?.tokenEndpointAuthMethod ??
+      (this.staticClient?.clientSecret ? "client_secret_post" : "none")
+    );
+  }
+
   get clientMetadata(): OAuthClientMetadata {
     const ownerLabel =
       this.ownerDisplayName ??
       (this.owner.type === "workspace" ? this.owner.wsId : `user:${this.owner.userId}`);
     const meta: OAuthClientMetadata = {
-      client_name: `NimbleBrain (${ownerLabel})`,
-      client_uri: NIMBLEBRAIN_CLIENT_URI,
-      logo_uri: NIMBLEBRAIN_LOGO_URI,
+      client_name: `${this.clientIdentity.name} (${ownerLabel})`,
+      ...(this.clientIdentity.clientUri ? { client_uri: this.clientIdentity.clientUri } : {}),
+      ...(this.clientIdentity.logoUri ? { logo_uri: this.clientIdentity.logoUri } : {}),
       redirect_uris: [this.callbackUrl],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
-      token_endpoint_auth_method:
-        this.staticClient?.tokenEndpointAuthMethod ??
-        (this.staticClient?.clientSecret ? "client_secret_post" : "none"),
+      token_endpoint_auth_method: this.tokenEndpointAuthMethod,
     };
     // Track A: requested OAuth scopes flow into the SDK's authorize URL
     // build via the standard `scope` field on clientMetadata. Joined with
@@ -866,7 +742,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     // `redirectToAuthorization`. The interactive branch replaces the
     // promise with the flow-registry's promise so the HTTP callback route
     // is the resolver.
-    const d = deferred<string>();
+    const d = deferred<AuthorizationResponse>();
     this.pendingFlow = { promise: d.promise, deferred: d };
     this.currentState = s;
     this.identityScopesRefused = false;
@@ -897,6 +773,12 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
         ...(this.staticClient.clientSecret
           ? { client_secret: this.staticClient.clientSecret }
           : {}),
+        // The SDK picks token-request client auth from the client information
+        // alone (`selectClientAuthMethod`), never from `clientMetadata`. Without
+        // the method here, a client with a secret gets `client_secret_basic`
+        // whenever the server advertises it, which some servers accept on the
+        // code exchange and reject on the refresh grant.
+        token_endpoint_auth_method: this.tokenEndpointAuthMethod,
       };
       return info;
     }
@@ -1107,7 +989,17 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
    * one call site that knows better goes through `readTokens` directly.
    */
   async tokens(_ctx?: OAuthClientInformationContext): Promise<OAuthTokens | undefined> {
-    return this.readTokens("transport");
+    const tokens = await this.readTokens("transport");
+    const refresh = tokens?.refresh_token;
+    if (refresh) {
+      this.servedRefreshTokens.delete(refresh);
+      this.servedRefreshTokens.add(refresh);
+      if (this.servedRefreshTokens.size > SERVED_REFRESH_TOKENS_KEPT) {
+        const oldest = this.servedRefreshTokens.values().next().value;
+        if (oldest !== undefined) this.servedRefreshTokens.delete(oldest);
+      }
+    }
+    return tokens;
   }
 
   /** The token read proper. `purpose` is what the audit line says it was for. */
@@ -1121,7 +1013,23 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     return data ?? undefined;
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  saveTokens(tokens: OAuthTokens): Promise<void> {
+    const saved = this.savingTokens.then(() => this.saveTokensInTurn(tokens));
+    this.savingTokens = saved.catch(() => {});
+    return saved;
+  }
+
+  private async saveTokensInTurn(tokens: OAuthTokens): Promise<void> {
+    // A refresh result answers for the refresh token its exchange spent, which
+    // the refresh fetch recorded against the token the result carries. When the
+    // store holds neither the spent token nor this result's, the result is for
+    // a stale copy (a replayed exchange, or one that settled after a later
+    // rotation landed): writing it would roll the credential back to a token the
+    // vendor has since revoked. Drop this provider's copy so its next read takes
+    // the stored one.
+    const received = tokens.refresh_token;
+    const spent = this.exchangingCode || !received ? undefined : spentRefreshTokenHash(received);
+    if (await this.droppedStaleResult(received, spent)) return;
     this.cachedTokens = tokens;
     // Fresh tokens landed — a subsequent auth loss is a NEW episode, so
     // re-arm the one-shot `notifyAuthLost` guard. Without this, a connection
@@ -1135,8 +1043,8 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
       await this.records.delete("auth_lost");
     }
 
-    // Connector OAuth health — redacted (booleans + lifetime only, never token
-    // values). A token response carrying no refresh_token means the connection
+    // Connector OAuth health — token hash tags and lifetime only, never token
+    // values. A token response carrying no refresh_token means the connection
     // CANNOT refresh: it dies at access-token expiry and needs a full reconnect
     // every time. That silently degrades scheduled tasks (a daily run
     // lands after the access token has expired → dead connector). The usual
@@ -1148,13 +1056,13 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     // here means the connection stays refreshable across refreshes, and the warn
     // fires only for a genuinely non-refreshable connection, at connect time, by
     // name.
-    const hasRefreshToken =
-      typeof tokens.refresh_token === "string" && tokens.refresh_token.length > 0;
-    if (hasRefreshToken) {
-      log.debug(
-        "mcp",
-        `[oauth] ${this.serverName} tokens saved: refreshable=true expires_in=${tokens.expires_in ?? "?"}`,
-      );
+    if (received) {
+      this.logRefreshOutcome("saved", {
+        grant: this.savedGrant(spent),
+        spent_refresh_hash: spent?.slice(0, 8),
+        received_refresh_hash: refreshTokenTag(received),
+        expires_in: tokens.expires_in,
+      });
     } else {
       log.warn(
         `[oauth] ${this.serverName} token exchange returned NO refresh_token ` +
@@ -1305,7 +1213,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
   }
 
   /**
-   * Run `finish` — the transport's `finishAuth(code)`, which exchanges the
+   * Run `finish` — the transport's `finishAuth(code, iss)`, which exchanges the
    * authorization code and lands the tokens through `saveTokens` — marked as a
    * code exchange, so `saveTokens` treats the tokens as a new sign-in.
    */
@@ -1405,69 +1313,6 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     if (!data) throw new Error("PKCE code verifier missing — OAuth flow corrupted");
     return data.codeVerifier;
   }
-
-  /**
-   * Fleet token-auth hook. Installed as `addClientAuthentication` ONLY when the
-   * fleet feature is configured (see constructor) — never on a local / self-host
-   * deployment. The SDK calls `addClientAuthentication` IN PLACE OF its built-in
-   * client authentication (auth.js executeTokenRequest:
-   * `if (addClientAuthentication) … else <default> …`), so once installed this
-   * provider owns client auth on EVERY token endpoint it talks to. We therefore:
-   *   1. always apply the standard OAuth 2.1 client auth the SDK would have
-   *      (client_id / client_secret per the negotiated method), then
-   *   2. additionally present the fleet tenant assertion — but ONLY to the
-   *      fleet authorizer's token endpoint.
-   * Because it's only installed in fleet deployments, none of this runs (and the
-   * {@link applyClientAuthentication} SDK-mirror carries no drift risk) for the
-   * local path.
-   *
-   * The assertion binds this tenant's identity to the flow's PKCE
-   * `code_challenge` (= SHA256(code_verifier)); the authorizer verifies the MAC
-   * and mints the proven `tenant_id`. A tenant-key signature must never leak to
-   * a vendor token endpoint, hence the origin guard.
-   *
-   * A bound arrow property, NOT a prototype method: the SDK's `auth()` flow
-   * destructures it off the provider
-   * (`addClientAuthentication: provider.addClientAuthentication`) and invokes it
-   * unbound, so a plain method would lose `this`.
-   */
-  private readonly fleetTokenAuth = async (
-    headers: Headers,
-    params: URLSearchParams,
-    url: string | URL,
-    metadata?: AuthorizationServerMetadata,
-  ): Promise<void> => {
-    // (1) Reproduce the SDK's default client authentication. Without this, the
-    // token request would carry no client_id/secret and every exchange fails.
-    const clientInformation = await this.clientInformation();
-    if (clientInformation) {
-      const supported = metadata?.token_endpoint_auth_methods_supported ?? [];
-      applyClientAuthentication(
-        selectClientAuthMethod(clientInformation, supported),
-        clientInformation,
-        headers,
-        params,
-      );
-    }
-
-    // (2) Fleet tenant assertion — only for the fleet authorizer's endpoint.
-    if (!this.fleetAuthorizerOrigin) return;
-    // The token endpoint we're POSTing to must belong to the fleet authorizer.
-    if (originOf(url) !== this.fleetAuthorizerOrigin) return;
-
-    // `inner` binds the assertion to THIS PKCE flow. The token request already
-    // carries `code_verifier`; the bound challenge is its S256 hash, which is
-    // exactly what the authorizer stored at /authorize. The SDK also invokes
-    // this hook on the refresh grant, which has no `code_verifier` — so refresh
-    // requests are intentionally left unasserted (PKCE binding can't exist on
-    // refresh). The fleet authorizer must not require an assertion on refresh.
-    const verifier = params.get("code_verifier");
-    if (!verifier) return;
-    const inner = createHash("sha256").update(verifier).digest("base64url");
-
-    const assertion = buildTenantAssertion({ inner });
-    if (assertion) params.set("tenant_assertion", assertion);
-  };
 
   async redirectToAuthorization(url: URL): Promise<void> {
     if (!this.pendingFlow) {
@@ -1594,6 +1439,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     // race this file is built to prevent.
     this.pendingFlow.promise = registryPromise;
     this.pendingFlow.deferred = undefined;
+    this.pendingFlow.registeredState = stateParam;
 
     // Notify the lifecycle / UI so the connector transitions to pending_auth and
     // the banner appears (best-effort — see notifyInteractiveAuthRequired). The
@@ -1667,7 +1513,10 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
    * through to the interactive branch. Throws (rejecting `d`) for authz-server
    * errors and SSRF blocks; swallows network failures and returns `false`.
    */
-  private async probeHeadlessRedirect(url: URL, d: Deferred<string> | undefined): Promise<boolean> {
+  private async probeHeadlessRedirect(
+    url: URL,
+    d: Deferred<AuthorizationResponse> | undefined,
+  ): Promise<boolean> {
     if (!this.headlessAuthProbe) return false;
     const MAX_HOPS = 10;
     let current = url;
@@ -1701,7 +1550,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
    */
   private async followHeadlessHop(
     current: URL,
-    d: Deferred<string> | undefined,
+    d: Deferred<AuthorizationResponse> | undefined,
     hop: number,
   ): Promise<{ resolved?: boolean; next?: URL }> {
     this.validateProbeHop(current);
@@ -1751,17 +1600,18 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
    */
   private consumeHeadlessCallback(
     next: URL,
-    d: Deferred<string> | undefined,
+    d: Deferred<AuthorizationResponse> | undefined,
     hop: number,
   ): boolean {
     const code = next.searchParams.get("code");
+    const iss = next.searchParams.get("iss");
     const errParam = next.searchParams.get("error");
     if (code) {
       log.debug(
         "mcp",
         `[oauth] headless flow: ${this.serverName} got code=${code.slice(0, 8)}… after ${hop + 1} hop(s)`,
       );
-      d?.resolve(code);
+      d?.resolve(iss === null ? { code } : { code, iss });
       return true;
     }
     if (errParam) {
@@ -1806,6 +1656,7 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
         this.dcrInFlight = null;
       }
     }
+    if (scope === "tokens" && (await this.keptStoredTokens())) return;
     if (scope === "all" || scope === "tokens") {
       this.cachedTokens = null;
       await this.records.delete("tokens");
@@ -1820,16 +1671,108 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
     // 'discovery' is SDK-internal metadata; we don't persist it.
   }
 
+  /**
+   * Drop a refresh result answering for a token the store has moved past: the
+   * store holds neither `spent` (the hash of the token its exchange spent) nor
+   * `received` (the token it carries). True when dropped.
+   */
+  private async droppedStaleResult(
+    received: string | undefined,
+    spent: string | undefined,
+  ): Promise<boolean> {
+    if (received === undefined || spent === undefined) return false;
+    const stored = await this.storedRefreshToken("save");
+    if (stored === undefined || stored === received || refreshTokenHash(stored) === spent) {
+      return false;
+    }
+    this.cachedTokens = null;
+    this.logRefreshOutcome("dropped-stale", {
+      spent_refresh_hash: spent.slice(0, 8),
+      received_refresh_hash: refreshTokenTag(received),
+      stored_refresh_hash: refreshTokenTag(stored),
+    });
+    return true;
+  }
+
+  /** The grant a saved token response came from, when known. */
+  private savedGrant(spent: string | undefined): string | undefined {
+    if (this.exchangingCode) return "authorization_code";
+    return spent === undefined ? undefined : "refresh_token";
+  }
+
+  /**
+   * Whether an invalidation of the tokens keeps the stored ones. The SDK answers
+   * `invalid_grant` by invalidating the tokens and authorizing again, and the
+   * refresh fetch recorded which token the vendor refused. When that was a
+   * token this provider served and the store holds a different, unrefused one,
+   * the refused token was a copy someone else had since rotated (a stale cache,
+   * another transport, another pod), and the stored credential is good: drop
+   * only this provider's copy, so the SDK's retry reads the stored tokens and
+   * refreshes with those.
+   */
+  private async keptStoredTokens(): Promise<boolean> {
+    const stored = await this.storedRefreshToken("invalidate");
+    if (stored === undefined) return false;
+    const storedRefusal = refreshTokenRefusal(stored);
+    const refusedServed = [...this.servedRefreshTokens]
+      .reverse()
+      .find((token) => refreshTokenRefusal(token) !== undefined);
+    if (storedRefusal !== undefined || refusedServed === undefined) {
+      this.logRefreshOutcome("invalidated", {
+        error: storedRefusal,
+        stored_refresh_hash: refreshTokenTag(stored),
+      });
+      return false;
+    }
+    this.cachedTokens = null;
+    this.logRefreshOutcome("kept-stored", {
+      error: refreshTokenRefusal(refusedServed),
+      spent_refresh_hash: refreshTokenTag(refusedServed),
+      stored_refresh_hash: refreshTokenTag(stored),
+    });
+    return true;
+  }
+
+  /**
+   * The stored refresh token, read from the store past the cache: it reflects a
+   * rotation that landed after this provider read its copy.
+   */
+  private async storedRefreshToken(purpose: "save" | "invalidate"): Promise<string | undefined> {
+    const stored = await this.records.read<OAuthTokens>("tokens", {
+      caller: "oauth:tokens",
+      purpose: `${purpose} ${this.serverName}`,
+    });
+    return stored?.refresh_token;
+  }
+
+  /**
+   * One info line per refresh outcome, attributed to this connector and owner.
+   * Tokens appear only as hash tags (`refreshTokenTag`), never as values.
+   */
+  private logRefreshOutcome(
+    outcome: "saved" | "dropped-stale" | "invalidated" | "kept-stored",
+    fields: Record<string, string | number | undefined>,
+  ): void {
+    log.info(`[oauth] ${this.serverName} refresh ${outcome}`, {
+      connector: this.serverName,
+      owner_type: this.owner.type,
+      owner_id: this.owner.type === "workspace" ? this.owner.wsId : this.owner.userId,
+      outcome,
+      ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)),
+    });
+  }
+
   // ── Extensions used by McpSource.start() ──────────────────────────
 
   /**
-   * Await the in-flight authorization to yield an authorization code.
-   * Called by `McpSource.start()` after catching `UnauthorizedError` so it
-   * can then call `transport.finishAuth(code)` and retry `connect()`.
+   * Await the in-flight authorization to yield its response: the code and,
+   * from an RFC 9207 server, its `iss`. Called by `McpSource.start()` after
+   * catching `UnauthorizedError` so it can then call
+   * `transport.finishAuth(code, iss)` and retry `connect()`.
    *
    * Fails fast if the flow was rejected (e.g., interactive OAuth).
    */
-  async awaitPendingFlow(): Promise<string> {
+  async awaitPendingFlow(): Promise<AuthorizationResponse> {
     if (!this.pendingFlow) {
       throw new Error(
         "[workspace-oauth-provider] awaitPendingFlow called with no active flow — " +
@@ -1837,6 +1780,18 @@ export class WorkspaceOAuthProvider implements OAuthClientProvider {
       );
     }
     return this.pendingFlow.promise;
+  }
+
+  /**
+   * End this provider's interactive flow if it is still waiting on the browser.
+   * Called by `McpSource.stop()`: a flow belongs to the source that began it,
+   * so a stopped source must not go on holding its start open for the flow's
+   * TTL, or finish the sign-in of a connector that was disconnected meanwhile.
+   * A flow that already settled is left alone.
+   */
+  abandonPendingFlow(): void {
+    const state = this.pendingFlow?.registeredState;
+    if (state) abandonInteractiveFlow(state);
   }
 
   /**

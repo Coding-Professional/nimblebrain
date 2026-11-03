@@ -21,6 +21,12 @@ export function loadCoreSkills(): Skill[] {
   return loadSkillDir(CORE_DIR, "core").map(markVendored);
 }
 
+/** One core skill's body by its file name (`task-authoring`), or `""` when it is absent. */
+export function coreSkillBody(name: string): string {
+  const path = join(CORE_DIR, `${name}.md`);
+  return existsSync(path) ? (parseSkillFile(path)?.body.trim() ?? "") : "";
+}
+
 /**
  * Stamp `provenance.origin = "vendored"` on a platform-shipped skill (core /
  * builtin). This is the one durable marker that these skills are the platform's
@@ -166,7 +172,7 @@ export function parseSkillFile(path: string, opts?: { cap?: boolean }): Skill | 
 
 /**
  * Read the file's mtime as ISO 8601. Returns the empty string if the file
- * cannot be statted (in-memory or non-existent paths). Used by Phase 2
+ * cannot be statted (in-memory or non-existent paths). Used by
  * `skills.loaded` events as a cheap version stamp.
  */
 export function readSkillMtime(path: string): string {
@@ -253,7 +259,7 @@ export function parseSkillParts(
           ? ` (${capped.sectionsOmitted} section${capped.sectionsOmitted === 1 ? "" : "s"} omitted)`
           : "";
       log.warn(
-        `[skill] body capped to ${MAX_SKILL_BODY_CHARS} chars${omitted} in ${sourcePath} — trim the skill or move depth into references/`,
+        `[skill] body capped to ${MAX_SKILL_BODY_CHARS} chars${omitted} in ${sourcePath} — fold its rules into existing sections, or split it into two skills`,
       );
     }
   }
@@ -263,7 +269,7 @@ export function parseSkillParts(
 /**
  * Boot-time partition of the *raw* skill cache by role: `always` = the context
  * channel (Layer 0/1, sorted by priority); `dynamic` = matchable/conditional
- * (tool-affinity Layer 3 + matcher).
+ * (trigger matcher + bound-skill delivery).
  *
  * NOTE — do not confuse with `partitionSkillsByRole` in `select.ts`. This one
  * runs once at boot over the full on-disk set and intentionally keeps *disabled*

@@ -11,18 +11,19 @@ import {
   ProtocolErrorCode,
   Server,
 } from "@modelcontextprotocol/server";
+import type { Static, TSchema } from "@sinclair/typebox";
 import type { PlacementDeclaration } from "../connectors/runtime/types.ts";
 import type { EventSink, ToolResult } from "../engine/types.ts";
 import { bytesToBase64 } from "../util/base64.ts";
 import { toWireJson } from "../util/wire-json.ts";
+import { MCP_APP_MIME_TYPE } from "./apps-extension.ts";
 import { coerceInputForSchema } from "./coerce-input.ts";
 import { McpSource } from "./mcp-source.ts";
 import { validateToolInput } from "./validate-input.ts";
 
 /**
- * Tool definition for an in-process MCP server. Mirrors the shape the
- * platform sources used pre-migration so authoring stays a function and a
- * JSON schema — no Zod adapter, no SDK boilerplate per tool.
+ * Tool definition for an in-process MCP server. Authoring stays a function and
+ * a JSON schema — no Zod adapter, no SDK boilerplate per tool.
  *
  * The two metadata fields are the two the MCP spec defines, and they are not
  * interchangeable:
@@ -54,11 +55,66 @@ export interface InProcessTool {
 }
 
 /**
- * The MIME type the MCP Apps spec gives a `ui://` resource. The parameter is
- * what tells a public MCP Apps host an app panel from plain HTML, so it is
- * claimed only for `ui://` URIs — see {@link defaultMimeType}.
+ * A failed call. An output schema binds only a success result (the SDK client
+ * validates `structuredContent` when `isError` is false), so a failure carries
+ * any `structuredContent` it likes, or none.
  */
-export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
+export type ToolErrorResult = ToolResult & { isError: true };
+
+/** A successful call whose `structuredContent` is `T`. */
+export type ToolSuccessResult<T> = Omit<ToolResult, "structuredContent" | "isError"> & {
+  structuredContent: T;
+  isError: false;
+};
+
+/**
+ * A tool output schema. Its root is an object on every MCP revision: 2025-11-25
+ * requires that, and the SDK server rewraps any other root as `{ result: … }`.
+ * A union of object shapes is `ObjectUnion` (`src/platform/schemas/_shared.ts`).
+ */
+export type OutputSchema = TSchema & { type: "object" };
+
+/** What the handler of a tool declaring output schema `O` returns. */
+export type TypedToolResult<O extends OutputSchema> =
+  | ToolSuccessResult<Static<O>>
+  | ToolErrorResult;
+
+/**
+ * An {@link InProcessTool} whose handler reads the static type of its TypeBox
+ * `inputSchema` and, when it declares a TypeBox `outputSchema`, returns that
+ * schema's static type as `structuredContent` on every success.
+ */
+export interface TypedInProcessTool<
+  S extends TSchema,
+  O extends OutputSchema | undefined = undefined,
+> extends Omit<InProcessTool, "inputSchema" | "handler" | "outputSchema"> {
+  inputSchema: S;
+  outputSchema?: O;
+  handler: (
+    input: Static<S>,
+  ) => Promise<[O] extends [OutputSchema] ? TypedToolResult<O> : ToolResult>;
+}
+
+/**
+ * Register a tool whose handler takes its input as `Static<S>`. `tools/call`
+ * runs `validateToolInput` against `inputSchema` before it calls a handler, so
+ * a handler never sees input its schema rejects, and it reads typed fields
+ * without a cast of its own.
+ *
+ * With an `outputSchema`, the compiler holds each success result to
+ * `Static<O>`, and `tools/list` publishes the schema, so a client knows the
+ * result's shape without reading this source. Keep an output schema open (no
+ * `additionalProperties: false`): the SDK client validates every success result
+ * against it, and a result it rejects fails the call.
+ */
+export function typedTool<S extends TSchema, O extends OutputSchema | undefined = undefined>(
+  tool: TypedInProcessTool<S, O>,
+): InProcessTool {
+  // `InProcessTool.handler` takes the `Record<string, unknown>` the SDK hands
+  // `tools/call`; the input has already passed validation against `S`, which
+  // that parameter type cannot express. Identical at runtime: the same object.
+  return tool as InProcessTool;
+}
 
 /**
  * The label for a bare-string resource: an app panel when it is served at a
@@ -101,6 +157,19 @@ export interface ResourceTemplate {
   name: string;
   description?: string;
   mimeType?: string;
+  /** Advertised as the template's `_meta`, e.g. the view that shows its records (`ai.nimblebrain/view`). */
+  _meta?: Record<string, unknown>;
+}
+
+/** A template as `resources/templates/list` advertises it: only the fields it declares. */
+function advertisedTemplate(t: ResourceTemplate) {
+  return {
+    uriTemplate: t.uriTemplate,
+    name: t.name,
+    ...(t.description ? { description: t.description } : {}),
+    ...(t.mimeType ? { mimeType: t.mimeType } : {}),
+    ...(t._meta ? { _meta: t._meta } : {}),
+  };
 }
 
 /**
@@ -132,7 +201,7 @@ export interface DefineInProcessAppOptions {
   instructions?: string;
   /**
    * URI templates advertised via `resources/templates/list`. Use for
-   * parametric URIs (e.g. `instructions://connectors/{name}`) where the catalog
+   * parametric URIs (e.g. `notes://{id}`) where the catalog
    * is dynamic but the shape is known.
    */
   templates?: ResourceTemplate[];
@@ -316,12 +385,7 @@ export function defineInProcessApp(
           // matching how a server that doesn't advertise templates behaves.
           if (hasTemplates) {
             server.setRequestHandler("resources/templates/list", async () => ({
-              resourceTemplates: templates.map((t) => ({
-                uriTemplate: t.uriTemplate,
-                name: t.name,
-                ...(t.description ? { description: t.description } : {}),
-                ...(t.mimeType ? { mimeType: t.mimeType } : {}),
-              })),
+              resourceTemplates: templates.map(advertisedTemplate),
             }));
           }
         }

@@ -17,11 +17,16 @@
 
 import type { EventSourcedConversationStore } from "../conversation/event-sourced-store.ts";
 import type { Conversation } from "../conversation/types.ts";
-import type { ConnectorSkillCandidate, EventSink, ToolSchema } from "../engine/types.ts";
+import type {
+  ConnectorSkillCandidate,
+  EventSink,
+  ThinkingEffort,
+  ToolSchema,
+  WrapUpLimit,
+} from "../engine/types.ts";
 import type { FileReference } from "../files/types.ts";
 import type { UserIdentity } from "../identity/provider.ts";
 import type { SkillMatch } from "../skills/matcher.ts";
-import type { SelectedSkill } from "../skills/select.ts";
 import type { Skill } from "../skills/types.ts";
 import type { RequestContext } from "./request-context.ts";
 import type { SpendAccount } from "./spend.ts";
@@ -111,6 +116,12 @@ export interface RunInput {
    * activate and call.
    */
   allowedTools?: string[];
+  /**
+   * Skills, by catalog name, delivered in full ahead of the run's opening
+   * message, so the run never depends on the model choosing to load them.
+   * Unattended only.
+   */
+  skills?: string[];
   /** Scopes the run to one app's briefing and tool surface. Chat only. */
   appContext?: AppContext;
 }
@@ -121,6 +132,14 @@ export interface RunBudget {
   maxIterations?: number;
   /** Input tokens the whole run may spend across every model call. Absent = no cap. */
   maxRunInputTokens?: number;
+  /**
+   * The run's wall-clock limit, enforced by the caller that set it (the tasks
+   * executor ends a task run at its cap). A model credential the door mints for
+   * the run expires at it plus the gateway's leeway. Absent = the run has no
+   * limit of its own (a chat turn); the door then holds a run that carries a
+   * model credential to the installation's ceiling itself.
+   */
+  maxRunDurationMs?: number;
   /**
    * The spend accounts the run draws on (`src/runtime/spend.ts`). Each model
    * call's output is clamped to what they allow and its worst case reserved
@@ -155,7 +174,7 @@ export interface RunSpec {
    */
   workspaceId: string;
   /**
-   * The workspace the prompt NARRATES — installed apps, instruction overlays,
+   * The workspace the prompt NARRATES — installed apps,
    * the "## Workspace" block, the workspace persona. Equal to `workspaceId` for
    * a run focused on its workspace; absent for a run merely *housed* in a
    * workspace (an unfocused task), which is walled to that workspace without
@@ -172,6 +191,13 @@ export interface RunSpec {
    * conversation runs on the model it was born with for its whole life.
    */
   model: string;
+  /**
+   * Reasoning depth for this run, in place of the configured
+   * `thinkingEffort`. It stands where that tier does in `resolveThinking`, so
+   * an operator's `thinking` of `off` or `adaptive` still wins and a model
+   * that does not reason gets none. Absent = the configured depth.
+   */
+  thinkingEffort?: ThinkingEffort;
   /** Cancellation, threaded into the engine and down to every tool call. */
   signal?: AbortSignal;
   /** The run's id, when the caller minted it ahead of the run; absent, the door mints one. */
@@ -179,6 +205,26 @@ export interface RunSpec {
   /** Per-request event sink (SSE stream, executor tap) joined to the defaults. */
   sink?: EventSink;
   onAbort: RunAbortDisposition;
+}
+
+/** A skill an unattended run declared, resolved to its body. */
+export interface DeclaredSkill {
+  name: string;
+  /** Storage tier, or `connector` for a curated overlay. */
+  scope: string;
+  body: string;
+}
+
+/**
+ * One skill reaching (or missing) the model during a run, for a caller with no
+ * conversation log to read it from. `loadedBy` is the load ledger's vocabulary
+ * for the runtime's own channels, plus `declared`: given in the system prompt
+ * because the run named it. `status` marks a bound skill that did NOT arrive.
+ */
+export interface SkillDelivery {
+  name: string;
+  loadedBy: "declared" | "before_call" | "tool_use" | "activation";
+  status?: "fetch_failed" | "capped" | "renamed_unheld";
 }
 
 /** A started (and completed) run. */
@@ -205,15 +251,21 @@ export interface RunHandle {
   finishReasonRaw?: string;
   /** The account that stopped the run, when `stopReason` is `spend_limit`. */
   spendAccountId?: string;
+  /** See `EngineResult.wrapUpLimit`. */
+  wrapUpLimit?: WrapUpLimit;
   usage: TurnUsage;
+  /** The run's cost in USD; see `ChatResult.costUsd`. */
+  costUsd: number;
+  /** Every skill the run was given, or that missed it, in order. */
+  skillsDelivered: SkillDelivery[];
 }
 
 /**
  * The prompt a run reasons with, and the tool surface it reasons over.
  *
  * One value because the two are resolved together and cannot be resolved apart:
- * the matched skill's `allowed-tools` decides the surfaced set, and the surfaced
- * set decides which connector skills tool-affinity selection loads.
+ * the matched skill composes into the prompt, and its `allowed-tools` decides
+ * the surfaced set.
  */
 export interface RunComposition {
   /** The ACTIVE tool set the model sees. */
@@ -224,12 +276,12 @@ export interface RunComposition {
   skill: Skill | null;
   /** The match itself, which also carries the phrase, for load telemetry. */
   skillMatch: SkillMatch | null;
-  /** Tool-affinity Layer 3 selections. */
-  selectedLayer3: SelectedSkill[];
   /** The always-on context channel — every tier's `always` skills + persona. */
   alwaysOnSkills: Skill[];
   /** Overlays the engine may surface once into history mid-run. */
   connectorSkillCandidates: ConnectorSkillCandidate[];
+  /** The skills the run declared, with the bodies its system prompt carries. */
+  declaredSkills: DeclaredSkill[];
   /** The cached system prefix. */
   stableSystem: string;
   /** The per-run head that rides the latest user message instead of the prefix. */

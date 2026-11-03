@@ -30,7 +30,9 @@ import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycl
 import { slugifyServerName } from "../../src/connectors/runtime/paths.ts";
 import type { ConnectorRef } from "../../src/connectors/runtime/types.ts";
 import type { UserIdentity } from "../../src/identity/provider.ts";
+import type { UserStore } from "../../src/identity/user.ts";
 import { MINTED_PROVIDER } from "../../src/oauth/minted-credential-provider.ts";
+import type { PermissionStore } from "../../src/permissions/permission-store.ts";
 import type { Runtime } from "../../src/runtime/runtime.ts";
 import { createManageConnectorsTool } from "../../src/tools/connector-tools.ts";
 import {
@@ -46,6 +48,8 @@ import { ToolRegistry } from "../../src/tools/registry.ts";
 import { resolveTransportCredential } from "../../src/tools/remote-transport.ts";
 import { WorkspaceContext } from "../../src/workspace/context.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
+import { fakeFetch } from "../helpers/fake-fetch.ts";
+import { stub } from "../helpers/stub.ts";
 import { seedWorkspace } from "../helpers/test-workspace.ts";
 
 const CATALOG_DIR = join(import.meta.dir, "..", "fixtures", "connectors-secret-headers");
@@ -59,9 +63,9 @@ const SERVER_NAME = slugifyServerName(ENTRY_ID);
 const DIRECT_ID = "com.acme/db-direct";
 const DIRECT_URL = "https://mcp.acme.test/direct/mcp";
 const DIRECT_SERVER_NAME = slugifyServerName(DIRECT_ID);
-/** The static-auth sibling naming the same key as its OAuth app's client secret. */
-const OPERATOR_ID = "com.acme/db-operator";
-const OPERATOR_URL = "https://mcp.acme.test/operator/mcp";
+/** The static-auth sibling naming the same key as its OAuth client's client secret. */
+const STATIC_ID = "com.acme/db-static";
+const STATIC_URL = "https://mcp.acme.test/static/mcp";
 
 const ADMIN: UserIdentity = {
   id: "usr_admin_secret_headers",
@@ -133,24 +137,24 @@ function directEntry(): CatalogListing {
   };
 }
 
-/** The static-auth entry whose operator app secret lives at `KEY`. */
-function operatorEntry(): CatalogListing {
+/** The static-auth entry whose OAuth client secret lives at `KEY`. */
+function staticEntry(): CatalogListing {
   return {
-    id: OPERATOR_ID,
-    name: "Acme DB Operator App",
-    description: "Connects through the workspace's own registered OAuth app",
+    id: STATIC_ID,
+    name: "Acme DB Static Client",
+    description: "Connects through the workspace's own registered OAuth client",
     install: {
       kind: "remote-oauth",
-      url: OPERATOR_URL,
+      url: STATIC_URL,
       transportType: "streamable-http",
       auth: "static",
-      operatorSetup: {
+      oauthClientSetup: {
         portalUrl: "https://acme.test/developers",
         hint: "Create an app, paste the client id and secret",
         clientSecretKey: KEY,
       },
     },
-  } as unknown as CatalogListing;
+  };
 }
 
 /**
@@ -160,7 +164,7 @@ function operatorEntry(): CatalogListing {
 function toolFor(sessionWsId: string, injected?: ConnectorLifecycleManager) {
   const lifecycle = injected ?? new ConnectorLifecycleManager(new NoopEventSink());
   const workspaceRegistry = new ToolRegistry();
-  const runtime = {
+  const runtime = stub<Runtime>({
     getWorkDir: () => workDir,
     getCredentialStore: () => store,
     getEventSink: () => new NoopEventSink(),
@@ -169,8 +173,8 @@ function toolFor(sessionWsId: string, injected?: ConnectorLifecycleManager) {
     getConnectorCatalog: () => new ConnectorCatalog(CATALOG_DIR),
     getLifecycle: () => lifecycle,
     getRegistryForWorkspace: (_id: string) => workspaceRegistry,
-    getPermissionStore: () => ({ deleteConnector: async () => {} }),
-    getUserStore: () => ({ get: async () => null }),
+    getPermissionStore: () => stub<PermissionStore>({ deleteConnector: async () => {} }),
+    getUserStore: () => stub<UserStore>({ get: async () => null }),
     getConnectorInstancesForWorkspace: (_wsId: string) => lifecycle.getInstances(),
     getAllowInsecureRemotes: () => false,
     // No connector here advertises the lifecycle extension, so both calls
@@ -180,7 +184,7 @@ function toolFor(sessionWsId: string, injected?: ConnectorLifecycleManager) {
       declarationFor: async () => undefined,
       portFor: () => undefined,
     }),
-  } as unknown as Runtime;
+  });
   return createManageConnectorsTool({
     runtime,
     getIdentity: () => ADMIN,
@@ -215,10 +219,10 @@ async function send(wsId: string): Promise<Headers> {
     wsId,
   );
   let seen = new Headers();
-  globalThis.fetch = (async (_input: string, init?: RequestInit) => {
+  globalThis.fetch = fakeFetch(async (_input, init) => {
     seen = new Headers(init?.headers);
     return new Response("{}", { status: 200 });
-  }) as unknown as typeof fetch;
+  });
   await (authed ?? globalThis.fetch)(URL_, { method: "POST", headers });
   return seen;
 }
@@ -485,20 +489,20 @@ describe("a catalog entry that binds a workspace secret to a header", () => {
   });
 
   test("a key a static-auth sibling's client secret names is kept", async () => {
-    // The third declaration site, and the asymmetric one: an uninstall never
-    // deletes an `oauthClient.clientSecret` key (`remove_operator_setup` owns
-    // it), but it is still a reason not to delete it on someone else's
-    // uninstall. Without the referrer read, uninstalling the header connector
-    // takes the operator app's secret with it and the static connector can no
-    // longer complete a token exchange, on a value nothing returns.
+    // The third declaration site: an `oauthClient.clientSecret` key goes only
+    // with its OAuth client, on the uninstall of that app's last user, and it
+    // is still a reason not to delete it on someone else's uninstall. Without
+    // the referrer read, uninstalling the header connector takes the operator
+    // app's secret with it and the static connector can no longer complete a
+    // token exchange, on a value nothing returns.
     const tool = toolFor("ws_00741647fd740fac");
     await tool.handler({
-      action: "setup_operator",
-      catalogId: OPERATOR_ID,
+      action: "set_oauth_client",
+      catalogId: STATIC_ID,
       clientId: "acme-client-id",
       clientSecret: "operator-app-secret",
     });
-    await tool.handler({ action: "install", entry: operatorEntry() });
+    await tool.handler({ action: "install", entry: staticEntry() });
     await tool.handler({ action: "install", entry: entry() });
 
     const result = await tool.handler({ action: "uninstall", serverName: SERVER_NAME });

@@ -5,12 +5,10 @@
  * may parse this form by hand — enforced by the `check:tool-namespace` AST lint
  * (`scripts/check-tool-namespace.ts`).
  *
- * Nothing CONSTRUCTS the form any more: it is retired, rejected rather than
- * routed, and `namespacedToolName` has no caller in `src/` or `web/`. The
- * builder is kept for the test fixtures that must produce a well-formed retired
- * name in order to assert it is refused — validated construction beats a
- * hand-spliced string in a fixture. The lint scans `src/` and `web/src/` only,
- * so those fixtures are unaffected by it.
+ * Nothing in `src/` or `web/` constructs the form: it is rejected rather than
+ * routed. The builder test fixtures use to produce a well-formed name (to assert
+ * it is refused) is `test/helpers/namespaced-tool-name.ts`; the lint scans
+ * `src/` and `web/src/` only, so it does not apply there.
  *
  * **Separator: `-`.** Workspace ids match
  * `WORKSPACE_ID_PATTERN = ^ws_[a-f0-9]{16}$` (no `-`), so the first
@@ -20,11 +18,11 @@
  * at the provider boundary, breaking tool registration. `-` satisfies
  * both the provider regex and our unambiguity requirement.
  *
- * Design rules (matching Stage 1 lessons):
+ * Design rules:
  *
- * 1. **Strict invariants over defensive defaults** (lesson 3). Every
+ * 1. **Strict invariants over defensive defaults.** Every
  *    invalid shape throws — no `??` / `?? null` / `?? ""` fallbacks
- *    anywhere. The orchestrator (T004) catches `UnknownNamespacedToolName`
+ *    anywhere. The orchestrator catches `UnknownNamespacedToolName`
  *    and decides what to do; the primitive does not guess.
  * 2. **Single source of truth for `wsId` validation.**
  *    `WORKSPACE_ID_RE` is imported from `src/workspace/workspace-store.ts`
@@ -93,7 +91,7 @@ export class UnknownNamespacedToolName extends Error {
    *
    * Values: `empty_input`, `empty_tool_name`, `invalid_wsid`, and
    * `legacy_namespaced_form` (raised by the orchestrator for the retired
-   * `ws_<id>-` wire form, which parses fine but is no longer routed).
+   * `ws_<id>-` wire form, which parses fine but is not routed).
    */
   readonly reason: string;
 
@@ -181,31 +179,6 @@ export function parseNamespacedToolName(s: string): { scope: ToolScope; toolName
   }
   // Bare: no workspace prefix. The whole name is the (identity) tool name.
   return { scope: { kind: "identity" }, toolName: s };
-}
-
-/**
- * Best-effort bare tool name for read-side consumers.
- *
- * If `s` is a workspace-namespaced name (`ws_<id>-<toolName>`), return the
- * `<toolName>` portion; for a bare/identity name, return it unchanged. It
- * exists for the read-side surfaces (tool surfacing in `runtime/tools.ts`,
- * Layer-3 skill affinity in `skills/select.ts`, the engine's system-tool
- * release guard) that classify tool lists mixing workspace-namespaced and
- * bare names.
- *
- * Implemented in terms of `parseNamespacedToolName` so the separator and
- * the `WORKSPACE_ID_RE` boundary stay defined in one place: an identity name
- * parses to `{ kind: "identity", toolName: s }` (the whole name), so this
- * returns `s`; a workspace name returns the stripped tool name. The
- * try/catch guards the only throwing cases (empty input, malformed
- * `ws_<id>-` prefix) — those pass through unchanged too.
- */
-export function bareToolName(s: string): string {
-  try {
-    return parseNamespacedToolName(s).toolName;
-  } catch {
-    return s;
-  }
 }
 
 /**

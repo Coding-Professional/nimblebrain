@@ -1,5 +1,5 @@
 /**
- * Phase 4 — mutation-tool behavior tests for `nb__skills`.
+ * Mutation-tool behavior tests for `nb__skills`.
  *
  * Per-tool: happy path + at least one error/permission edge. Versioning
  * (`_versions/{name}.{iso}.md` snapshots) is verified as a side-effect of
@@ -23,40 +23,35 @@ import { join } from "node:path";
 import { NoopEventSink } from "../../../../src/adapters/noop-events.ts";
 import type { EngineEvent, EventSink } from "../../../../src/engine/types.ts";
 import { isModelVisible } from "../../../../src/engine/types.ts";
+import type { UserIdentity } from "../../../../src/identity/provider.ts";
 import { createSkillsSource } from "../../../../src/platform/skills/source.ts";
 import { runWithRequestContext } from "../../../../src/runtime/request-context.ts";
+import type { Runtime } from "../../../../src/runtime/runtime.ts";
 import { parseSkillContent } from "../../../../src/skills/loader.ts";
-import { selectLayer3Skills } from "../../../../src/skills/select.ts";
 import { MAX_SKILL_BODY_CHARS } from "../../../../src/skills/truncate.ts";
+import { listSkillVersions } from "../../../../src/skills/versions.ts";
 import type { McpSource } from "../../../../src/tools/mcp-source.ts";
 import { surfaceTools } from "../../../../src/tools/surfacing.ts";
 import { WorkspaceContext } from "../../../../src/workspace/context.ts";
-import { seedWorkspaceRoot } from "../../../helpers/test-workspace.ts";
+import type { Workspace } from "../../../../src/workspace/types.ts";
+import type { WorkspaceStore } from "../../../../src/workspace/workspace-store.ts";
+import { skillEditPatch } from "../../../../web/src/pages/settings/skill-edit-patch.ts";
+import { stub } from "../../../helpers/stub.ts";
+import { makeWorkspace, seedWorkspaceRoot } from "../../../helpers/test-workspace.ts";
 
-interface FakeIdentity {
-  id: string;
-  email: string;
-  displayName: string;
-  orgRole: "owner" | "admin" | "member";
-  preferences: { timezone: string; locale: string; theme: string };
-}
-
-/** The dev user, as the `dev` provider verifies every request: org owner. */
-const DEV_USER: FakeIdentity = {
+/** The dev user, as the `dev` provider verifies every request: org admin. */
+const DEV_USER: UserIdentity = {
   id: "usr_default",
   email: "dev@localhost",
   displayName: "Developer",
-  orgRole: "owner",
+  orgRole: "admin",
   preferences: { timezone: "UTC", locale: "en-US", theme: "system" },
 };
 
 class FakeRuntime {
-  identity: FakeIdentity | null = DEV_USER;
+  identity: UserIdentity | null = DEV_USER;
   wsId: string | null = null;
-  workspaces = new Map<
-    string,
-    { id: string; name: string; members: Array<{ userId: string; role: "admin" | "member" }> }
-  >();
+  workspaces = new Map<string, Workspace>();
 
   constructor(private workDir: string) {
     const convDir = join(workDir, "conversations");
@@ -68,7 +63,7 @@ class FakeRuntime {
   getWorkDir(): string {
     return this.workDir;
   }
-  getCurrentIdentity(): FakeIdentity | null {
+  getCurrentIdentity(): UserIdentity | null {
     return this.identity;
   }
   requireWorkspaceId(): string {
@@ -82,9 +77,9 @@ class FakeRuntime {
     return new WorkspaceContext({ wsId, workDir: this.workDir });
   }
   getWorkspaceStore() {
-    return {
+    return stub<WorkspaceStore>({
       get: async (id: string) => this.workspaces.get(id) ?? null,
-    };
+    });
   }
   getContextSkills() {
     return [];
@@ -106,7 +101,7 @@ class FakeRuntime {
   setMember(wsId: string, userId: string, role: "admin" | "member"): void {
     const ws = this.workspaces.get(wsId);
     if (!ws) {
-      this.workspaces.set(wsId, { id: wsId, name: wsId, members: [{ userId, role }] });
+      this.workspaces.set(wsId, makeWorkspace({ id: wsId, members: [{ userId, role }] }));
     } else {
       ws.members = [{ userId, role }];
     }
@@ -138,8 +133,11 @@ afterEach(async () => {
 });
 
 async function buildSource(): Promise<McpSource> {
-  source = createSkillsSource(runtime as unknown as never, sink ?? new NoopEventSink());
+  source = createSkillsSource(stub<Runtime>(runtime), sink ?? new NoopEventSink());
   await source.start();
+  // List first, as the engine does: the SDK client validates a result against
+  // its tool's output schema only once it holds the `tools/list` that declares it.
+  await source.tools();
   return source;
 }
 
@@ -152,7 +150,7 @@ function readManifestField(path: string, key: string): string | undefined {
 // ── create ───────────────────────────────────────────────────────────────
 
 describe("skills__create", () => {
-  test("the dev user, an org owner, writes an org-scope skill and emits skill.created", async () => {
+  test("the dev user, an org admin, writes an org-scope skill and emits skill.created", async () => {
     const src = await buildSource();
     const client = src.getClient()!;
     const result = await client.callTool({
@@ -176,14 +174,10 @@ describe("skills__create", () => {
   });
 
   test("a skill cannot be created inside a task run at all", async () => {
-    // This began as a provenance test. While a run's correlation id lived in
-    // `conversationId`, a task-created skill was persisted as
-    // `origin: "chat"` with a run id recorded as its conversation — wrong data
-    // on disk. #1033 corrected the stamp; the unattended wall then removed the
-    // path, which is the stronger guarantee: a skill is durable guidance that
-    // loads itself into later conversations, and a run ingesting untrusted
-    // content must not be able to author one. So the assertion is no longer
-    // "the provenance is right" but "nothing was written".
+    // The unattended wall removes the path, which is a stronger guarantee
+    // than correct provenance: a skill is durable guidance that loads itself
+    // into later conversations, and a run ingesting untrusted content must
+    // not be able to author one. So the assertion is "nothing was written".
     const src = await buildSource();
     const client = src.getClient()!;
     const result = await runWithRequestContext(
@@ -354,7 +348,7 @@ describe("skills__create", () => {
 describe("skills — workspace-scope write gate", () => {
   const WS = "ws_0039fad880e2fea0";
 
-  function setIdentity(id: string, orgRole: "owner" | "admin" | "member"): void {
+  function setIdentity(id: string, orgRole: "admin" | "member"): void {
     runtime.wsId = WS;
     seedWorkspaceRoot(workDir, WS);
     runtime.identity = {
@@ -422,23 +416,12 @@ describe("skills — workspace-scope write gate", () => {
     );
     expect(existsSync(join(workDir, "workspaces", WS, "skills", "orgadmin-cannot.md"))).toBe(false);
   });
-
-  test("org OWNER who is NOT a workspace member CANNOT write (no org-owner override)", async () => {
-    setIdentity("u_owner", "owner");
-    runtime.setMember(WS, "someone_else", "admin");
-    const result = await createWsSkill("owner-cannot");
-    expect(result.isError).toBe(true);
-    expect((result as { structuredContent?: { code?: string } }).structuredContent?.code).toBe(
-      "permission_denied",
-    );
-    expect(existsSync(join(workDir, "workspaces", WS, "skills", "owner-cannot.md"))).toBe(false);
-  });
 });
 
 // ── create-time loading-strategy derivation (issue #391) ───────────────────
 
 describe("skills__create — loading-strategy", () => {
-  test("defaults to dynamic; with no triggers/affinity it is catalog-only (not Layer-3 selected)", async () => {
+  test("defaults to dynamic; with no triggers/affinity it is catalog-only (binds no tool)", async () => {
     const src = await buildSource();
     const client = src.getClient()!;
     const result = await client.callTool({
@@ -456,10 +439,9 @@ describe("skills__create — loading-strategy", () => {
     expect(parsed).not.toBeNull();
     expect(parsed?.manifest.loadingStrategy).toBe("dynamic");
 
-    // No tool-affinity → NOT reachable by the Layer-3 selector (catalog-only,
-    // honoring #4 — the handler does not silently bump it to `always`).
-    const selected = selectLayer3Skills({ skills: [parsed!], activeTools: [] });
-    expect(selected.map((s) => s.skill.manifest.name)).not.toContain("catalog-only");
+    // No tool-affinity → bound to no tool, so it loads only from the catalog
+    // (the handler does not silently bump it to `always`).
+    expect(parsed?.manifest.toolAffinity).toBeUndefined();
   });
 
   test("dynamic + triggers loads via the matcher", async () => {
@@ -503,7 +485,7 @@ describe("skills__create — loading-strategy", () => {
     expect(parsed?.manifest.loadingStrategy).toBe("always");
   });
 
-  test("success message flags a catalog-only skill", async () => {
+  test("success message says a catalog-only skill loads on request", async () => {
     const src = await buildSource();
     const client = src.getClient()!;
     const result = await client.callTool({
@@ -515,7 +497,7 @@ describe("skills__create — loading-strategy", () => {
       },
     });
     const text = (result.content as Array<{ text: string }>)[0]?.text ?? "";
-    expect(text).toMatch(/catalog-only/);
+    expect(text).toMatch(/on request/);
   });
 });
 
@@ -561,7 +543,7 @@ describe("a pasted SKILL.md in the body", () => {
     );
     expect(written?.manifest.loadingStrategy).toBe("dynamic");
     expect(written?.manifest.priority).toBe(25);
-    expect(written?.manifest.toolAffinity).toEqual(["skills__*"]);
+    expect(written?.manifest.toolAffinity).toEqual(["skills__create", "skills__update"]);
     expect(written?.manifest.triggers).toHaveLength(8);
     expect(written?.manifest.description).toContain("Guide for authoring");
     // The filename is the caller's — it is what the permission gate ran against.
@@ -600,10 +582,10 @@ describe("a pasted SKILL.md in the body", () => {
       },
     });
     const out = result.structuredContent as {
-      loading?: { wouldLoad: boolean; mechanism: string };
+      loading?: { mechanism: string };
       frontmatterApplied?: string[];
     };
-    expect(out.loading).toEqual({ wouldLoad: true, mechanism: "tool_affinity" });
+    expect(out.loading).toEqual({ mechanism: "tool_affinity" });
     expect(out.frontmatterApplied).toEqual(["description", "loading-strategy", "tool-affinity"]);
   });
 
@@ -852,12 +834,11 @@ describe("skills__update", () => {
     expect(result.isError).toBe(true);
   });
 
-  // Regression: production bug where the agent passed a stale `id` (a path
-  // the skill used to live at, before being moved to a workspace dir). The
-  // old ordering ran the permission check first and returned "Org-scope
-  // writes require org admin or owner" — sending the agent down a
-  // hallucination loop trying to fix its role instead of refreshing its
-  // path. Existence-first surfaces the actual cause.
+  // The agent can pass a stale `id` (a path the skill no longer lives at,
+  // after a move to a workspace dir). Running the permission check first
+  // would return "Org-scope writes require org admin" — sending the agent
+  // down a hallucination loop trying to fix its role instead of refreshing
+  // its path. Existence-first surfaces the actual cause.
   test("stale org-scope id (file moved away) returns 'not found', not 'permission denied'", async () => {
     runtime.identity = {
       id: "u_member",
@@ -928,6 +909,219 @@ describe("skills__update", () => {
   });
 });
 
+// ── null clears (platform/AGENTS.md §1.3) ────────────────────────────────
+
+describe("skills__update — null clears a field, omission keeps it", () => {
+  async function seedFull(): Promise<{
+    id: string;
+    client: NonNullable<ReturnType<McpSource["getClient"]>>;
+  }> {
+    const src = await buildSource();
+    const client = src.getClient()!;
+    const created = await client.callTool({
+      name: "create",
+      arguments: {
+        scope: "org",
+        manifest: {
+          name: "full",
+          description: "Every field set",
+          loadingStrategy: "always",
+          priority: 40,
+          toolAffinity: ["gmail__*"],
+          triggers: ["ship it"],
+          allowedTools: ["files__read"],
+        },
+        body: "Body.",
+      },
+    });
+    expect(created.isError).toBeFalsy();
+    return { id: join(workDir, "skills", "full.md"), client };
+  }
+
+  const read = (id: string) => parseSkillContent(readFileSync(id, "utf-8"), id, { cap: false });
+
+  test("null on a list removes the key from the file", async () => {
+    const { id, client } = await seedFull();
+    for (const [field, key] of [
+      ["toolAffinity", "tool-affinity"],
+      ["triggers", "triggers"],
+      ["allowedTools", "allowed-tools"],
+    ] as const) {
+      const result = await client.callTool({
+        name: "update",
+        arguments: { id, manifest: { [field]: null } },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(readFileSync(id, "utf-8")).not.toContain(`${key}:`);
+      expect(read(id)?.manifest[field]).toBeUndefined();
+    }
+  });
+
+  test("null on priority or loadingStrategy restores the default the loader applies", async () => {
+    const { id, client } = await seedFull();
+    const result = await client.callTool({
+      name: "update",
+      arguments: { id, manifest: { priority: null, loadingStrategy: null } },
+    });
+    expect(result.isError).toBeFalsy();
+    const written = read(id);
+    expect(written?.manifest.priority).toBe(50);
+    expect(written?.manifest.loadingStrategy).toBe("dynamic");
+  });
+
+  test("an omitted field keeps its value", async () => {
+    const { id, client } = await seedFull();
+    const result = await client.callTool({
+      name: "update",
+      arguments: { id, manifest: { triggers: null } },
+    });
+    expect(result.isError).toBeFalsy();
+    const m = read(id)?.manifest;
+    expect(m?.triggers).toBeUndefined();
+    expect(m?.description).toBe("Every field set");
+    expect(m?.loadingStrategy).toBe("always");
+    expect(m?.priority).toBe(40);
+    expect(m?.toolAffinity).toEqual(["gmail__*"]);
+    expect(m?.allowedTools).toEqual(["files__read"]);
+  });
+
+  test("a required field takes no null, and nothing is written", async () => {
+    const { id, client } = await seedFull();
+    const before = readFileSync(id, "utf-8");
+    const result = await client.callTool({
+      name: "update",
+      arguments: { id, manifest: { description: null } },
+    });
+    expect(result.isError).toBe(true);
+    expect(readFileSync(id, "utf-8")).toBe(before);
+  });
+
+  test("the schema declares each clear as anyOf [T, null], and description has none", async () => {
+    const src = await buildSource();
+    const { tools } = await src.getClient()!.listTools();
+    const update = tools.find((t) => t.name === "update");
+    if (!update) throw new Error("no update tool");
+    const manifest = (
+      update.inputSchema.properties as Record<string, { properties: Record<string, unknown> }>
+    ).manifest;
+    for (const field of [
+      "loadingStrategy",
+      "priority",
+      "toolAffinity",
+      "triggers",
+      "allowedTools",
+    ]) {
+      const prop = manifest?.properties[field] as { anyOf?: Array<{ type?: string }> };
+      expect(prop.anyOf?.some((branch) => branch.type === "null")).toBe(true);
+    }
+    expect(JSON.stringify(manifest?.properties.description)).not.toContain('"null"');
+  });
+});
+
+// ── the Skills editor's per-field saves ──────────────────────────────────
+
+// The editor saves one field at a time through `skillEditPatch`; these send
+// exactly what it sends, so a body save and a field save are checked against
+// the real handler, not a hand-written input.
+describe("skills__update — the Skills editor's per-field saves", () => {
+  async function seed(): Promise<{
+    id: string;
+    client: NonNullable<ReturnType<McpSource["getClient"]>>;
+  }> {
+    const src = await buildSource();
+    const client = src.getClient()!;
+    await client.callTool({
+      name: "create",
+      arguments: {
+        scope: "org",
+        manifest: {
+          name: "edited",
+          description: "Edited",
+          loadingStrategy: "always",
+          priority: 40,
+        },
+        body: "Original.",
+      },
+    });
+    return { id: join(workDir, "skills", "edited.md"), client };
+  }
+
+  const read = (id: string) => parseSkillContent(readFileSync(id, "utf-8"), id, { cap: false });
+
+  test("a field save leaves the body alone, and a body save leaves the fields alone", async () => {
+    const { id, client } = await seed();
+
+    const field = await client.callTool({
+      name: "update",
+      arguments: { ...skillEditPatch(id, "triggers", "ship it") },
+    });
+    expect(field.isError).toBeFalsy();
+    expect(read(id)?.body).toBe("Original.");
+    expect(read(id)?.manifest.triggers).toEqual(["ship it"]);
+
+    const body = await client.callTool({
+      name: "update",
+      arguments: { ...skillEditPatch(id, "body", "Rewritten.") },
+    });
+    expect(body.isError).toBeFalsy();
+    const written = read(id);
+    expect(written?.body).toBe("Rewritten.");
+    expect(written?.manifest.triggers).toEqual(["ship it"]);
+    expect(written?.manifest.priority).toBe(40);
+    expect(written?.manifest.loadingStrategy).toBe("always");
+  });
+
+  test("a list emptied in the editor is cleared from the file", async () => {
+    const { id, client } = await seed();
+    await client.callTool({
+      name: "update",
+      arguments: { ...skillEditPatch(id, "triggers", "ship it") },
+    });
+    await client.callTool({
+      name: "update",
+      arguments: { ...skillEditPatch(id, "toolAffinity", "gmail__*") },
+    });
+    for (const field of ["triggers", "toolAffinity"] as const) {
+      const result = await client.callTool({
+        name: "update",
+        arguments: { ...skillEditPatch(id, field, "  \n ") },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(read(id)?.manifest[field]).toBeUndefined();
+    }
+    expect(read(id)?.manifest.priority).toBe(40);
+  });
+
+  test("a header kept as text in the body sets no field", async () => {
+    const { id, client } = await seed();
+    const header = [
+      "---",
+      "name: edited",
+      "description: Hijacked.",
+      "metadata:",
+      "  nimblebrain:",
+      "    loading-strategy: dynamic",
+      "    priority: 70",
+      "---",
+      "",
+      "Prose about headers.",
+    ].join("\n");
+    const result = await client.callTool({
+      name: "update",
+      arguments: { ...skillEditPatch(id, "body", header, { keepHeaderAsText: true }) },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(
+      (result.structuredContent as { frontmatterApplied?: string[] }).frontmatterApplied,
+    ).toBeUndefined();
+    const written = read(id);
+    expect(written?.manifest.description).toBe("Edited");
+    expect(written?.manifest.loadingStrategy).toBe("always");
+    expect(written?.manifest.priority).toBe(40);
+    expect(written?.body).toContain("Hijacked.");
+  });
+});
+
 // ── read (regression: existence-first ordering) ──────────────────────────
 
 // Mirrors the update-side regression at line 305. The read handler picked
@@ -963,14 +1157,14 @@ describe("skills__read — full body (no prompt-cap leak)", () => {
     const src = await buildSource();
     const client = src.getClient()!;
     const body = `${"x".repeat(MAX_SKILL_BODY_CHARS * 2)}\nEND_MARKER_KEEP_ME`;
-    await client.callTool({
-      name: "create",
-      arguments: {
-        scope: "org",
-        manifest: { name: "oversized", description: "test", type: "skill" },
-        body,
-      },
-    });
+    // Seeded on disk: an authored write refuses a body this long, but files
+    // over the cap still exist (written before the rule, or by other means).
+    mkdirSync(join(workDir, "skills"), { recursive: true });
+    writeFileSync(
+      join(workDir, "skills", "oversized.md"),
+      `---\nname: oversized\ndescription: test\n---\n${body}\n`,
+      "utf-8",
+    );
     const result = await client.callTool({
       name: "read",
       arguments: { id: join(workDir, "skills", "oversized.md") },
@@ -982,6 +1176,150 @@ describe("skills__read — full body (no prompt-cap leak)", () => {
     // skills__update would silently lose user-authored content.
     expect(text).toContain("END_MARKER_KEEP_ME");
     expect(text.length).toBeGreaterThan(MAX_SKILL_BODY_CHARS);
+    // The reader is told how much of it never reaches the model.
+    expect(text).toContain(`over-limit-by: ${body.length - MAX_SKILL_BODY_CHARS} characters`);
+    expect((result.structuredContent as { overLimitBy?: number }).overLimitBy).toBe(
+      body.length - MAX_SKILL_BODY_CHARS,
+    );
+  });
+});
+
+describe("skill body size — a skill the platform cannot deliver whole is not saved", () => {
+  const text = (r: unknown) =>
+    ((r as { content: Array<{ text?: string }> }).content ?? []).map((c) => c.text ?? "").join("");
+
+  function seedOversized(name: string, chars: number): string {
+    const path = join(workDir, "skills", `${name}.md`);
+    mkdirSync(join(workDir, "skills"), { recursive: true });
+    writeFileSync(
+      path,
+      `---\nname: ${name}\ndescription: test\n---\n${"y".repeat(chars)}\n`,
+      "utf-8",
+    );
+    return path;
+  }
+
+  test("create refuses a body over the limit and writes nothing", async () => {
+    const client = (await buildSource()).getClient()!;
+    const result = await client.callTool({
+      name: "create",
+      arguments: {
+        scope: "org",
+        manifest: { name: "too-long", description: "test" },
+        body: "z".repeat(MAX_SKILL_BODY_CHARS + 1),
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain("Not saved");
+    expect(text(result)).toContain("split the skill into two");
+    expect(existsSync(join(workDir, "skills", "too-long.md"))).toBe(false);
+  });
+
+  test("a body of exactly the limit is saved", async () => {
+    const client = (await buildSource()).getClient()!;
+    const result = await client.callTool({
+      name: "create",
+      arguments: {
+        scope: "org",
+        manifest: { name: "at-limit", description: "test" },
+        body: "z".repeat(MAX_SKILL_BODY_CHARS),
+      },
+    });
+    expect(result.isError).toBeFalsy();
+  });
+
+  test("a pasted SKILL.md is measured without its frontmatter", async () => {
+    const client = (await buildSource()).getClient()!;
+    const frontmatter = `---\nname: pasted-at-limit\ndescription: ${"d".repeat(200)}\n---\n`;
+    const result = await client.callTool({
+      name: "create",
+      arguments: {
+        scope: "org",
+        manifest: { name: "pasted-at-limit", description: "test" },
+        body: `${frontmatter}${"z".repeat(MAX_SKILL_BODY_CHARS)}`,
+      },
+    });
+    expect(result.isError).toBeFalsy();
+  });
+
+  test("append past the limit is refused, leaving no file change and no snapshot", async () => {
+    const client = (await buildSource()).getClient()!;
+    await client.callTool({
+      name: "create",
+      arguments: {
+        scope: "org",
+        manifest: { name: "growing", description: "test" },
+        body: "z".repeat(MAX_SKILL_BODY_CHARS - 10),
+      },
+    });
+    const id = join(workDir, "skills", "growing.md");
+    const before = readFileSync(id, "utf-8");
+    const result = await client.callTool({
+      name: "update",
+      arguments: { id, body: "One more rule, dated today.", body_mode: "append" },
+    });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain("rather than appending");
+    expect(readFileSync(id, "utf-8")).toBe(before);
+    const versions = join(workDir, "skills", "_versions");
+    const snapshots = existsSync(versions)
+      ? readdirSync(versions).filter((f) => f.startsWith("growing."))
+      : [];
+    expect(snapshots).toEqual([]);
+  });
+
+  test("an over-limit skill can be edited when the edit does not grow it, and is told it is still over", async () => {
+    const id = seedOversized("legacy-long", MAX_SKILL_BODY_CHARS + 500);
+    const client = (await buildSource()).getClient()!;
+    const result = await client.callTool({
+      name: "update",
+      arguments: { id, body: "y".repeat(MAX_SKILL_BODY_CHARS + 400), body_mode: "replace" },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(text(result)).toContain("still 400 characters over");
+  });
+
+  test("an over-limit skill cannot grow, by replace or by append", async () => {
+    const id = seedOversized("legacy-grow", MAX_SKILL_BODY_CHARS + 500);
+    const client = (await buildSource()).getClient()!;
+    const replaced = await client.callTool({
+      name: "update",
+      arguments: { id, body: "y".repeat(MAX_SKILL_BODY_CHARS + 501), body_mode: "replace" },
+    });
+    expect(replaced.isError).toBe(true);
+    const appended = await client.callTool({
+      name: "update",
+      arguments: { id, body: "x", body_mode: "append" },
+    });
+    expect(appended.isError).toBe(true);
+  });
+
+  test("restoring an over-limit snapshot succeeds and says it is over", async () => {
+    const id = seedOversized("legacy-restore", MAX_SKILL_BODY_CHARS + 300);
+    const client = (await buildSource()).getClient()!;
+    const shrunk = await client.callTool({
+      name: "update",
+      arguments: { id, body: "short now", body_mode: "replace" },
+    });
+    expect(shrunk.isError).toBeFalsy();
+    const [snapshot] = listSkillVersions(id);
+    expect(snapshot).toBeDefined();
+    const restored = await client.callTool({
+      name: "restore",
+      arguments: { id, version: snapshot!.version },
+    });
+    expect(restored.isError).toBeFalsy();
+    expect(text(restored)).toContain("still 300 characters over");
+  });
+
+  test("a manifest-only patch on an over-limit skill is not refused on size", async () => {
+    const id = seedOversized("legacy-manifest", MAX_SKILL_BODY_CHARS + 500);
+    const client = (await buildSource()).getClient()!;
+    const result = await client.callTool({
+      name: "update",
+      arguments: { id, manifest: { description: "new description" } },
+    });
+    expect(result.isError).toBeFalsy();
   });
 });
 
@@ -1070,7 +1408,7 @@ describe("durable status is set_status only", () => {
   });
 
   test("update refuses manifest.status — set_status is the only durable door", async () => {
-    // The schema no longer declares the field, but the validator lets unknown
+    // The schema does not declare the field, but the validator lets unknown
     // keys through, so a silent drop would report a disable that never
     // happened. Refuse instead, and say where the capability lives.
     const src = await buildSource();
@@ -1271,11 +1609,14 @@ describe("cross-workspace access — regression", () => {
     runtime.wsId = "ws_00148bca567ef156";
     // Alice is admin in ws_00148bca567ef156. ws_005820c54ca342ad has no Alice membership.
     runtime.setMember("ws_00148bca567ef156", "u_alice", "admin");
-    runtime.workspaces.set("ws_005820c54ca342ad", {
-      id: "ws_005820c54ca342ad",
-      name: "Other",
-      members: [{ userId: "u_carol", role: "admin" }],
-    });
+    runtime.workspaces.set(
+      "ws_005820c54ca342ad",
+      makeWorkspace({
+        id: "ws_005820c54ca342ad",
+        name: "Other",
+        members: [{ userId: "u_carol", role: "admin" }],
+      }),
+    );
     // Pre-stage a skill under ws_005820c54ca342ad, on disk.
     const otherDir = join(workDir, "workspaces", "ws_005820c54ca342ad", "skills");
     mkdirSync(otherDir, { recursive: true });
@@ -1398,7 +1739,7 @@ describe("cross-workspace access — regression", () => {
       id: "u_alice",
       email: "alice@ex.com",
       displayName: "Alice",
-      orgRole: "owner", // even owner — strict policy denies cross-user
+      orgRole: "admin", // even an org admin — strict policy denies cross-user
       preferences: { timezone: "UTC", locale: "en-US", theme: "system" },
     };
     const otherUserDir = join(workDir, "users", "u_carol", "skills");

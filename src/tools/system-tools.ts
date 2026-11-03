@@ -4,12 +4,12 @@ import type { CatalogListing } from "../connectors/catalog/types.ts";
 import { textContent } from "../engine/content-helpers.ts";
 import type { EventSink, ToolPromotionControls, ToolResult, ToolSchema } from "../engine/types.ts";
 import { isModelVisible, NON_ADVANCING_META_KEY } from "../engine/types.ts";
+import { MAX_TOOL_RESULT_CHARS } from "../limits.ts";
 import { log } from "../observability/log.ts";
 import { createUseSkillToolDef } from "../platform/skills/source.ts";
 import { getRequestContext } from "../runtime/request-context.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import { hydrateSkill } from "../skills/connector-skills.ts";
-import type { SelectedSkill } from "../skills/select.ts";
 import { approxTokens } from "../skills/tokens.ts";
 import type { Skill } from "../skills/types.ts";
 import { createManageConnectorsTool } from "./connector-tools.ts";
@@ -78,7 +78,7 @@ export async function createSystemTools(
     {
       name: "search",
       description:
-        "Search installed tools by keyword (scope: tools) or the connector catalog for servers to install (scope: catalog). Returns matches as a list; to call a matched tool, activate it first with nb__manage_tools.",
+        "Search installed tools by keyword (scope: tools) or the connector catalog for servers to install (scope: catalog). Returns matches as a list; to call a matched tool that is not already in your tool list, activate it first with nb__manage_tools.",
       inputSchema: {
         type: "object",
         properties: {
@@ -171,10 +171,37 @@ export async function createSystemTools(
 /** Core skills ship with the package under src/skills/core/. */
 const CORE_SKILL_MARKER = "/skills/core/";
 
-/** Maximum characters returned from a single read_resource call.
- *  Matches the focused-app skill budget so a connector-advertised `skill://` resource
- *  fits into the LLM's context without blowing past it. */
-const READ_RESOURCE_MAX_CHARS = 12_000;
+/**
+ * Most characters a `skill://` read returns. Matches the focused-app skill
+ * budget: a skill is guidance loaded alongside other context, and one larger
+ * than this is a skill to split, not one to load whole.
+ */
+const SKILL_READ_MAX_CHARS = 12_000;
+
+/**
+ * Room left under {@link MAX_TOOL_RESULT_CHARS} for the truncation note, so a
+ * cut read stays under the engine's own bound and is never cut a second time
+ * under a note that says the rest is on the user's screen.
+ */
+const TRUNCATION_NOTE_RESERVE = 400;
+
+/**
+ * Most characters any other read returns: a connector's record (a contact with
+ * a long dossier, say) is read whole up to the limit every tool result has.
+ */
+export const RECORD_READ_MAX_CHARS = MAX_TOOL_RESULT_CHARS - TRUNCATION_NOTE_RESERVE;
+
+/**
+ * The agent's own resource read, by its qualified name. A run whose tool limit
+ * does not allow it reads no connector's resources, directly or through a
+ * tool's resource arguments.
+ */
+export const READ_RESOURCE_TOOL = "nb__read_resource";
+
+/** The read limit for `uri`: the skill budget for `skill://`, the tool-result limit otherwise. */
+function readLimitFor(uri: string): number {
+  return uri.toLowerCase().startsWith("skill:") ? SKILL_READ_MAX_CHARS : RECORD_READ_MAX_CHARS;
+}
 
 /**
  * Creates the nb__read_resource system tool.
@@ -190,7 +217,7 @@ function createReadResourceTool(getRegistry: () => ToolRegistry): InProcessTool 
   return {
     name: "read_resource",
     description:
-      "Read a resource published by an installed app or by the platform. Use this when an app's instructions tell you to load a specific resource, or when you need to inspect platform-published context (e.g. saved overlay instructions). Supported URI schemes include " +
+      "Read a resource published by an installed app or by the platform. Use this when an app's instructions tell you to load a specific resource, when you need to inspect platform-published context, or to read one of an app's records whole: the URI shapes an app serves are listed under it in an `app-resource-templates` block, and its tool results often carry a record's `uri`. Supported URI schemes include " +
       `${READ_RESOURCE_SCHEMES_PROSE}, and any connector-published scheme matching the connector's source name. ` +
       "Pass the full URI; the content comes back as text in the tool result.",
     inputSchema: {
@@ -241,7 +268,7 @@ async function readResourceFromSource(
     const data = await source.readResource(uri);
     if (data == null) return null;
     if (typeof data.text === "string") {
-      return formatResourceText(data.text);
+      return formatResourceText(data.text, readLimitFor(uri));
     }
     if (data.blob) {
       return {
@@ -258,12 +285,17 @@ async function readResourceFromSource(
   }
 }
 
-/** Format a text resource body, truncating past READ_RESOURCE_MAX_CHARS. */
-function formatResourceText(full: string): ToolResult {
-  const truncated = full.length > READ_RESOURCE_MAX_CHARS;
-  const body = truncated
-    ? `${full.slice(0, READ_RESOURCE_MAX_CHARS)}\n\n[truncated — resource exceeds ${READ_RESOURCE_MAX_CHARS} chars]`
-    : full;
+/**
+ * Format a text resource body, cutting it at `limit`. The note says what the
+ * model holds and where the rest is: this tool returns no more of the
+ * resource, and nothing else put the remainder in front of the user.
+ */
+function formatResourceText(full: string, limit: number): ToolResult {
+  if (full.length <= limit) return { content: textContent(full), isError: false };
+  const body =
+    `${full.slice(0, limit)}\n\n[truncated: showing the first ${limit} of ${full.length} chars. ` +
+    "read_resource returns no more of this resource; the rest is held only by the app that " +
+    "published it. For a field past this point, use that app's own tools.]";
   return { content: textContent(body), isError: false };
 }
 
@@ -420,41 +452,44 @@ async function handleSkillStatus(
   nameQuery: string | null,
   wsId: string,
 ): Promise<ToolResult> {
-  // Report through the SAME per-request path `chat` composes with
-  // (`describeRequestSkills` → `selectRequestLayer3`), so workspace- and
-  // user-tier skills that actually load into the prompt appear here — the old
-  // path read a boot-time cache and reported only platform/core skills.
-  const { context, layer3 } = await runtime.describeRequestSkills(wsId);
-  // Legacy trigger-matched skills still come from the boot matcher cache.
+  // Report through the SAME per-request loaders `chat` composes with
+  // (`describeRequestSkills`), so workspace- and user-tier skills appear here:
+  // a boot-time cache would report only platform/core skills.
+  const { context, bound } = await runtime.describeRequestSkills(wsId);
+  // Trigger-matched skills come from the boot matcher cache.
   const matchable = getSkills?.().matchable ?? [];
-  const layer3Names = new Set(layer3.map((s) => s.skill.manifest.name));
+  const boundNames = new Set(bound.map((s) => s.manifest.name));
 
   // Single skill detail view
   if (nameQuery) {
-    return await skillDetailResult(context, layer3, matchable, nameQuery);
+    return await skillDetailResult(context, bound, matchable, nameQuery);
   }
 
   // Overview: categorize all skills
   const coreContext = context.filter((s) => s.sourcePath.includes(CORE_SKILL_MARKER));
   const coreNames = new Set(coreContext.map((s) => s.manifest.name));
-  // Non-core boot context skills, minus any that ALSO surface in the
-  // per-request Layer-3 set below — otherwise the same skill lists twice.
+  // Non-core boot context skills, minus any that ALSO surface in the bound
+  // set below — otherwise the same skill lists twice.
   const userContext = context.filter(
-    (s) => !s.sourcePath.includes(CORE_SKILL_MARKER) && !layer3Names.has(s.manifest.name),
+    (s) => !s.sourcePath.includes(CORE_SKILL_MARKER) && !boundNames.has(s.manifest.name),
   );
   // A skill already shown under "Core Skills (immutable)" is not repeated in
-  // the Layer-3 sections — Core is authoritative. Deduped BY NAME (not by a
+  // the bound section — Core is authoritative. Deduped BY NAME (not by a
   // `/skills/core/` path marker), so a non-core skill that merely lives under
-  // a `core/` subfolder keeps its own name and is never wrongly hidden.
-  // Layer 3 is the conditional channel: only tool-affinity skills load here.
-  // `always` skills compose into the context channel (shown in the sections above).
-  const toolAffined = layer3.filter((s) => !coreNames.has(s.skill.manifest.name));
+  // a `core/` subfolder keeps its own name and is never wrongly hidden. A bound
+  // skill is not in the prompt: it reaches the model before the first call to
+  // a tool it names (ADR-0053).
+  const boundSkills = bound.filter((s) => !coreNames.has(s.manifest.name));
 
   const sections = [
     formatAlwaysOnCost(context),
     buildSkillSection("## Core Skills (immutable)", coreContext, formatSkillSummary),
     buildSkillSection("## User Context Skills (always active)", userContext, formatSkillSummary),
-    buildSkillSection("## Tool-Affined Skills (active)", toolAffined, formatLayer3Summary),
+    buildSkillSection(
+      "## Bound Skills (delivered before their tool's first call)",
+      boundSkills,
+      formatBoundSummary,
+    ),
     buildSkillSection("## Matchable Skills (triggered)", matchable, formatMatchableSummary),
   ].filter((s): s is string => s !== null);
 
@@ -518,11 +553,11 @@ function formatAlwaysOnCost(context: readonly Skill[]): string | null {
  */
 async function skillDetailResult(
   context: readonly Skill[],
-  layer3: readonly SelectedSkill[],
+  bound: readonly Skill[],
   matchable: readonly Skill[],
   nameQuery: string,
 ): Promise<ToolResult> {
-  const all = [...context, ...layer3.map((s) => s.skill), ...matchable];
+  const all = [...context, ...bound, ...matchable];
   const found = all.find((s) => s.manifest.name.toLowerCase() === nameQuery.toLowerCase());
   if (!found) {
     return {
@@ -650,11 +685,11 @@ function formatSkillSummary(skill: Skill): string {
   return `- ${m.name} (${m.loadingStrategy}, priority ${m.priority}) — ${m.description || "(no description)"}`;
 }
 
-/** Summary line for a per-request Layer-3 skill, including why it loaded. */
-function formatLayer3Summary(selected: SelectedSkill): string {
-  const m = selected.skill.manifest;
+/** Summary line for a bound skill, with the tool patterns that deliver it. */
+function formatBoundSummary(skill: Skill): string {
+  const m = skill.manifest;
   const scope = m.scope ?? "org";
-  return `- ${m.name} (${scope}, priority ${m.priority}) — ${m.description || "(no description)"}\n  Loaded: ${selected.reason}`;
+  return `- ${m.name} (${scope}, priority ${m.priority}) — ${m.description || "(no description)"}\n  Bound to: ${(m.toolAffinity ?? []).join(", ")}`;
 }
 
 function formatMatchableSummary(skill: Skill): string {
@@ -867,7 +902,7 @@ async function searchTools(
     lines.push(`- **${t.name}**: ${desc.length > 100 ? `${desc.slice(0, 100)}…` : desc}`);
   }
   lines.push(
-    "\nTo call one, activate it with nb__manage_tools first (that surfaces its full schema).",
+    "\nA match already in your tool list can be called directly. To call one that is not, activate it with nb__manage_tools first. Its schema reaches you on your next message, so promote and call in separate messages, never in the same one.",
   );
   return {
     content: textContent(lines.join("\n")),

@@ -1,10 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildThemeStyleBlock,
   DARK_TOKENS,
+  getModeExtensionTokens,
+  getSpecThemeTokens,
   getThemeTokens,
   LIGHT_TOKENS,
+  setThemePalette,
 } from "../../../web/src/bridge/theme.ts";
+import { mergePalette } from "../../../web/src/theme/brand.ts";
+import { colors, radiusScale, spacing } from "../../../web/src/theme/palette.ts";
+import { ACME_BRAND } from "../../helpers/acme-brand.ts";
 
 /**
  * What the injected map must CONTAIN is asserted where it can stay true on its
@@ -75,4 +81,55 @@ describe("buildThemeStyleBlock", () => {
     const tokens = getThemeTokens("light");
     expect(tokens["--font-sans"]).toBe("'Hanken Grotesk', system-ui, sans-serif");
   });
+});
+
+describe("a brand's palette reaches the iframe", () => {
+  afterEach(() => setThemePalette());
+
+  test("the brand accent reaches both channels once the palette is set", () => {
+    setThemePalette(mergePalette(ACME_BRAND));
+    // Mode-independent spec keys ride the style block; the mode-varying accent
+    // rides the extension the host re-sends on every theme change.
+    expect(buildThemeStyleBlock("light")).toContain("--color-ring-primary: #B53707;");
+    expect(buildThemeStyleBlock("dark")).toContain("--color-ring-primary: #FF8A4C;");
+    expect(getModeExtensionTokens("light")["--color-text-accent"]).toBe("#B53707");
+    expect(getModeExtensionTokens("dark")["--color-text-accent"]).toBe("#FF8A4C");
+    expect(getThemeTokens("light")["--font-sans"]).toBe(ACME_BRAND.fonts?.sans?.stack);
+    expect(getThemeTokens("light")["--border-radius-md"]).toBe(radiusScale["--border-radius-md"]);
+  });
+
+  test("setting no palette restores the canonical tokens", () => {
+    setThemePalette(mergePalette(ACME_BRAND));
+    setThemePalette();
+    expect(getThemeTokens("light")["--color-text-accent"]).toBe(colors.primary[0]);
+  });
+});
+
+/**
+ * An app gets the host's wide and narrow gutter and nothing that fixes its
+ * gutter. The kit reads `--nb-gutter` at every width, so a host that sent it
+ * would stop an app's gutter narrowing. The values are the same in both modes,
+ * so they travel in the style block.
+ */
+describe("the page gutter reaches an app as its wide and narrow values", () => {
+  for (const mode of ["light", "dark"] as const) {
+    test(`${mode}: the style block carries both gutter values from the palette`, () => {
+      const block = buildThemeStyleBlock(mode);
+      expect(block).toContain(`  --nb-gutter-wide: ${spacing.gutter};`);
+      expect(block).toContain(`  --nb-gutter-narrow: ${spacing.gutterNarrow};`);
+    });
+
+    test(`${mode}: --nb-gutter is sent on no channel`, () => {
+      expect(buildThemeStyleBlock(mode)).not.toMatch(/--nb-gutter\s*:/);
+      expect(getSpecThemeTokens(mode)["--nb-gutter"]).toBeUndefined();
+      expect(getModeExtensionTokens(mode)["--nb-gutter"]).toBeUndefined();
+    });
+
+    test(`${mode}: the gutter values stay off the protocol fields`, () => {
+      for (const key of ["--nb-gutter-wide", "--nb-gutter-narrow"]) {
+        expect(getSpecThemeTokens(mode)[key]).toBeUndefined();
+        expect(getModeExtensionTokens(mode)[key]).toBeUndefined();
+      }
+    });
+  }
 });

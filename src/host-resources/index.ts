@@ -19,3 +19,27 @@ export type {
   ListResourcesParams,
 } from "./resolver.ts";
 export { FileBackedHostResourcesResolver } from "./resolver.ts";
+export type {
+  RecordArgumentsGrant,
+  ResourceArgumentEntries,
+  ResourceArgumentEntry,
+  ResourceArgumentErrorCode,
+  ResourceArgumentResolution,
+  ResourceArgumentSpec,
+  ResourceArgumentsContext,
+  ResourceArgumentsDeclaration,
+  ResourceArgumentsLimits,
+  ResourceArgumentsResolver,
+  ResourceArgumentsResolverDeps,
+  ResourceArgumentTextContents,
+  ResourceServingSource,
+} from "./resource-arguments.ts";
+export {
+  collectResourceArgumentUris,
+  createResourceArgumentsResolver,
+  parseResourceArgumentsDeclaration,
+  RESOURCE_ARGUMENT_SPAN_EVENT,
+  RESOURCE_ARGUMENTS_EXTENSION_ID,
+  RESOURCE_ARGUMENTS_MAX_URIS,
+  resourceArgumentsClientExtension,
+} from "./resource-arguments.ts";

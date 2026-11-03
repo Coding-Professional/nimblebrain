@@ -1,13 +1,12 @@
 /**
  * The ledger, end to end: a real turn spends, and `usage__report` reads it back.
  *
- * This is the regression test for the defect the ledger exists to fix. Usage
- * used to be derived from a storage side effect — a conversation JSONL
- * happening to exist — so a task run, which persists no conversation, spent
- * money the report could not see. The first test below runs `executeTask` and
- * asserts the spend appears. Before the ledger it did not, and no unit test
- * could have caught that, because the gap was between the writer and the
- * reader rather than inside either.
+ * This guards the defect the ledger exists to prevent. Usage derived from a
+ * storage side effect — a conversation JSONL happening to exist — would miss a
+ * task run, which persists no conversation. The first test below runs
+ * `executeTask` and asserts the spend appears. No unit test can catch that,
+ * because the gap is between the writer and the reader rather than inside
+ * either.
  */
 
 import { afterEach, expect, test } from "bun:test";
@@ -108,7 +107,31 @@ test("a chat turn counts as a conversation, and both land in one report", async 
   expect(byOrigin.task).toBeGreaterThan(0);
 });
 
-test("ownerFilter fails closed on a line with no userId", async () => {
+test("a conversation's title call is recorded under the turn that forked it", async () => {
+  const rt = await start();
+  await rt.chat({
+    identity: TEST_IDENTITY,
+    workspaceId: TEST_WORKSPACE_ID,
+    message: "hello",
+  });
+
+  // Title generation is forked after the turn returns, so its line lands later.
+  let title: UsageLedgerEntry | undefined;
+  for (let i = 0; i < 50 && !title; i++) {
+    title = readLines().find((l) => l.source === "title");
+    if (!title) await Bun.sleep(20);
+  }
+  expect(title).toBeDefined();
+  const turn = readLines().filter((l) => l.source === "main");
+  expect(turn.length).toBeGreaterThan(0);
+  const turnRunId = turn[0]?.runId;
+  expect(turnRunId).toBeDefined();
+  // The model gateway charges the title call to the turn's run (it runs under
+  // the run's credential subject), so the ledger names the same run.
+  expect(title?.runId).toBe(turnRunId);
+});
+
+test("ownerFilter reads only the owner's own lines", async () => {
   const rt = await start();
   await rt.chat({
     identity: TEST_IDENTITY,
@@ -119,8 +142,7 @@ test("ownerFilter fails closed on a line with no userId", async () => {
   const mine = await aggregateUsage(workDir, "month", "day", { ownerFilter: TEST_IDENTITY.id });
   expect(mine.totals.llmCalls).toBeGreaterThan(0);
 
-  // Someone else's view must not see it, and neither must a filtered read see a
-  // line whose owner is unknown — the case the predicate has to fail closed on.
+  // Someone else's view must not see it.
   const theirs = await aggregateUsage(workDir, "month", "day", { ownerFilter: "usr_someone_else" });
   expect(theirs.totals.llmCalls).toBe(0);
 });
@@ -128,20 +150,21 @@ test("ownerFilter fails closed on a line with no userId", async () => {
 test("an unpriced line reports its tokens and is counted, not billed as zero", async () => {
   await start();
 
-  // Unpriced lines arise from backfill, not from live writes: the writer
-  // resolves rates whenever the catalog knows the model, and a backfilled
-  // task run has no model recorded at all. So this writes the shape
-  // backfill produces and reads it back, which is where the distinction has to
-  // hold — the reader is what decides whether "no price" reads as "free".
+  // The writer stores rates whenever the catalog knows the model, so an
+  // unpriced line is one for a model the catalog has never known. This writes
+  // that shape and reads it back, which is where the distinction has to hold —
+  // the reader is what decides whether "no price" reads as "free".
   const month = usageMonthOf(new Date());
   mkdirSync(usageMonthDir(workDir, month), { recursive: true });
   const line: UsageLedgerEntry = {
     ts: new Date().toISOString(),
     source: "main",
     origin: "task",
-    model: "unknown",
+    model: "acme:uncatalogued-model",
     usage: { inputTokens: 1_000_000, outputTokens: 500_000 },
     llmMs: 0,
+    userId: TEST_IDENTITY.id,
+    workspaceId: TEST_WORKSPACE_ID,
   };
   writeFileSync(join(usageMonthDir(workDir, month), "backfill.jsonl"), `${JSON.stringify(line)}\n`);
 

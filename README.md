@@ -130,7 +130,7 @@ Three port interfaces isolate concerns:
 |------|---------|----------------|
 | `ModelPort` | LLM provider | `AnthropicModelAdapter` (prompt caching), `EchoModelAdapter` (tests) |
 | `ToolRouter` | Tool discovery + execution | `ToolRegistry` (MCP sources + inline sources), `StaticToolRouter` (tests) |
-| `EventSink` | Observability | `StructuredLogSink`, `WorkspaceLogSink`, `SseEventManager`, `ConsoleEventSink`, `DebugEventSink`, `NoopEventSink` |
+| `EventSink` | Observability | `WorkspaceLogSink`, `SseEventManager`, `ConsoleEventSink`, `DebugEventSink`, `NoopEventSink` |
 
 ### System Tools
 
@@ -140,7 +140,7 @@ All system tools are prefixed with `nb__` (the `nb` source name + `__` separator
 |-----------|---------|
 | `nb__status` | Platform status: overview, connectors, skills, or config (scope param) |
 | `nb__search` | Unified search: installed tools or the connector catalog (scope param) |
-| `nb__read_resource` | Read a `skill://` / `ui://` resource from an installed app's MCP server |
+| `nb__read_resource` | Read a resource from an installed app's MCP server: a `skill://` or `ui://` resource, or one of the app's records by URI |
 | `nb__set_preferences` | Set user preferences (name, timezone, theme) |
 | `nb__manage_tools` | Promote/release tools in the active set |
 
@@ -291,6 +291,7 @@ The working directory is set via `NB_WORK_DIR` (see Environment Variables).
 | `ANTHROPIC_API_KEY` | Anthropic API key (required unless set via `providers.anthropic.apiKey`) |
 | `OPENAI_API_KEY` | OpenAI API key (when using `openai:*` model slots) |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | Google Gemini API key (when using `google:*` model slots) |
+| `GREENPT_API_KEY` | GreenPT API key (when using `greenpt:*` model slots) |
 | `NEBIUS_API_KEY` | Nebius Token Factory API key (when using `nebius:*` model slots) |
 | `XAI_API_KEY` | xAI API key (when using `xai:*` model slots) |
 
@@ -300,8 +301,6 @@ The working directory is set via `NB_WORK_DIR` (see Environment Variables).
 |----------|---------|
 | `NB_WORK_DIR` | Override working directory (takes precedence over config) |
 | `ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (for cookie-based auth) |
-| `MCP_MAX_SESSIONS` | Max concurrent MCP sessions before LRU eviction kicks in (default: 100) |
-| `MCP_SESSION_TTL_SECONDS` | MCP session idle TTL in seconds; drives both transport-map sweep and registry TTL (default: 28800, i.e. 8h) |
 | `NB_CHAT_RATE_LIMIT` | Chat requests per minute per user (default: 20) |
 | `NB_TOOL_RATE_LIMIT` | Tool calls per minute per user (default: 60) |
 | `NB_CONNECTOR_START_CONCURRENCY` | Max connectors started in parallel at boot (default: 4, set to 1 for sequential) |
@@ -415,7 +414,6 @@ src/
 │   ├── user-tools.ts     User management tools
 │   └── conversation-tools.ts   Conversation sharing tools
 ├── adapters/             Pluggable implementations
-│   ├── structured-log-sink.ts   Per-conversation JSONL logs with cost
 │   ├── workspace-log-sink.ts    Workspace-level daily JSONL logs
 │   ├── console-events.ts        Stderr event logging
 │   ├── debug-events.ts          Verbose debug logging
@@ -516,7 +514,7 @@ User-uploaded files are persisted in the workspace `FileStore` and referenced fr
 
 Pluggable authentication via `IdentityProvider` interface (`src/identity/provider.ts`). Configured via `instance.json` in the work directory:
 
-- **`dev`** — No login: every request is one local developer (`usr_default`, org owner). Chosen only by writing `{"auth":{"adapter":"dev"}}`.
+- **`dev`** — No login: every request is one local developer (`usr_default`, org admin). Chosen only by writing `{"auth":{"adapter":"dev"}}`.
 - **`oidc`** — JWT verification via any OIDC provider. Auto-provisions users on first valid login.
 - **`workos`** — Full OAuth code flow with PKCE, token refresh, managed users via WorkOS. Supports MCP OAuth for external client access via AuthKit.
 
@@ -546,7 +544,7 @@ Connectors can be installed per-workspace (tracked via `ConnectorInstance.wsId`)
 
 **CORS:** The same under every identity provider: only `ALLOWED_ORIGINS` env var origins, with credentials support; with it unset, same-origin only.
 
-**MCP endpoint (`/mcp/<wsId>`):** Streamable HTTP, one per workspace; bare `/mcp` is refused. The bundled web UI's app bridge uses it, and external MCP clients (Claude, Claude Code, Cursor) connect to a workspace's URL (Workspace settings → MCP). A token from the authorization server is accepted only when its `aud` is exactly that URL, and membership of the workspace is checked on every request. 100 concurrent sessions (env: `MCP_MAX_SESSIONS`, LRU-evicted at the cap rather than 429'd), 8-hour idle TTL (env: `MCP_SESSION_TTL_SECONDS`). When `authkitDomain` is configured, returns `WWW-Authenticate` header on 401 for automatic OAuth discovery by MCP clients. Full setup guide: [MCP Endpoint](https://docs.nimblebrain.ai/api/mcp-endpoint/) and [Connecting External Clients](https://docs.nimblebrain.ai/guide/mcp-connect/) on docs.nimblebrain.ai.
+**MCP endpoint (`/mcp/<wsId>`):** Streamable HTTP, one per workspace, MCP `2026-07-28` only: each request is served on its own under its `_meta` envelope, with no session, and a request without the envelope (any 2025-era client) is refused with `400` / `-32022`; bare `/mcp` is refused. The bundled web UI's app bridge uses it, and external MCP clients (Claude, Claude Code, Cursor) connect to a workspace's URL (Workspace settings → MCP). A token from the authorization server is accepted only when its `aud` is exactly that URL, and membership of the workspace is checked on every request. When `authkitDomain` is configured, returns `WWW-Authenticate` header on 401 for automatic OAuth discovery by MCP clients. Full setup guide: [MCP Endpoint](https://docs.nimblebrain.ai/api/mcp-endpoint/) and [Connecting External Clients](https://docs.nimblebrain.ai/guide/mcp-connect/) on docs.nimblebrain.ai.
 
 **MCP resource URL:** built from the configured public origin (`NB_PUBLIC_ORIGIN`, or the forwarded custom domain / platform host), never from request headers. The authorization server needs a resource indicator covering `<origin>/mcp/*` for each public host, or it ignores the client's `resource` and every token is refused. See [MCP OAuth: the resource URL](https://docs.nimblebrain.ai/deploy/security/#mcp-oauth-the-resource-url).
 
@@ -617,7 +615,7 @@ All default to `true`. What `false` does depends on the flag: most withhold a to
 | `catalogSearch` | Catalog search | `nb__search` stays; `scope: "catalog"` returns an error |
 | `fileContext` | File upload, serving, and context extraction | The file endpoints refuse (404, or 415 on a multipart upload) |
 | `userManagement` | Create, update, and delete users | `nb__manage_users` is not registered |
-| `workspaceManagement` | Workspaces, members, sharing | `nb__manage_workspaces` is not registered |
+| `workspaceManagement` | Workspaces and members | `nb__manage_workspaces` is not registered |
 | `compaction` | Folding the oldest turns of a long conversation into a summary at run start | Full history replays every turn (event-sourced stores only) |
 
 **Enforcement.** For the flags that withhold a tool, three layers: (1) the tool is not built into its source at startup, so it reaches no tool list and no dispatcher; (2) `POST /v1/workspaces/:wsId/tools/call` returns `403 feature_disabled`; (3) MCP `tools/list` filters it and `tools/call` returns an error. `toolDiscovery`, `catalogSearch`, and `fileContext` are enforced inside the handler instead — the tool or endpoint is present and refuses. `compaction` gates no call path at all. Tools outside the table (`nb__status`, the read-only platform surfaces, `nb__search` itself) are never gated.
@@ -692,7 +690,7 @@ These are non-negotiable patterns. Violating them causes production bugs:
 | `@ai-sdk/openai` | OpenAI provider |
 | `@ai-sdk/google` | Google Gemini provider |
 | `@modelcontextprotocol/client` | MCP client to connectors: negotiates the 2026-07-28 or a 2025 protocol revision per connection (Streamable HTTP, SSE, in-memory) |
-| `@modelcontextprotocol/server` | MCP servers: platform apps (in-memory) and both legs of `/mcp/<wsId>` |
+| `@modelcontextprotocol/server` | MCP servers: platform apps (in-memory) and `/mcp/<wsId>` |
 | `ajv` + `ajv-formats` | JSON Schema validation for MCPB manifests |
 | `gray-matter` | YAML frontmatter parsing for skill files |
 | `posthog-node` | Anonymous product telemetry (server-side) |
@@ -701,7 +699,6 @@ These are non-negotiable patterns. Violating them causes production bugs:
 
 ### Observability
 
-- **`StructuredLogSink`** — Per-conversation JSONL logs with LLM/tool latency, cache tokens, cost. Disable with `logging.disabled: true`.
 - **`WorkspaceLogSink`** — Workspace-level daily rolling JSONL logs. Only persists workspace events (connector lifecycle, data/config changes, skill/file operations).
 - **`ConsoleEventSink`** — Human-readable stderr for development.
 - **`DebugEventSink`** — Verbose JSON dumps (`--debug`).

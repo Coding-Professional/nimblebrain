@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ManagedConnectorProvider } from "../../src/connectors/providers/managed-provider.ts";
@@ -11,11 +11,12 @@ import { log } from "../../src/observability/log.ts";
 import { hasMcpOAuthAuthLost, McpOAuthRecords } from "../../src/tools/mcp-oauth-records.ts";
 import { McpSource } from "../../src/tools/mcp-source.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
-import { legacyConnectorRef } from "../helpers/connector-fixtures.ts";
+import type { WorkspaceOAuthProvider } from "../../src/tools/workspace-oauth-provider.ts";
 import {
   installTestCredentialStore,
   resetTestCredentialStore,
 } from "../helpers/credential-store.ts";
+import { stub } from "../helpers/stub.ts";
 import { seedWorkspaceRoot } from "../helpers/test-workspace.ts";
 
 /**
@@ -45,7 +46,7 @@ function seedInstance(
   lifecycle: ConnectorLifecycleManager,
   serverName: string,
   wsId: string,
-  // Stage 2: only "workspace" is legal post-schema-cut.
+  // Only "workspace" is a legal scope.
   oauthScope: "workspace" = "workspace",
   ref?: ConnectorRef,
 ): ConnectorInstance {
@@ -95,20 +96,7 @@ describe("ConnectorLifecycleManager.startAuth — validation & idempotence", () 
     ).rejects.toThrow(/not installed/);
   });
 
-  test("rejects when connector ref has no URL (named or local connector)", async () => {
-    seedInstance(
-      lifecycle,
-      "stdio",
-      "ws_0076759dbbe19fcc",
-      "workspace",
-      legacyConnectorRef({ name: "@scope/stdio" }),
-    );
-    await expect(
-      lifecycle.startAuth("stdio", "ws_0076759dbbe19fcc", "_workspace", OPTS),
-    ).rejects.toThrow(/missing URL ref/);
-  });
-
-  test("rejects when principal is not the workspace principal (Stage 2: user-scope removed)", async () => {
+  test("rejects a principal other than the workspace principal", async () => {
     seedInstance(lifecycle, "granola", "ws_0076759dbbe19fcc", "workspace", {
       url: "https://example.test/mcp",
       serverName: "granola",
@@ -170,19 +158,6 @@ describe("ConnectorLifecycleManager.disconnect — symmetric teardown", () => {
     await expect(
       lifecycle.disconnect("ghost", "ws_0076759dbbe19fcc", "_workspace", { workDir: "/tmp" }),
     ).rejects.toThrow(/not installed/);
-  });
-
-  test("rejects when connector has no URL ref (revocation requires the AS URL)", async () => {
-    seedInstance(
-      lifecycle,
-      "stdio",
-      "ws_0076759dbbe19fcc",
-      "workspace",
-      legacyConnectorRef({ name: "@scope/stdio" }),
-    );
-    await expect(
-      lifecycle.disconnect("stdio", "ws_0076759dbbe19fcc", "_workspace", { workDir: "/tmp" }),
-    ).rejects.toThrow(/missing URL ref/);
   });
 
   test("transitions Connection to not_authenticated, drops the source, emits state_changed", async () => {
@@ -342,28 +317,16 @@ describe("ConnectorLifecycleManager.startAuthBackground — headless / already-a
     const resolveAuthUrl = mock((_url: string | null) => {});
     const rejectAuthUrl = mock((_err: Error) => {});
     let disarmed = false;
-    const provider = {
+    const provider = stub<WorkspaceOAuthProvider>({
       setInteractiveAuthAllowed: (v: boolean) => {
         if (!v) disarmed = true;
       },
-    };
+    });
     // A source that connects cleanly without ever driving an interactive flow.
-    const source = { start: async () => {} };
+    const source = stub<McpSource>({ start: async () => {} });
 
-    (
-      lifecycle as unknown as {
-        startAuthBackground: (a: {
-          source: unknown;
-          provider: unknown;
-          serverName: string;
-          wsId: string;
-          principalId: string;
-          getCapturedAuthUrl: () => string | undefined;
-          resolveAuthUrl: (u: string | null) => void;
-          rejectAuthUrl: (e: Error) => void;
-        }) => void;
-      }
-    ).startAuthBackground({
+    // biome-ignore lint/complexity/useLiteralKeys: `startAuthBackground` is private; bracket access is TypeScript's typed path to it
+    lifecycle["startAuthBackground"]({
       source,
       provider,
       serverName: "minted",
@@ -384,5 +347,22 @@ describe("ConnectorLifecycleManager.startAuthBackground — headless / already-a
       .byType("connection.state_changed")
       .filter((e) => (e.data as { state?: string }).state === "running");
     expect(running.length).toBe(1);
+  });
+});
+
+describe("ConnectorLifecycleManager.startIdentityAuth — record validation", () => {
+  test("refuses a personal connector row with no url instead of parsing it", async () => {
+    const userId = "usr_alice";
+    const userDir = join(workDir, "users", userId);
+    mkdirSync(userDir, { recursive: true });
+    writeFileSync(
+      join(userDir, "connectors.json"),
+      JSON.stringify({ version: 1, connectors: [{ serverName: "granola" }] }),
+    );
+    const lifecycle = new ConnectorLifecycleManager(new CapturingSink());
+
+    await expect(lifecycle.startIdentityAuth("granola", userId, { workDir })).rejects.toThrow(
+      /"granola" is not a personal connector for usr_alice/,
+    );
   });
 });

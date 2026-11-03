@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Task as McpTask } from "@modelcontextprotocol/server";
+import { TasksRunOutput } from "../../../../src/platform/schemas/tasks.ts";
 import {
   type Executor,
   isOpenRun,
@@ -20,6 +21,7 @@ import {
 import type { ToolContext } from "../../../../src/platform/tasks/server.ts";
 import {
   loadOwnerTasks,
+  loadTask,
   readIdempotencyKey,
   readRunResult,
   readRuns,
@@ -37,6 +39,7 @@ import type {
 import { createRunAdmission, type RunAdmission } from "../../../../src/runtime/admission.ts";
 import type { IdentityTaskSource } from "../../../../src/tools/identity-task-source.ts";
 import { TaskNotFoundError, type TaskOwnerContext } from "../../../../src/tools/types.ts";
+import { validateToolInput } from "../../../../src/tools/validate-input.ts";
 import { seedWorkspaceRoot } from "../../../helpers/test-workspace.ts";
 
 const WS = "ws_00a1b2c3d4e5f607";
@@ -126,7 +129,7 @@ function harness(opts: { executor: Executor; admission?: RunAdmission }) {
       const runId = readIdempotencyKey(workDir, wsId, owner, id, key);
       return runId ? currentTicket(wsId, owner, runId) : null;
     },
-    cancelRun: (id) => scheduler.cancelRun(wsId, owner, id),
+    cancelRun: (runId) => scheduler.cancelRunById(wsId, owner, runId),
     readRuns: (id, o) => readRuns(workDir, wsId, owner, id, o),
     readRunsPage: () => ({ runs: [] }),
     readAllRuns: () => [],
@@ -140,6 +143,7 @@ function harness(opts: { executor: Executor; admission?: RunAdmission }) {
   const source = createTaskRunSource({
     toolContext: () => ctx(),
     readTicket: currentTicket,
+    readTask: (wsId, owner, id) => loadTask(workDir, wsId, owner, id),
     readResult: (wsId, owner, id, runId) => readRunResult(workDir, wsId, owner, id, runId),
     runEnded: (runId) => scheduler.runEnded(runId),
     cancelRun: (wsId, owner, runId) => scheduler.cancelRunById(wsId, owner, runId),
@@ -222,7 +226,7 @@ describe("tasks__run as a task", () => {
     const { scheduler, source } = harness({ executor });
     seed("digest");
 
-    const task = await startTask(source, { name: "digest" });
+    const task = await startTask(source, { taskId: "digest" });
 
     expect(task.status).toBe("working");
     expect(task.ttl).toBeNull();
@@ -242,7 +246,7 @@ describe("tasks__run as a task", () => {
     const { executor, held } = heldExecutor();
     const { scheduler, source } = harness({ executor });
     seed("digest");
-    const task = await startTask(source, { name: "digest", input: { topic: "news" } });
+    const task = await startTask(source, { taskId: "digest", input: { topic: "news" } });
 
     held[0]?.finish("the digest");
     const result = await source.awaitToolTaskResult(task.taskId, { ownerContext: OWNED });
@@ -250,10 +254,15 @@ describe("tasks__run as a task", () => {
       "completed",
     );
     expect(result.content).toEqual([{ type: "text", text: "the digest" }]);
-    const { run, result: deliverable } = result.structuredContent as {
-      run: TaskRun;
-      result: TaskRunResult;
-    };
+    // `/mcp` publishes `tasks__run`'s output schema for this result too.
+    const structured = result.structuredContent ?? {};
+    expect(validateToolInput(structured, TasksRunOutput)).toEqual({ valid: true });
+    const out = structured as TasksRunOutput;
+    if (!("run" in out))
+      throw new Error(`expected the ended-run shape, got ${JSON.stringify(out)}`);
+    const { run, result: deliverable, enabled } = out;
+    expect(enabled).toBe(true);
+    if (!deliverable) throw new Error("expected the run's result");
     expect(run.id).toBe(task.taskId);
     expect(run.status).toBe("success");
     expect(run.input).toEqual({ topic: "news" });
@@ -267,9 +276,9 @@ describe("tasks__run as a task", () => {
     const { executor, held } = heldExecutor();
     const { scheduler, source } = harness({ executor });
     seed("digest");
-    await startTask(source, { name: "digest" });
+    await startTask(source, { taskId: "digest" });
 
-    const second = await startTask(source, { name: "digest" });
+    const second = await startTask(source, { taskId: "digest" });
     expect(second.status).toBe("failed");
     expect(second.statusMessage).toContain("Already running");
     await expect(
@@ -288,8 +297,8 @@ describe("tasks__run as a task", () => {
     seed("first");
     seed("second");
 
-    const running = await startTask(source, { name: "first" });
-    const queued = await startTask(source, { name: "second" });
+    const running = await startTask(source, { taskId: "first" });
+    const queued = await startTask(source, { taskId: "second" });
     expect(readRunTicket(workDir, WS, OWNER, queued.taskId)?.run.status).toBe("queued");
 
     const cancelledQueued = await source.cancelTask(queued.taskId, { ownerContext: OWNED });
@@ -311,7 +320,7 @@ describe("tasks__run as a task", () => {
     const { executor, held } = heldExecutor();
     const { scheduler, source } = harness({ executor });
     seed("digest");
-    const task = await startTask(source, { name: "digest" });
+    const task = await startTask(source, { taskId: "digest" });
 
     const strangers: TaskOwnerContext[] = [
       { ...OWNED, identityId: STRANGER },
@@ -341,7 +350,7 @@ describe("tasks__run as a task", () => {
     const first = heldExecutor();
     const before = harness({ executor: first.executor });
     seed("digest");
-    const task = await startTask(before.source, { name: "digest" });
+    const task = await startTask(before.source, { taskId: "digest" });
     first.held[0]?.finish("kept");
     await flush();
     before.scheduler.stop();
@@ -386,15 +395,15 @@ describe("tasks__run as a task", () => {
     const { scheduler, source } = harness({ executor });
     seed("digest");
 
-    const first = await startTask(source, { name: "digest", idempotencyKey: "item-42" });
-    const again = await startTask(source, { name: "digest", idempotencyKey: "item-42" });
+    const first = await startTask(source, { taskId: "digest", idempotencyKey: "item-42" });
+    const again = await startTask(source, { taskId: "digest", idempotencyKey: "item-42" });
     expect(again.taskId).toBe(first.taskId);
     expect(held).toHaveLength(1);
     expect(readRunTicket(workDir, WS, OWNER, first.taskId)?.run.idempotencyKey).toBe("item-42");
 
     held[0]?.finish("done");
     await flush();
-    const afterEnd = await startTask(source, { name: "digest", idempotencyKey: "item-42" });
+    const afterEnd = await startTask(source, { taskId: "digest", idempotencyKey: "item-42" });
     expect(afterEnd.taskId).toBe(first.taskId);
     expect(afterEnd.status).toBe("completed");
     scheduler.stop();
@@ -405,7 +414,7 @@ describe("tasks__run as a task", () => {
     const { scheduler, source } = harness({ executor });
 
     const task = await startTask(source, {
-      prompt: "Summarize the input.",
+      definition: { body: "Summarize the input." },
       input: { text: "hello" },
       idempotencyKey: "batch-1/item-1",
     });
@@ -417,7 +426,7 @@ describe("tasks__run as a task", () => {
     expect(held[0]?.input).toEqual({ data: { text: "hello" } });
 
     const again = await startTask(source, {
-      prompt: "Summarize the input.",
+      definition: { body: "Summarize the input." },
       input: { text: "hello" },
       idempotencyKey: "batch-1/item-1",
     });
@@ -442,7 +451,7 @@ describe("tasks__run as a task", () => {
 
     const refused = await source.startToolAsTask(
       "run",
-      { name: "typed", input: { link: "x" } },
+      { taskId: "typed", input: { link: "x" } },
       { ownerContext: OWNED },
     );
     expect("result" in refused && refused.result.isError).toBe(true);
@@ -450,7 +459,7 @@ describe("tasks__run as a task", () => {
     expect(held).toHaveLength(0);
     expect(readRuns(workDir, WS, OWNER, "typed")).toHaveLength(0);
 
-    const ok = await startTask(source, { name: "typed", input: { url: "https://example.com" } });
+    const ok = await startTask(source, { taskId: "typed", input: { url: "https://example.com" } });
     expect(ok.status).toBe("working");
     held[0]?.finish("done");
     await flush();
@@ -461,22 +470,22 @@ describe("tasks__run as a task", () => {
     const { executor, held } = heldExecutor();
     const { scheduler, source } = harness({ executor });
     seed("digest");
-    await startTask(source, { name: "digest" });
+    await startTask(source, { taskId: "digest" });
 
     // Already running: refused, and the key is not claimed.
-    const refused = await startTask(source, { name: "digest", idempotencyKey: "retry-me" });
+    const refused = await startTask(source, { taskId: "digest", idempotencyKey: "retry-me" });
     expect(refused.status).toBe("failed");
     expect(readIdempotencyKey(workDir, WS, OWNER, "digest", "retry-me")).toBeNull();
 
     held[0]?.finish("first");
     await flush();
-    const retried = await startTask(source, { name: "digest", idempotencyKey: "retry-me" });
+    const retried = await startTask(source, { taskId: "digest", idempotencyKey: "retry-me" });
     expect(retried.taskId).not.toBe(refused.taskId);
     expect(retried.status).toBe("working");
     expect(held).toHaveLength(2);
 
     // Admitted, so the key now names this run.
-    const repeat = await startTask(source, { name: "digest", idempotencyKey: "retry-me" });
+    const repeat = await startTask(source, { taskId: "digest", idempotencyKey: "retry-me" });
     expect(repeat.taskId).toBe(retried.taskId);
     expect(held).toHaveLength(2);
 
@@ -489,8 +498,16 @@ describe("tasks__run as a task", () => {
     const { executor, held } = heldExecutor();
     const { scheduler, source } = harness({ executor });
     const definition = {
-      prompt: "Fetch the page.",
-      inputSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+      definition: {
+        body: "Fetch the page.",
+        manifest: {
+          inputSchema: {
+            type: "object",
+            properties: { url: { type: "string" } },
+            required: ["url"],
+          },
+        },
+      },
       idempotencyKey: "page-1",
     };
 
@@ -514,11 +531,11 @@ describe("tasks__run as a task", () => {
   test("a key reused with a different inline definition is refused", async () => {
     const { executor, held } = heldExecutor();
     const { scheduler, source } = harness({ executor });
-    await startTask(source, { prompt: "Version one.", idempotencyKey: "shared" });
+    await startTask(source, { definition: { body: "Version one." }, idempotencyKey: "shared" });
 
     const changed = await source.startToolAsTask(
       "run",
-      { prompt: "Version two.", idempotencyKey: "shared" },
+      { definition: { body: "Version two." }, idempotencyKey: "shared" },
       { ownerContext: OWNED },
     );
     expect("result" in changed && changed.result.isError).toBe(true);
@@ -537,7 +554,7 @@ describe("tasks__run as a task", () => {
     setUnattended(true);
     const refused = await source.startToolAsTask(
       "run",
-      { name: "digest" },
+      { taskId: "digest" },
       { ownerContext: OWNED },
     );
     expect("result" in refused && refused.result.isError).toBe(true);

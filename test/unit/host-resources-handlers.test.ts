@@ -7,7 +7,6 @@ import type { ListResourcesResult, ReadResourceResult } from "@modelcontextproto
 import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
 import type { EventSink } from "../../src/engine/types.ts";
 import { createFileStore, type FileStore } from "../../src/files/store.ts";
-import type { FileEntry } from "../../src/files/types.ts";
 import {
   FileBackedHostResourcesResolver,
   HOST_RESOURCES_LIST_METHOD,
@@ -23,8 +22,7 @@ import { textOf } from "../helpers/resource-contents.ts";
 // drive a tool call whose implementation calls back through the server
 // → client request channel using the namespaced method.
 //
-// This closes the QA-flagged gap from Phase 1's review: the gate logic
-// is unit-tested in isolation, but the wiring that gets a real
+// The gate logic is unit-tested in isolation, but the wiring that gets a real
 // `setRequestHandler` to dispatch on real request frames isn't covered
 // by anything more than typechecking. The fake-server pattern exercises
 // the full Client.setRequestHandler → resolver → FileStore round trip.
@@ -57,9 +55,11 @@ async function seedFile(
     mimeType: mime,
     size: saved.size,
     createdAt: new Date().toISOString(),
-    description: undefined,
+    description: null,
     tags,
-  } as unknown as FileEntry);
+    source: "manual",
+    conversationId: null,
+  });
   return saved.id;
 }
 

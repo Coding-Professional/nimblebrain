@@ -80,10 +80,9 @@ describe("updateTask — pause/resume regression (CLI path)", () => {
       },
       ctx,
     );
-    expect(created.created).toBe(true);
     expect(created.task.enabled).toBe(true);
 
-    const result = updateTask("Daily Sync", { enabled: false }, ctx);
+    const result = updateTask("daily-sync", { enabled: false }, ctx);
     expect(result.updated).toBe(true);
     expect(result.task.enabled).toBe(false);
 
@@ -111,7 +110,7 @@ describe("updateTask — pause/resume regression (CLI path)", () => {
     auto.disabledReason = "Token budget exceeded";
     ctx.save(defs);
 
-    const result = updateTask("Recovering", { enabled: true }, ctx);
+    const result = updateTask("recovering", { enabled: true }, ctx);
     expect(result.updated).toBe(true);
     expect(result.task.enabled).toBe(true);
     expect(result.task.consecutiveErrors).toBe(0);
@@ -130,7 +129,7 @@ describe("updateTask — pause/resume regression (CLI path)", () => {
       },
       ctx,
     );
-    updateTask("One-off send", { enabled: false }, ctx);
+    updateTask("one-off-send", { enabled: false }, ctx);
 
     // The date passes while it is paused: its only occurrence is now behind it,
     // and the stored nextRunAt is that occurrence.
@@ -140,7 +139,7 @@ describe("updateTask — pause/resume regression (CLI path)", () => {
     auto.nextRunAt = "2020-01-01T09:00:00.000Z";
     ctx.save(defs);
 
-    const result = updateTask("One-off send", { enabled: true }, ctx);
+    const result = updateTask("one-off-send", { enabled: true }, ctx);
     expect(result.task.enabled).toBe(true);
     expect(result.task.nextRunAt).toBeUndefined();
     expect(ctx.definitions().get(created.task.id)?.nextRunAt).toBeUndefined();
@@ -152,13 +151,13 @@ describe("updateTask — pause/resume regression (CLI path)", () => {
       { name: "Daily", prompt: "Digest", schedule: { type: "cron", expression: "0 9 * * *" } },
       ctx,
     );
-    updateTask("Daily", { enabled: false }, ctx);
+    updateTask("daily", { enabled: false }, ctx);
     const defs = ctx.definitions();
     const past = new Date(Date.now() - 86_400_000).toISOString();
     defs.get(created.task.id)!.nextRunAt = past;
     ctx.save(defs);
 
-    const result = updateTask("Daily", { enabled: true }, ctx);
+    const result = updateTask("daily", { enabled: true }, ctx);
     expect(result.task.nextRunAt).toBe(past);
   });
 
@@ -174,11 +173,11 @@ describe("updateTask — pause/resume regression (CLI path)", () => {
     );
     expect(reloadCount).toBe(1); // From create
 
-    updateTask("Counter", { enabled: false }, ctx);
+    updateTask("counter", { enabled: false }, ctx);
     expect(reloadCount).toBe(2); // Mutation triggered reload
 
     // Calling update with no actual change should NOT trigger reload.
-    updateTask("Counter", {}, ctx);
+    updateTask("counter", {}, ctx);
     expect(reloadCount).toBe(2);
   });
 });
@@ -241,7 +240,7 @@ describe("token budget window anchoring", () => {
     // Rebuild: raise the budget via update (the operator's "rebuild on real
     // tools" edit).
     const result = updateTask(
-      "Rebuilt",
+      "rebuilt",
       { tokenBudget: { maxInputTokens: 500_000, period: "daily" } },
       ctx,
     );
@@ -274,7 +273,7 @@ describe("token budget window anchoring", () => {
     ctx.save(defs);
 
     // Editing the prompt must not reset the window mid-period.
-    const result = updateTask("Keep", { prompt: "watch harder" }, ctx);
+    const result = updateTask("keep", { prompt: "watch harder" }, ctx);
     expect(result.task.cumulativeInputTokens).toBe(120_000);
   });
 
@@ -297,7 +296,7 @@ describe("token budget window anchoring", () => {
     // A caller re-sends the identical budget alongside an unrelated edit. The
     // budget didn't change, so accumulated spend must survive.
     const result = updateTask(
-      "Resend",
+      "resend",
       { prompt: "watch harder", tokenBudget: { maxInputTokens: 300_000, period: "daily" } },
       ctx,
     );
@@ -331,7 +330,7 @@ describe("createTask / deleteTask — internal caller path", () => {
     expect(defs.get("tool-authored")?.source).toBe("agent");
   });
 
-  test("delete by name removes from store", () => {
+  test("delete by id removes from store", () => {
     const ctx = makeCtx();
     createTask(
       {
@@ -341,7 +340,7 @@ describe("createTask / deleteTask — internal caller path", () => {
       },
       ctx,
     );
-    const result = deleteTask("Delete Me", ctx);
+    const result = deleteTask("delete-me", ctx);
     expect(result.deleted).toBe(true);
     expect(ctx.definitions().size).toBe(0);
   });
@@ -350,7 +349,7 @@ describe("createTask / deleteTask — internal caller path", () => {
 describe("an event schedule", () => {
   const eventSchedule = {
     type: "event" as const,
-    match: { source: "precision-outbound", name: "reply.*" },
+    match: { source: "acme-outbound", name: "reply.*" },
   };
 
   test("carries no nextRunAt, because it has no position in time", () => {
@@ -379,7 +378,7 @@ describe("an event schedule", () => {
     const before = ctx.definitions().get("reply-triage");
     expect(before?.nextRunAt).toBeDefined();
 
-    updateTask("Reply triage", { schedule: eventSchedule }, ctx);
+    updateTask("reply-triage", { schedule: eventSchedule }, ctx);
     expect(ctx.definitions().get("reply-triage")?.nextRunAt).toBeUndefined();
   });
 
@@ -397,6 +396,7 @@ describe("an event schedule", () => {
           name: "Self wake",
           prompt: "Go.",
           schedule: eventSchedule,
+          // biome-ignore lint/plugin/never-cast: a provenance outside `TaskSource`, which is the input under test
           source: "bundle" as never,
         },
         ctx,
@@ -412,11 +412,12 @@ describe("an event schedule", () => {
         name: "Bundle job",
         prompt: "Go.",
         schedule: { type: "interval", intervalMs: 3_600_000 },
+        // biome-ignore lint/plugin/never-cast: a provenance outside `TaskSource`, which is the input under test
         source: "bundle" as never,
       },
       ctx,
     );
-    expect(() => updateTask("Bundle job", { schedule: eventSchedule }, ctx)).toThrow(
+    expect(() => updateTask("bundle-job", { schedule: eventSchedule }, ctx)).toThrow(
       /cannot run on events/,
     );
     expect(ctx.definitions().get("bundle-job")?.schedule.type).toBe("interval");
@@ -447,8 +448,42 @@ describe("updateTask — a schedule with no next run", () => {
     );
     expect(loadOwnerTasks(workDir, WS, OWNER).get("morning")?.nextRunAt).toBeDefined();
 
-    updateTask("Morning", { schedule: { type: "cron", expression: "0 9 31 2 *" } }, ctx);
+    updateTask("morning", { schedule: { type: "cron", expression: "0 9 31 2 *" } }, ctx);
 
     expect(loadOwnerTasks(workDir, WS, OWNER).get("morning")?.nextRunAt).toBeUndefined();
+  });
+});
+
+describe("a task's model", () => {
+  // Refused where the definition is written, so the author hears it instead of
+  // every scheduled run failing later.
+  test("create refuses a bare id, naming the qualified form, and saves nothing", () => {
+    const ctx = makeCtx();
+    expect(() =>
+      createTask({ name: "Bare", prompt: "p", model: "claude-sonnet-4-6" }, ctx),
+    ).toThrow(
+      'Task model "claude-sonnet-4-6" has no provider. Write it as provider:model, e.g. "anthropic:claude-sonnet-4-6".',
+    );
+    expect(ctx.definitions().size).toBe(0);
+  });
+
+  test("update refuses a bare id and leaves the stored model alone", () => {
+    const ctx = makeCtx();
+    createTask({ name: "Pinned", prompt: "p", model: "anthropic:claude-sonnet-4-6" }, ctx);
+    expect(() => updateTask("pinned", { model: "gpt-4o" }, ctx)).toThrow('"openai:gpt-4o"');
+    expect(ctx.definitions().get("pinned")?.model).toBe("anthropic:claude-sonnet-4-6");
+  });
+
+  test.each(["anthropic:claude-sonnet-4-6", "fast", "alias:fast"])("accepts %s", (model) => {
+    const ctx = makeCtx();
+    createTask({ name: "Ok", prompt: "p", model }, ctx);
+    expect(ctx.definitions().get("ok")?.model).toBe(model);
+  });
+
+  test("update clears the model with null", () => {
+    const ctx = makeCtx();
+    createTask({ name: "Clear", prompt: "p", model: "anthropic:claude-sonnet-4-6" }, ctx);
+    updateTask("clear", { model: null }, ctx);
+    expect(ctx.definitions().get("clear")?.model).toBeUndefined();
   });
 });

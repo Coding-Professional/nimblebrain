@@ -3,10 +3,11 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { getInstalledConnector, type InstalledConnector } from "../../api/client";
 import { ConnectorHeader } from "../../components/connectors/ConnectorHeader";
 import { ConnectorSettingsSection } from "../../components/connectors/ConnectorSettingsSection";
-import { OperatorOAuthSection } from "../../components/connectors/OperatorOAuthSection";
+import { OAuthClientSection } from "../../components/connectors/OAuthClientSection";
 import { ToolPermissionsTable } from "../../components/connectors/ToolPermissionsTable";
 import { UninstallConnectorDialog } from "../../components/connectors/UninstallConnectorDialog";
 import { WorkspaceSecretsSection } from "../../components/connectors/WorkspaceSecretsSection";
+import { useWorkspaceContext } from "../../context/WorkspaceContext";
 import { useCanWriteActiveWorkspace } from "../../hooks/useScopedRole";
 
 /**
@@ -21,7 +22,7 @@ import { useCanWriteActiveWorkspace } from "../../hooks/useScopedRole";
  *     under it only when status ≠ ready.
  *
  *   - Then the sections, in one order, one rule between each: how the
- *     connector is reached (operator OAuth, secrets), how it behaves (its
+ *     connector is reached (OAuth client, secrets), how it behaves (its
  *     own settings section, when it declares one), and what the agent may
  *     call (tool permissions, collapsed to a summary).
  *
@@ -51,6 +52,9 @@ export function ConnectorDetailPage() {
   // Edit gates ride on workspace-admin *membership*, matching the server's
   // `canWriteWorkspaceScoped`.
   const canManage = useCanWriteActiveWorkspace();
+  // `installed.allowedTools` is decided for the viewer's role, so a role change
+  // re-reads the entry.
+  const viewerRole = useWorkspaceContext().activeWorkspace?.userRole;
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -68,9 +72,10 @@ export function ConnectorDetailPage() {
     }
   }, [serverName]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `viewerRole` is the trigger, not an input — the server reads the role itself
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, viewerRole]);
 
   if (loading) {
     return <div className="text-sm text-muted-foreground">Loading…</div>;
@@ -128,9 +133,13 @@ export function ConnectorDetailPage() {
           how it behaves (its own settings), to what the agent may call — the tool list is
           the longest and least often changed, so it comes last and starts collapsed. */}
       <div className="divide-y divide-border/60 [&>*]:py-6 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
-        <OperatorOAuthSection installed={installed} canManage={canManage} onChanged={refresh} />
+        <OAuthClientSection installed={installed} canManage={canManage} onChanged={refresh} />
         <WorkspaceSecretsSection installed={installed} canManage={canManage} />
-        <ConnectorSettingsSection serverName={installed.serverName} canManage={canManage} />
+        <ConnectorSettingsSection
+          serverName={installed.serverName}
+          canManage={canManage}
+          allowedTools={installed.allowedTools}
+        />
         <ToolPermissionsTable
           serverName={installed.serverName}
           scope="workspace"

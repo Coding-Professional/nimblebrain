@@ -30,7 +30,6 @@ function writeConversation(
     ownerId: "usr_test",
     createdAt,
     updatedAt,
-    title: opts.title ?? null,
     totalInputTokens: 100,
     totalOutputTokens: 50,
     totalCostUsd: 0.01,
@@ -45,7 +44,11 @@ function writeConversation(
   for (let i = 0; i < (opts.extraMessages ?? 0); i++) {
     turns.push({ role: "user", content: `msg ${i}`, timestamp: updatedAt });
   }
-  const content = [meta, ...conversationEventLines(turns)].map((l) => `${l}\n`).join("");
+  // The title is a `metadata.title` event; line 1 never carries one.
+  const title = opts.title
+    ? [JSON.stringify({ type: "metadata.title", ts: createdAt, title: opts.title })]
+    : [];
+  const content = [meta, ...title, ...conversationEventLines(turns)].map((l) => `${l}\n`).join("");
   writeFileSync(join(dir, `${id}.jsonl`), content);
 }
 
@@ -247,7 +250,7 @@ describe("ConversationIndex", () => {
 
   it("excludes legacy files missing ownerId from list()", async () => {
     // Strict single-owner invariant: an ownerless on-disk file
-    // predates Stage 1 and has no defensible owner, so the index
+    // predates the ownership invariant and has no defensible owner, so the index
     // drops it rather than synthesizing one. Pair to load()'s throw
     // at conversation-metadata.test.ts:52-64.
     writeConversation(dir, "conv_valid", { title: "Owned" });

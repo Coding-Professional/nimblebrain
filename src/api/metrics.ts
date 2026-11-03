@@ -352,7 +352,7 @@ export const serverNotificationsRelayedTotal = new Counter({
  *
  * `source` is the MCP source name, sanitized to a bounded charset (see
  * recordConnectorCrash) so a malformed/unbounded name can't explode cardinality.
- * `remote` separates remote (HTTP/SSE) connectors from local stdio connectors.
+ * `remote` separates remote (HTTP/SSE) connectors from in-process sources.
  * No tenant/workspace label — one pod per tenant, so the scrape namespace
  * attributes it (same rationale as nb_artifact_resolutions_total).
  *
@@ -381,7 +381,7 @@ const SAFE_SOURCE = /^[a-z0-9_.-]+$/;
 /**
  * Record one health-monitor-detected connector crash. `source` is the MCP source
  * name (sanitized to a bounded label); `remote` is true for HTTP/SSE connectors
- * and false for local stdio connectors. Defensive: a missing/empty/odd name
+ * and false for in-process sources. Defensive: a missing/empty/odd name
  * buckets to "other".
  */
 export function recordConnectorCrash(source: string | undefined, remote: boolean): void {
@@ -402,10 +402,12 @@ export function recordConnectorCrash(source: string | undefined, remote: boolean
  * the `for:` timer would reset every cycle and a genuine multi-day outage would
  * never page — the exact incident the alert exists to catch.
  *
- * Excludes `healthy` (up) and `dead` (a DELIBERATE teardown — disconnect /
- * uninstall — not an outage to page on). A genuine transient blip that recovers
- * within the first burst asserts for only ~1-2 min and is de-flapped by the
- * alert's `for: 10m` — no false page.
+ * Excludes `healthy` (up), `dead` (a DELIBERATE teardown — disconnect /
+ * uninstall — not an outage to page on), and `awaiting_reconnect` (a rejected
+ * credential, which `nb_connector_reauth_required` reports). So this gauge is a
+ * transport outage only. A genuine transient blip that recovers within the
+ * first burst asserts for only ~1-2 min and is de-flapped by the alert's
+ * `for: 10m` — no false page.
  *
  * Why a gauge, not the `nb_connector_crashed_total` counter: the counter is a
  * crash RATE (a burst per cooldown), so an `increase()`-based alert would
@@ -418,7 +420,7 @@ export function recordConnectorCrash(source: string | undefined, remote: boolean
  */
 export const connectorUnhealthy = new Gauge({
   name: "nb_connector_unhealthy",
-  help: 'MCP connectors currently down involuntarily (HealthMonitor state "restarting" or "cooldown"), by source. 1 = down.',
+  help: 'MCP connectors whose transport is down involuntarily (HealthMonitor state "restarting" or "cooldown"), by source. 1 = down. A connection that needs Reconnect is nb_connector_reauth_required, not this.',
   labelNames: ["source"] as const,
   registers: [metricsRegistry],
   collect() {
@@ -432,7 +434,8 @@ export const connectorUnhealthy = new Gauge({
       // across the whole burst→cooldown→burst cycle (the `for: 10m` alert needs
       // that continuity): `restarting` (active backoff burst) and `cooldown`
       // (slow re-probe between bursts). `healthy` is up; `dead` is a DELIBERATE
-      // teardown, not an outage.
+      // teardown, not an outage; `awaiting_reconnect` is a credential, not a
+      // transport, and is the reauth gauge's.
       if (connector.state !== "restarting" && connector.state !== "cooldown") continue;
       const safe = connector.name && SAFE_SOURCE.test(connector.name) ? connector.name : "other";
       this.set({ source: safe }, 1);
@@ -455,6 +458,52 @@ let healthStatusProvider: (() => ConnectorHealth[]) | null = null;
  */
 export function registerConnectorHealthGauge(getStatus: () => ConnectorHealth[]): void {
   healthStatusProvider = getStatus;
+}
+
+/**
+ * Gauge: how many connections of each connector need the user's Reconnect
+ * (lifecycle state `reauth_required`), by source. Absent when none do.
+ *
+ * Read from the lifecycle's connection records, not the HealthMonitor. A
+ * rejected credential is credential state, which the lifecycle owns and keeps
+ * across a restart (the `auth_lost` flag the boot seed reads), while the
+ * HealthMonitor sees only transport liveness of a registered source. After a
+ * restart such a connection has no source to monitor, so a liveness signal
+ * resolves while the connection still needs a person. This one stays asserted
+ * until the user reconnects or disconnects.
+ *
+ * `source` is the server name, through the same `SAFE_SOURCE` guard as
+ * `nb_connector_unhealthy`, so the two join on it. No tenant/workspace label —
+ * one pod per tenant, scrape namespace attributes it; two workspaces with the
+ * same connector both waiting count 2.
+ */
+export const connectorReauthRequired = new Gauge({
+  name: "nb_connector_reauth_required",
+  help: "Connector connections that need the user to Reconnect (lifecycle state reauth_required), by source.",
+  labelNames: ["source"] as const,
+  registers: [metricsRegistry],
+  collect() {
+    // Reset so a reconnected connection's series disappears and the alert resolves.
+    this.reset();
+    for (const name of reauthRequiredProvider?.() ?? []) {
+      this.inc({ source: name && SAFE_SOURCE.test(name) ? name : "other" });
+    }
+  },
+});
+
+/**
+ * Server names of the connections in `reauth_required`, one entry per
+ * connection, read by the `nb_connector_reauth_required` gauge at scrape time.
+ * `null` until wired, in which case the gauge reports nothing.
+ */
+let reauthRequiredProvider: (() => readonly string[]) | null = null;
+
+/**
+ * Wire the `nb_connector_reauth_required` gauge to the lifecycle. Call once at
+ * server start. Last registration wins (so tests can swap in a stub).
+ */
+export function registerConnectorReauthGauge(getReauthRequired: () => readonly string[]): void {
+  reauthRequiredProvider = getReauthRequired;
 }
 
 // ---------------------------------------------------------------------------
@@ -722,3 +771,33 @@ export const notificationsTemplateMissesTotal = new Counter({
 export function notificationSourceLabel(source: string | undefined): string {
   return source && SAFE_SOURCE.test(source) ? source : "other";
 }
+
+/**
+ * Whether the model gateway has said which providers it serves, read through
+ * this provider at scrape time. `null` without a gateway (the gauge then reports
+ * nothing).
+ */
+let gatewayProvidersStatus: (() => { known: boolean }) | null = null;
+
+/** Wire `nb_model_gateway_providers_unknown` to the runtime's gateway provider watch. */
+export function registerGatewayProvidersGauge(status: (() => { known: boolean }) | null): void {
+  gatewayProvidersStatus = status;
+}
+
+/**
+ * Gauge: 1 while the runtime has a model gateway that has not yet said which
+ * providers it serves (`GET <gateway>/providers`), 0 once it has. Until then the
+ * runtime offers every provider it knows, so a model the gateway does not serve
+ * stays selectable and fails when called; a steady 1 means the runtime cannot
+ * reach or authenticate to its gateway. Absent without a gateway.
+ */
+export const modelGatewayProvidersUnknown = new Gauge({
+  name: "nb_model_gateway_providers_unknown",
+  help: "1 while the model gateway has not answered which providers it serves (every provider is offered meanwhile); 0 once it has. Absent without a gateway.",
+  registers: [metricsRegistry],
+  collect() {
+    this.reset();
+    const status = gatewayProvidersStatus?.();
+    if (status) this.set(status.known ? 0 : 1);
+  },
+});

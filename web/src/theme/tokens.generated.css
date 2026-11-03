@@ -41,10 +41,14 @@
   --sidebar-foreground: #5c5c66;
   --sidebar-border: #e4e4e7;
   --sidebar-hover: #f4f4f5;
+  --sidebar-active: #eaeaeb;
+  --sidebar-active-foreground: #09090b;
   --tooltip: #18181b;
   --tooltip-foreground: #fafafa;
   --sidebar-width: 240px;
   --sidebar-width-collapsed: 64px;
+  --page-gutter: 1.5rem;
+  --page-gutter-narrow: 1rem;
   --border-radius-xs: 0.25rem;
   --border-radius-sm: 0.5rem;
   --border-radius-md: 0.75rem;
@@ -123,10 +127,18 @@
   --sidebar-foreground: #9b9ba4;
   --sidebar-border: #232326;
   --sidebar-hover: #0e0e10;
+  --sidebar-active: #171719;
+  --sidebar-active-foreground: #fafafa;
   --tooltip: #2e2e33;
   --tooltip-foreground: #fafafa;
   --nb-shadow-hairline: 0 0 0 1px rgba(255,255,255,0.06);
   --nb-shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
   --nb-shadow-md: 0 4px 6px -1px rgba(0,0,0,0.4);
   --nb-shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.4);
+}
+
+@container main (max-width: 640px) {
+  * {
+    --page-gutter: var(--page-gutter-narrow);
+  }
 }

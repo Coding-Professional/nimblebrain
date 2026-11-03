@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { getBrand } from "../brand";
 import { matchesShortcut, SHORTCUTS } from "../lib/shortcuts";
 
 type ThemeMode = "light" | "dark";
@@ -42,19 +43,38 @@ function resolvePreference(pref: ThemePreference): ThemeMode {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-/** Resolve initial theme synchronously to prevent FOUC. */
+function isPreference(value: unknown): value is ThemePreference {
+  return value === "light" || value === "dark" || value === "system";
+}
+
+/**
+ * The preference in force: the person's own choice (stored in this browser,
+ * and kept in step with their server preference), else the brand's
+ * `defaultTheme`, else the OS. A choice always wins over the brand.
+ */
+export function effectivePreference(
+  stored: string | null,
+  brandDefault: string | undefined,
+): ThemePreference {
+  if (isPreference(stored)) return stored;
+  if (isPreference(brandDefault)) return brandDefault;
+  return "system";
+}
+
+/** The preference in force in this browser right now. */
+function currentPreference(): ThemePreference {
+  return effectivePreference(localStorage.getItem(LS_KEY), getBrand().defaultTheme);
+}
+
+/**
+ * Resolve the initial theme synchronously to prevent FOUC. The brand is applied
+ * before the first render, so its default is readable here. The provider sits
+ * at the root of the app, above the auth gate, so the loading skeleton and the
+ * sign-in page paint in it as well as the shell.
+ */
 function getInitialMode(): ThemeMode {
   if (typeof window === "undefined") return "light";
-
-  const stored = localStorage.getItem(LS_KEY);
-  if (stored === "dark" || stored === "light" || stored === "system") {
-    const mode = resolvePreference(stored as ThemePreference);
-    applyMode(mode);
-    return mode;
-  }
-
-  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-  const mode: ThemeMode = prefersDark ? "dark" : "light";
+  const mode = resolvePreference(currentPreference());
   applyMode(mode);
   return mode;
 }
@@ -66,19 +86,30 @@ export function ThemeProvider({
   children: React.ReactNode;
   /**
    * Stores a theme the person chose outside Settings (the palette, the
-   * shortcut) as their server preference. Without it a toggle lasts only until
-   * the shell applies the stored preference again.
+   * shortcut) as their server preference. Absent while no one is signed in: a
+   * toggle on the sign-in page lives in this browser only, and the account's
+   * own preference, when it has one, applies once the shell loads.
    */
   savePreference?: (pref: ThemePreference) => Promise<void>;
 }) {
   const [mode, setModeState] = useState<ThemeMode>(getInitialMode);
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  const saveRef = useRef(savePreference);
-  saveRef.current = savePreference;
   // Saves run one at a time so quick toggles reach the server in order.
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const pendingSaves = useRef(0);
+  // The provider outlives sign-in and sign-out, so its save state is kept per
+  // session. A new save function (signing in, signing out) starts a session:
+  // saves still in flight belong to the old one, and must neither hold back the
+  // new account's preference in `applyPreference` nor queue ahead of its saves.
+  const saveRef = useRef(savePreference);
+  const session = useRef(0);
+  if (saveRef.current !== savePreference) {
+    session.current += 1;
+    pendingSaves.current = 0;
+    saveQueue.current = Promise.resolve();
+  }
+  saveRef.current = savePreference;
 
   const setMode = useCallback((next: ThemeMode) => {
     applyMode(next);
@@ -96,12 +127,13 @@ export function ThemeProvider({
     if (!save) return;
     // The theme has already changed here; a failed save only means the next
     // load applies the stored preference instead.
+    const saveSession = session.current;
     pendingSaves.current += 1;
     saveQueue.current = saveQueue.current
       .then(() => save(next))
       .catch((err) => console.warn("[theme] preference not saved", err))
       .finally(() => {
-        pendingSaves.current -= 1;
+        if (session.current === saveSession) pendingSaves.current -= 1;
       });
   }, []);
 
@@ -123,9 +155,8 @@ export function ThemeProvider({
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
 
     function handleChange(e: MediaQueryListEvent) {
-      // Follow OS preference when set to "system" or no explicit choice
-      const stored = localStorage.getItem(LS_KEY);
-      if (!stored || stored === "system") {
+      // Follow the OS only while the preference in force is "system".
+      if (currentPreference() === "system") {
         const next: ThemeMode = e.matches ? "dark" : "light";
         applyMode(next);
         setModeState(next);
@@ -159,15 +190,4 @@ export function useTheme(): ThemeContextValue {
   const ctx = useContext(ThemeContext);
   if (!ctx) throw new Error("useTheme must be used within ThemeProvider");
   return ctx;
-}
-
-/**
- * Theme mode with a safe default. Unlike `useTheme`, this never throws when
- * rendered outside a `ThemeProvider` — it falls back to "light". For leaf UI
- * (e.g. `ConnectorIcon`) that only needs to pick a light/dark asset and may be
- * rendered in isolation (unit tests, embeds), a missing provider should
- * degrade to the light variant, not crash the subtree.
- */
-export function useThemeMode(): ThemeMode {
-  return useContext(ThemeContext)?.mode ?? "light";
 }

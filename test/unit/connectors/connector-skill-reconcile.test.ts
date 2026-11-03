@@ -10,11 +10,12 @@ import type {
   ConnectorRef,
   ConnectorSkillLockEntry,
 } from "../../../src/connectors/runtime/types.ts";
+import { stub } from "../../helpers/stub.ts";
 
 const PIN = "v0.3.0";
 
 function lock(identity: string, version: string): ConnectorSkillLockEntry {
-  return { identity, version, sha: `sha-${version}`, path: `/ws/connector-skills/${identity}.md` };
+  return { identity, version, sha: `sha-${version}` };
 }
 
 function connector(fields: {
@@ -36,7 +37,9 @@ function connector(fields: {
 function catalog(
   entries: Record<string, Partial<ConnectorCatalogEntry>>,
 ): Map<string, ConnectorCatalogEntry> {
-  return new Map(Object.entries(entries)) as unknown as Map<string, ConnectorCatalogEntry>;
+  return new Map(
+    Object.entries(entries).map(([key, entry]) => [key, stub<ConnectorCatalogEntry>(entry)]),
+  );
 }
 
 interface Captured {
@@ -81,7 +84,7 @@ describe("reconcileConnectorSkills", () => {
       skillsLock: [lock("outlook", "v0.2.0")],
     });
     const current = connector({ serverName: "com-gmail-mcp", skillsLock: [lock("gmail", PIN)] });
-    // A pre-URL registry row as it sits on disk; ConnectorRef no longer admits it.
+    // biome-ignore lint/plugin/double-cast: a pre-URL registry row as it sits on disk, claimed as a ConnectorRef, which does not admit it
     const registry = { name: "@nimblebraininc/synapse-crm" } as unknown as ConnectorRef;
     const { deps, cap } = buildDeps(
       [{ id: "ws_00079598e311c160", connectors: [stale, current, registry] }],
@@ -106,6 +109,32 @@ describe("reconcileConnectorSkills", () => {
     expect(persisted.some((b) => "name" in b && b.name === "@nimblebraininc/synapse-crm")).toBe(
       true,
     );
+  });
+
+  it("skips a named connector whose url is not http(s), and still refreshes a valid one", async () => {
+    const unusable = connector({
+      url: "file:///etc/mcp",
+      serverName: "com-broken-mcp",
+      skillsLock: [lock("broken", "v0.2.0")],
+    });
+    const valid = connector({
+      serverName: "com-outlook-mcp",
+      skillsLock: [lock("outlook", "v0.2.0")],
+    });
+    const { deps, cap } = buildDeps(
+      [{ id: "ws_00079598e311c160", connectors: [unusable, valid] }],
+      (identity) => [lock(identity, PIN)],
+    );
+
+    const result = await reconcileConnectorSkills(deps);
+
+    expect(cap.syncCalls).toEqual([
+      { identity: "outlook", serverName: "com-outlook-mcp", wsId: "ws_00079598e311c160" },
+    ]);
+    expect(result.connectorsRefreshed).toBe(1);
+    const persisted = cap.persisted[0]!.connectors;
+    expect(persisted[0]).toBe(unusable);
+    expect(skillsLockOf(persisted[1]!)?.[0]?.version).toBe(PIN);
   });
 
   it("is a no-op (no sync, no persist) when every connector is already at the pin", async () => {

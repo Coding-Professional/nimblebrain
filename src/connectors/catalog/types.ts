@@ -14,6 +14,7 @@ import type { ConnectorAuthKind } from "../../connectors/auth-kind.ts";
 import type { ConnectorUiMeta } from "../../connectors/runtime/types.ts";
 import type { HookDeclaration } from "../../hooks/types.ts";
 import type { NotificationsDeclaration } from "../../notifications/types.ts";
+import type { AccountLookup } from "./account-lookup.ts";
 import type {
   ComposioConnectorConfig,
   SecretHeaderRef,
@@ -44,17 +45,17 @@ export interface CatalogListing {
   personal?: boolean;
   install: InstallAction;
   /**
-   * For static-auth entries: whether the workspace has operator OAuth
+   * For static-auth entries: whether the workspace has OAuth client
    * app credentials configured (both clientId in workspace.json and
    * client_secret in the credential store). DCR / direct-url entries
-   * leave this undefined — operator setup doesn't apply.
+   * leave this undefined — OAuth client setup doesn't apply.
    *
    * Browse uses this to flip the row affordance:
    *   - undefined or true  → "Install" button
-   *   - false              → "Set up" (admin only) / "Operator setup
+   *   - false              → "Set up" (admin only) / "OAuth client setup
    *     required" (non-admin)
    */
-  operatorConfigured?: boolean;
+  oauthClientConfigured?: boolean;
 }
 
 /**
@@ -84,7 +85,14 @@ export interface ConnectorCatalogEntry {
   auth: ConnectorAuthKind;
   requiredScopes?: string[];
   additionalAuthorizationParams?: Record<string, string>;
-  operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
+  oauthClientSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
+  /**
+   * The server's in-band access-token rejection text
+   * (`NimbleBrainConnectorMeta.inBandAuthErrors`). Read per connection through
+   * `bindCatalogEntry`, never copied onto the ConnectorRef, so an edit reaches
+   * connections installed before it.
+   */
+  inBandAuthErrors?: string[];
   /**
    * A brokered entry's provider config block, carried under the key naming its
    * provider — the convention `brokeredCatalogConfig` reads. The two typed
@@ -112,6 +120,12 @@ export interface ConnectorCatalogEntry {
   docsUrl?: string;
   /** Offered for personal (identity-plane) connection — see `NimbleBrainConnectorMeta.personal`. */
   personal?: boolean;
+  /**
+   * The tool to ask for the signed-in account, from
+   * `_meta["ai.nimblebrain/connector"].account`. Absent for a connector whose
+   * sign-in names its account, or whose entry declares no lookup.
+   */
+  account?: AccountLookup;
   /**
    * Host UI integration (sidebar placement, etc.) declared by the server in
    * `ServerDetail._meta["ai.nimblebrain/host"]`. Server-authored, carried here
@@ -155,6 +169,13 @@ export interface ConnectorCatalogEntry {
    * of the server stops saying it. Absent for connectors that declare none.
    */
   adminTools?: AdminToolsDeclaration;
+  /**
+   * `true` when `ServerDetail._meta["ai.nimblebrain/host"].record_arguments`
+   * is: the operator grants this server record arguments in every workspace
+   * that installs it (ADR-0058), narrowed per workspace by
+   * `ConnectorRef.recordSources`. Absent otherwise.
+   */
+  recordArguments?: true;
 }
 
 /**
@@ -194,7 +215,7 @@ export interface RemoteOAuthInstall {
   auth: ConnectorAuthKind;
   requiredScopes?: string[];
   additionalAuthorizationParams?: Record<string, string>;
-  operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
+  oauthClientSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
   /**
    * A brokered entry's provider config block, carried under the key naming its
    * provider. The install path reads whichever block `auth` names via
@@ -235,18 +256,18 @@ export interface DirectUrlInstall {
 /**
  * Per-call context handed to `ConnectorCatalog.list`. Carries the
  * pieces a workspace-aware projection might need (e.g.
- * `operatorConfigured` on static entries) without coupling the
+ * `oauthClientConfigured` on static entries) without coupling the
  * directory to the runtime singleton.
  */
 export interface ListEntriesContext {
   /** The workspace whose state determines workspace-aware fields. */
   wsId?: string;
   /**
-   * Async lookup: does the workspace have valid operator OAuth app
+   * Async lookup: does the workspace have valid OAuth client
    * config (both clientId + client_secret) for this catalog id?
    * Returns false if either piece is missing. Returns null if the
    * caller didn't supply this resolver — the projection treats that
    * as "I can't compute this; leave the field undefined."
    */
-  isOperatorConfigured?: (catalogId: string, clientSecretKey: string) => Promise<boolean>;
+  isOAuthClientConfigured?: (catalogId: string, clientSecretKey: string) => Promise<boolean>;
 }

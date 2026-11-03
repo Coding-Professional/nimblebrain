@@ -10,10 +10,10 @@ export {
   readSkillMtime,
 } from "./loader.ts";
 export type { SkillLoadingMechanism } from "./loading.ts";
-export { resolveLoadingMechanism, wouldLoad } from "./loading.ts";
+export { resolveLoadingMechanism } from "./loading.ts";
 export { SkillMatcher } from "./matcher.ts";
-export type { LoadedBy, SelectedSkill, SelectInput } from "./select.ts";
-export { selectLayer3Skills, toolMatches } from "./select.ts";
+export type { LoadedBy, SelectedSkill } from "./select.ts";
+export { toolMatches } from "./select.ts";
 export { approxTokens } from "./tokens.ts";
 export type {
   Skill,

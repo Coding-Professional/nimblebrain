@@ -15,43 +15,30 @@
  *     malformed call can't widen it) that fails closed on a line with no
  *     `userId`.
  *   - `scope: "org"` — every user's spend, attributed by owner. Gated to org
- *     admin/owner via `ORG_ADMIN_ROLES`, matching the
- *     `instructions__write_instructions` / `manage_users` precedent.
+ *     admin via `ORG_ADMIN_ROLES`, matching the
+ *     `manage_users` precedent.
  */
 
 import { textContent } from "../../engine/content-helpers.ts";
-import type { EventSink, ToolResult } from "../../engine/types.ts";
+import type { EventSink } from "../../engine/types.ts";
 import { ORG_ADMIN_ROLES } from "../../identity/types.ts";
 import type { Runtime } from "../../runtime/runtime.ts";
-import { defineInProcessApp, type InProcessTool } from "../../tools/in-process-app.ts";
+import {
+  defineInProcessApp,
+  type InProcessTool,
+  type ToolErrorResult,
+  type TypedToolResult,
+  typedTool,
+} from "../../tools/in-process-app.ts";
 import type { McpSource } from "../../tools/mcp-source.ts";
 import { WORKSPACE_OPTIONAL_META } from "../../tools/workspace-optional.ts";
 import { aggregateUsage } from "../../usage/aggregate.ts";
-import {
-  type UsageGroupBy,
-  type UsageOrigin,
-  UsageReportInput,
-  type UsageReportOutput,
-  type UsageStackBy,
-} from "../schemas/usage.ts";
-
-interface UsageReportArgs {
-  scope?: "user" | "org";
-  period?: string;
-  groupBy?: UsageGroupBy | UsageGroupBy[];
-  from?: string;
-  to?: string;
-  stackBy?: UsageStackBy;
-  workspaceId?: string;
-  userId?: string;
-  model?: string;
-  origin?: UsageOrigin;
-}
+import { UsageReportInput, UsageReportOutput } from "../schemas/usage.ts";
 
 const USAGE_REPORT_DESCRIPTION =
   "Get aggregated usage (tokens, cost, LLM calls) recorded at the point of spend. " +
   'Defaults to `scope: "user"` — only your own spend. ' +
-  '`scope: "org"` reports every user\'s usage and requires org admin/owner; ' +
+  '`scope: "org"` reports every user\'s usage and requires org admin; ' +
   'pair it with `groupBy: "user"` for a per-user breakdown. ' +
   "`workspaceId`, `userId`, `model`, and `origin` narrow the calls counted.";
 
@@ -76,7 +63,7 @@ function resolveScope(
 
   if (requestedScope === "org") {
     if (!ORG_ADMIN_ROLES.has(identity.orgRole)) {
-      return { error: "Org-scope usage requires org admin or owner." };
+      return { error: "Org-scope usage requires org admin." };
     }
     return { scope: "org", ownerFilter: undefined };
   }
@@ -85,21 +72,26 @@ function resolveScope(
   return { scope: "user", ownerFilter: identity.id };
 }
 
+/** A refusal, read by the model as plain text. */
+function fail(message: string): ToolErrorResult {
+  return { content: textContent(message), isError: true };
+}
+
 export function createUsageSource(runtime: Runtime, eventSink: EventSink): McpSource {
   const tools: InProcessTool[] = [
-    {
+    typedTool({
       name: "report",
       description: USAGE_REPORT_DESCRIPTION,
       meta: { ...WORKSPACE_OPTIONAL_META },
       inputSchema: UsageReportInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: UsageReportOutput,
+      handler: async (args): Promise<TypedToolResult<typeof UsageReportOutput>> => {
         try {
-          const args = input as UsageReportArgs;
           const requestedScope = args.scope ?? "user";
 
           const resolved = resolveScope(runtime, requestedScope);
           if ("error" in resolved) {
-            return { content: textContent(resolved.error), isError: true };
+            return fail(resolved.error);
           }
           // A user-scope caller may name only themselves. Refused rather than
           // returned empty, so asking for a peer's spend reads as not allowed
@@ -110,10 +102,7 @@ export function createUsageSource(runtime: Runtime, eventSink: EventSink): McpSo
             args.userId !== undefined &&
             args.userId !== resolved.ownerFilter
           ) {
-            return {
-              content: textContent('Filtering by another user requires scope: "org".'),
-              isError: true,
-            };
+            return fail('Filtering by another user requires scope: "org".');
           }
 
           const period = args.period ?? "month";
@@ -138,9 +127,7 @@ export function createUsageSource(runtime: Runtime, eventSink: EventSink): McpSo
           const out: UsageReportOutput = { scope: resolved.scope, ...report };
           return {
             content: textContent(JSON.stringify(out, null, 2)),
-            // Wire-format cast: `structuredContent` is `Record<string,
-            // unknown>`; the named `out` above is the load-bearing assertion.
-            structuredContent: out as unknown as Record<string, unknown>,
+            structuredContent: out,
             isError: false,
           };
         } catch (err) {
@@ -151,7 +138,7 @@ export function createUsageSource(runtime: Runtime, eventSink: EventSink): McpSo
           };
         }
       },
-    },
+    }),
   ];
 
   // No UI resource. Usage has one rendering, the `/org/usage` settings page,

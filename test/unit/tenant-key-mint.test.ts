@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
+  assertFleetIdentityProvisioned,
   buildMintRequest,
   createMintingFetch,
   MintError,
@@ -135,6 +137,49 @@ describe("buildMintRequest — authorizer parity", () => {
   });
 });
 
+// Cross-implementation drift guard. The authorizer's tests verify this same wire.
+// If either side drifts on HKDF info, MAC framing or payload shape, exactly one
+// breaks. The master is a fixture, never a real key.
+describe("buildMintRequest — cross-impl vector", () => {
+  it("reproduces the committed wire byte-for-byte", () => {
+    const vector = JSON.parse(
+      readFileSync(
+        new URL("./fixtures/authorizer-mint-cross-impl-v1.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      masterKeyB64: string;
+      tid: string;
+      workspace: string;
+      audience: string;
+      scope: string;
+      iat: number;
+      exp: number;
+      wire: string;
+    };
+    const tenantKey = Buffer.from(
+      hkdfSync(
+        "sha256",
+        Buffer.from(vector.masterKeyB64, "base64"),
+        Buffer.from(vector.tid),
+        Buffer.from("mcp-authorizer/v1"),
+        32,
+      ),
+    );
+    expect(
+      buildMintRequest({
+        tid: vector.tid,
+        workspace: vector.workspace,
+        audience: vector.audience,
+        scope: vector.scope,
+        tenantKey,
+        now: vector.iat,
+        ttlSeconds: vector.exp - vector.iat,
+      }),
+    ).toBe(vector.wire);
+  });
+});
+
 describe("buildMintRequest — local validation", () => {
   const base = {
     tid: TID,
@@ -195,6 +240,69 @@ describe("readTenantIdentityFromEnv", () => {
     } as NodeJS.ProcessEnv);
     expect(id.tid).toBe("hq");
     expect(id.tenantKey.equals(TENANT_KEY)).toBe(true);
+  });
+
+  it("refuses a tenant id outside the DNS-label grammar", () => {
+    expect(() =>
+      readTenantIdentityFromEnv({
+        NB_TENANT_ID: "Not_A_Label",
+        NB_MCP_AUTHORIZER_TENANT_KEY: TENANT_KEY.toString("base64"),
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/DNS-label/);
+  });
+
+  it("refuses a truncated key and a placeholder key", () => {
+    for (const key of [Buffer.alloc(16, 7), Buffer.alloc(32, 0), Buffer.alloc(32, 0xff)]) {
+      expect(() =>
+        readTenantIdentityFromEnv({
+          NB_TENANT_ID: "hq",
+          NB_MCP_AUTHORIZER_TENANT_KEY: key.toString("base64"),
+        } as NodeJS.ProcessEnv),
+      ).toThrow(/NB_MCP_AUTHORIZER_TENANT_KEY/);
+    }
+  });
+});
+
+describe("assertFleetIdentityProvisioned", () => {
+  const url = { NB_FLEET_AUTHORIZER_TOKEN_URL: "http://authorizer.example/token" };
+
+  it("does nothing without a token endpoint, even with no identity", () => {
+    expect(() => assertFleetIdentityProvisioned({} as NodeJS.ProcessEnv)).not.toThrow();
+  });
+
+  it("does nothing when only the issuer is set: the token endpoint is the signal", () => {
+    expect(() =>
+      assertFleetIdentityProvisioned({
+        NB_FLEET_AUTHORIZER_ISSUER: "http://authorizer.example",
+      } as NodeJS.ProcessEnv),
+    ).not.toThrow();
+  });
+
+  it("refuses a token endpoint with no tenant id or key", () => {
+    expect(() =>
+      assertFleetIdentityProvisioned({
+        ...url,
+        NB_MCP_AUTHORIZER_TENANT_KEY: TENANT_KEY.toString("base64"),
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/NB_TENANT_ID/);
+    expect(() =>
+      assertFleetIdentityProvisioned({ ...url, NB_TENANT_ID: "hq" } as NodeJS.ProcessEnv),
+    ).toThrow(/NB_MCP_AUTHORIZER_TENANT_KEY/);
+  });
+
+  it("passes with a provisioned identity, whether or not the issuer is also set", () => {
+    const env = {
+      ...url,
+      NB_TENANT_ID: "hq",
+      NB_MCP_AUTHORIZER_TENANT_KEY: TENANT_KEY.toString("base64"),
+    };
+    expect(() => assertFleetIdentityProvisioned(env as NodeJS.ProcessEnv)).not.toThrow();
+    expect(() =>
+      assertFleetIdentityProvisioned({
+        ...env,
+        NB_FLEET_AUTHORIZER_ISSUER: "http://authorizer.example",
+      } as NodeJS.ProcessEnv),
+    ).not.toThrow();
   });
 });
 
@@ -404,7 +512,7 @@ describe("createMintingFetch", () => {
   });
 });
 
-describe("resolveAuthorizerTokenUrl (issuer/endpoint decoupling)", () => {
+describe("resolveAuthorizerTokenUrl", () => {
   const ENV = ["NB_FLEET_AUTHORIZER_TOKEN_URL", "NB_FLEET_AUTHORIZER_ISSUER"] as const;
   function withEnv(
     vals: Partial<Record<(typeof ENV)[number], string | undefined>>,
@@ -426,65 +534,27 @@ describe("resolveAuthorizerTokenUrl (issuer/endpoint decoupling)", () => {
     }
   }
 
-  it("uses an explicit tokenUrl verbatim, ignoring the issuer (location != identity)", () => {
-    // The whole point: a moved endpoint never disturbs the `iss` identity.
-    expect(
-      resolveAuthorizerTokenUrl({
-        tokenUrl: "http://mcp-authorizer.auth.svc/token",
-        issuer: "http://mcp-authorizer.mcp-shared.svc",
-      }),
-    ).toBe("http://mcp-authorizer.auth.svc/token");
-  });
-
-  it("derives `${issuer}/token` when no explicit tokenUrl (legacy fallback)", () => {
-    expect(resolveAuthorizerTokenUrl({ issuer: "http://mcp-authorizer.mcp-shared.svc" })).toBe(
-      "http://mcp-authorizer.mcp-shared.svc/token",
+  it("reads NB_FLEET_AUTHORIZER_TOKEN_URL", () => {
+    withEnv({ NB_FLEET_AUTHORIZER_TOKEN_URL: "http://mcp-authorizer.auth.svc/token" }, () =>
+      expect(resolveAuthorizerTokenUrl()).toBe("http://mcp-authorizer.auth.svc/token"),
     );
   });
 
-  it("prefers NB_FLEET_AUTHORIZER_TOKEN_URL over the issuer-derived endpoint", () => {
-    withEnv(
-      {
-        NB_FLEET_AUTHORIZER_TOKEN_URL: "http://mcp-authorizer.auth.svc/token",
-        NB_FLEET_AUTHORIZER_ISSUER: "http://mcp-authorizer.mcp-shared.svc",
-      },
-      () => expect(resolveAuthorizerTokenUrl()).toBe("http://mcp-authorizer.auth.svc/token"),
-    );
-  });
-
-  it("falls back to `${NB_FLEET_AUTHORIZER_ISSUER}/token` when the token-url var is unset", () => {
+  it("derives nothing from NB_FLEET_AUTHORIZER_ISSUER", () => {
     withEnv(
       {
         NB_FLEET_AUTHORIZER_TOKEN_URL: undefined,
         NB_FLEET_AUTHORIZER_ISSUER: "http://mcp-authorizer.mcp-shared.svc",
       },
-      () => expect(resolveAuthorizerTokenUrl()).toBe("http://mcp-authorizer.mcp-shared.svc/token"),
-    );
-  });
-
-  it("returns undefined when neither is configured", () => {
-    withEnv(
-      { NB_FLEET_AUTHORIZER_TOKEN_URL: undefined, NB_FLEET_AUTHORIZER_ISSUER: undefined },
       () => expect(resolveAuthorizerTokenUrl()).toBeUndefined(),
     );
   });
 
-  it("per-connection config wins over global env (a pinned authorizer is never silently redirected)", () => {
-    withEnv(
-      {
-        NB_FLEET_AUTHORIZER_TOKEN_URL: "http://global-authorizer.svc/token",
-        NB_FLEET_AUTHORIZER_ISSUER: "http://global-authorizer.svc",
-      },
-      () => {
-        // A connection pinned via config.issuer must beat the global TOKEN_URL env...
-        expect(resolveAuthorizerTokenUrl({ issuer: "http://pinned.example" })).toBe(
-          "http://pinned.example/token",
-        );
-        // ...and an explicit config.tokenUrl likewise.
-        expect(resolveAuthorizerTokenUrl({ tokenUrl: "http://pinned.example/token" })).toBe(
-          "http://pinned.example/token",
-        );
-      },
+  it("a per-connection tokenUrl wins over the global env (a pinned authorizer is never redirected)", () => {
+    withEnv({ NB_FLEET_AUTHORIZER_TOKEN_URL: "http://global-authorizer.svc/token" }, () =>
+      expect(resolveAuthorizerTokenUrl("http://pinned.example/token")).toBe(
+        "http://pinned.example/token",
+      ),
     );
   });
 });

@@ -1,27 +1,28 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
-import { ProtocolError, UnauthorizedError } from "@modelcontextprotocol/client";
+import { type Client, ProtocolError, UnauthorizedError } from "@modelcontextprotocol/client";
 import { NoopEventSink } from "../../src/adapters/noop-events.ts";
 import type { EngineEvent, EventSink } from "../../src/engine/types.ts";
 import { INFRA_ERROR_META_KEY, SKILL_ACTIVATED_META_KEY } from "../../src/engine/types.ts";
 import { McpSource, type McpTransportMode, policyFor } from "../../src/tools/mcp-source.ts";
-import { TASKS_EXTENSION_ID } from "../../src/tools/mcp-task-client.ts";
+import { TASKS_EXTENSION_ID, type TaskClient } from "../../src/tools/mcp-task-client.ts";
 import type { WorkspaceOAuthProvider } from "../../src/tools/workspace-oauth-provider.ts";
 import { payloadsOf } from "../helpers/engine-events.ts";
+import { mcpSourceInternals, mockTryRestart } from "../helpers/mcp-source-internals.ts";
+import { stub } from "../helpers/stub.ts";
 
 /**
- * Phase 2 of the recovery redesign (research/SPEC-mcp-source-recovery.md): the
- * single `recover` path that both `execute` (tools/call) and `readResource` route
- * their catch through, driven by `classifyConnectionFailure` + `policyFor`. These
- * lock the intentional behavior CONVERGENCES that the unification introduces:
+ * The single `recover` path that both `execute` (tools/call) and `readResource`
+ * route their catch through, driven by `classifyConnectionFailure` + `policyFor`.
+ * These lock the behavior the shared path guarantees:
  *   - app/protocol errors on tools/call surface WITHOUT a futile restart
- *   - readResource now handles auth-loss (flips reauth_required) and recovers a
- *     torn transport — previously a silent null
+ *   - readResource handles auth-loss (flips reauth_required) and recovers a
+ *     torn transport rather than returning a silent null
  *   - the task-augmented no-retry invariant survives (policy-level)
  */
 
 function remoteSource(opts: {
-  callTool?: () => Promise<unknown>;
-  readResource?: () => Promise<unknown>;
+  callTool?: Client["callTool"];
+  readResource?: Client["readResource"];
   notifyAuthLost?: () => void;
   delays?: readonly number[];
   sink?: EventSink;
@@ -29,26 +30,21 @@ function remoteSource(opts: {
   const authProvider =
     opts.notifyAuthLost === undefined
       ? undefined
-      : ({ notifyAuthLost: opts.notifyAuthLost } as unknown as WorkspaceOAuthProvider);
+      : stub<WorkspaceOAuthProvider>({ notifyAuthLost: opts.notifyAuthLost });
   const mode: McpTransportMode = {
     type: "remote",
     url: new URL("https://svc.example.com/mcp"),
     ...(authProvider ? { authProvider } : {}),
   };
   const source = new McpSource("svc", mode, opts.sink ?? new NoopEventSink());
-  const internal = source as unknown as {
-    client: { callTool?: unknown; readResource?: unknown; close: () => Promise<void> };
-    dead: boolean;
-    start: () => Promise<void>;
-    recoveryDelaysMs: readonly number[];
-  };
-  internal.client = {
+  const internal = mcpSourceInternals(source);
+  internal.client = stub<Client>({
     callTool: opts.callTool,
     readResource: opts.readResource,
     close: () => Promise.resolve(),
-  };
+  });
   internal.dead = false;
-  internal.start = () => Promise.resolve(); // neutralize real network on tryRestart
+  source.start = () => Promise.resolve(); // neutralize real network on tryRestart
   // Only override the per-call-site budget when a test asks — otherwise exercise
   // the real production schedule (tool calls = one immediate retry).
   if (opts.delays !== undefined) internal.recoveryDelaysMs = opts.delays;
@@ -56,22 +52,16 @@ function remoteSource(opts: {
 }
 
 function spyRestart(source: McpSource, result: boolean) {
-  return spyOn(
-    source as unknown as { tryRestart: () => Promise<boolean> },
-    "tryRestart",
-  ).mockResolvedValue(result);
+  return mockTryRestart(source).mockResolvedValue(result);
 }
 
 /** A restart that succeeds AND re-establishes the client — models an idle-closed
  *  source that a stop()/start() reconnect brings back. (`spyRestart(_, true)`
  *  returns true without wiring a client, which models a start that hasn't yet
  *  produced one.) */
-function spyRestartEstablishing(source: McpSource, client: unknown) {
-  const internal = source as unknown as { client: unknown };
-  return spyOn(
-    source as unknown as { tryRestart: () => Promise<boolean> },
-    "tryRestart",
-  ).mockImplementation(async () => {
+function spyRestartEstablishing(source: McpSource, client: Client | null) {
+  const internal = mcpSourceInternals(source);
+  return mockTryRestart(source).mockImplementation(async () => {
     internal.client = client;
     return true;
   });
@@ -137,7 +127,7 @@ describe("execute (tools/call) — unified recovery", () => {
   it("surfaces a 429 WITHOUT restarting, and tells the agent to fan out less", async () => {
     // The failure this closes: a gateway answers `429 {"error":"rate_limited"}` to
     // a parallel batch of tool calls. That arrives message-only (no numeric code),
-    // so it used to classify as `unknown` → `transport-dead` → stop()/start().
+    // so it could classify as `unknown` → `transport-dead` → stop()/start().
     // Because `stop()` aborts every in-flight stream on the source, ONE throttled
     // call tears the transport out from under every admitted sibling in the batch —
     // including writes the server has already committed. The restart must not
@@ -163,9 +153,7 @@ describe("execute (tools/call) — unified recovery", () => {
       // The `dead` flag is what would hand this source to HealthMonitor's restart
       // burst. (`isAlive()` also reads `transport`, which this harness never wires,
       // so it can't distinguish the thing under test here.)
-      expect((source as unknown as { _isDeadForTesting: () => boolean })._isDeadForTesting()).toBe(
-        false,
-      );
+      expect(source._isDeadForTesting()).toBe(false);
       // The agent's default repair for a failed batch is to retry the batch, which
       // is exactly wrong here — the surfaced text has to redirect it.
       const text = JSON.stringify(result.content);
@@ -185,23 +173,25 @@ describe("execute (tools/call) — unified recovery", () => {
     // advice would invite the duplicate side effects that no-retry rule exists to
     // prevent. The diagnosis is still useful; the instruction is not.
     const source = remoteSource({});
-    const internal = source as unknown as {
-      cachedTools: unknown[];
-      client: Record<string, unknown>;
-      taskClient: unknown;
-      protocolEra: "legacy" | "modern";
-    };
+    const internal = mcpSourceInternals(source);
     // A 2026-07-28 server advertising the tasks extension: every call takes the task path.
     internal.protocolEra = "modern";
     internal.client.getServerCapabilities = () => ({ extensions: { [TASKS_EXTENSION_ID]: {} } });
-    internal.cachedTools = [{ name: "svc__long_job", inputSchema: { type: "object" } }];
+    internal.cachedTools = [
+      {
+        name: "svc__long_job",
+        description: "",
+        inputSchema: { type: "object" },
+        source: "mcp:svc",
+      },
+    ];
     // The throttle lands on the task stream, which is the path that can be
     // refused AFTER the task already exists server-side.
-    internal.taskClient = {
+    internal.taskClient = stub<TaskClient>({
       callToolStream: () => {
         throw new Error("Streamable HTTP error: Failed to open SSE stream: Too Many Requests");
       },
-    };
+    });
     const restart = spyRestart(source, true);
     try {
       const result = await source.execute("long_job", {});
@@ -337,19 +327,31 @@ describe("execute (tools/call) — unified recovery", () => {
     // The strip has two projections and the inline one is covered above. Without
     // this, deleting the task-path call leaves the suite green — verified.
     const source = remoteSource({});
-    const internal = source as unknown as {
-      cachedTools: unknown[];
-      client: Record<string, unknown>;
-      taskClient: unknown;
-      protocolEra: "legacy" | "modern";
-    };
+    const internal = mcpSourceInternals(source);
     // A 2026-07-28 server advertising the tasks extension: every call takes the task path.
     internal.protocolEra = "modern";
     internal.client.getServerCapabilities = () => ({ extensions: { [TASKS_EXTENSION_ID]: {} } });
-    internal.cachedTools = [{ name: "svc__long_job", inputSchema: { type: "object" } }];
-    internal.taskClient = {
+    internal.cachedTools = [
+      {
+        name: "svc__long_job",
+        description: "",
+        inputSchema: { type: "object" },
+        source: "mcp:svc",
+      },
+    ];
+    const now = new Date().toISOString();
+    internal.taskClient = stub<TaskClient>({
       callToolStream: async function* () {
-        yield { type: "taskCreated", task: { taskId: "t1", status: "working" } };
+        yield {
+          type: "taskCreated",
+          task: {
+            taskId: "t1",
+            status: "working",
+            ttl: 60_000,
+            createdAt: now,
+            lastUpdatedAt: now,
+          },
+        };
         yield {
           type: "result",
           result: {
@@ -359,7 +361,7 @@ describe("execute (tools/call) — unified recovery", () => {
           },
         };
       },
-    };
+    });
 
     const result = await source.execute("long_job", {});
     expect(result._meta?.[INFRA_ERROR_META_KEY]).toBeUndefined();
@@ -415,7 +417,7 @@ describe("execute (tools/call) — unified recovery", () => {
     // instantly. Exempting it would remove the run's only brake on a source that
     // is not coming back.
     const source = remoteSource({});
-    const internal = source as unknown as { client: unknown; lastReconnectFailedAt: number };
+    const internal = mcpSourceInternals(source);
     internal.client = null;
     internal.lastReconnectFailedAt = Date.now();
 
@@ -508,7 +510,7 @@ describe("execute (tools/call) — unified recovery", () => {
 });
 
 describe("readResource — unified recovery (new behaviors)", () => {
-  it("flips reauth_required on auth loss (was a silent null before)", async () => {
+  it("flips reauth_required on auth loss rather than returning a silent null", async () => {
     const notifyAuthLost = mock(() => {});
     const source = remoteSource({
       readResource: () => Promise.reject(new UnauthorizedError("token rejected")),
@@ -524,7 +526,7 @@ describe("readResource — unified recovery (new behaviors)", () => {
     }
   });
 
-  it("recovers a torn transport on a ui:// read (was a silent null before)", async () => {
+  it("recovers a torn transport on a ui:// read rather than returning a silent null", async () => {
     let calls = 0;
     const source = remoteSource({
       readResource: () => {
@@ -607,7 +609,7 @@ describe("on-demand reconnect of a torn-down (null) client — the fleet-flap fi
     const source = remoteSource({
       callTool: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], isError: false }),
     });
-    const internal = source as unknown as { client: unknown };
+    const internal = mcpSourceInternals(source);
     const liveClient = internal.client; // the fake client remoteSource wired
     internal.client = null; // simulate the idle-close teardown
     const restart = spyRestartEstablishing(source, liveClient);
@@ -627,7 +629,7 @@ describe("on-demand reconnect of a torn-down (null) client — the fleet-flap fi
     const source = remoteSource({
       callTool: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], isError: false }),
     });
-    (source as unknown as { dead: boolean }).dead = true;
+    mcpSourceInternals(source).dead = true;
     const restart = spyRestart(source, true);
     try {
       const result = await source.execute("do_thing", {});
@@ -644,7 +646,7 @@ describe("on-demand reconnect of a torn-down (null) client — the fleet-flap fi
     const source = remoteSource({
       callTool: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], isError: false }),
     });
-    const internal = source as unknown as { client: unknown; stopped: boolean };
+    const internal = mcpSourceInternals(source);
     internal.client = null;
     internal.stopped = true;
     const restart = spyRestart(source, true);
@@ -667,7 +669,7 @@ describe("on-demand reconnect of a torn-down (null) client — the fleet-flap fi
     const source = remoteSource({
       callTool: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], isError: false }),
     });
-    (source as unknown as { client: unknown }).client = null;
+    mcpSourceInternals(source).client = null;
     const restart = spyRestart(source, false); // stays down: never re-establishes a client
     try {
       expect((await source.execute("do_thing", {})).isError).toBe(true);
@@ -683,7 +685,7 @@ describe("on-demand reconnect of a torn-down (null) client — the fleet-flap fi
       readResource: () =>
         Promise.resolve({ contents: [{ uri: "ui://svc/main", text: "<html>ok</html>" }] }),
     });
-    const internal = source as unknown as { client: unknown };
+    const internal = mcpSourceInternals(source);
     const liveClient = internal.client;
     internal.client = null;
     const restart = spyRestartEstablishing(source, liveClient);
@@ -703,12 +705,13 @@ describe("on-demand reconnect of a torn-down (null) client — the fleet-flap fi
     // Discovery/composition probes legitimately race a not-yet-started client — they
     // must stay a cheap null, never trigger a stop()/start().
     const source = remoteSource({
-      readResource: () => Promise.resolve({ contents: [{ uri: "app://instructions", text: "x" }] }),
+      readResource: () =>
+        Promise.resolve({ contents: [{ uri: "skill://probe/SKILL.md", text: "x" }] }),
     });
-    (source as unknown as { client: unknown }).client = null;
+    mcpSourceInternals(source).client = null;
     const restart = spyRestart(source, true);
     try {
-      expect(await source.readResource("app://instructions")).toBeNull();
+      expect(await source.readResource("skill://probe/SKILL.md")).toBeNull();
       expect(restart).not.toHaveBeenCalled();
     } finally {
       restart.mockRestore();

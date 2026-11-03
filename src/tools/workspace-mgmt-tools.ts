@@ -103,7 +103,7 @@ export function createManageWorkspacesTool(ctx: ManageWorkspacesContext): InProc
   return {
     name: "manage_workspaces",
     description:
-      "Manage workspaces and their members. Workspace CRUD requires org admin, except a rename (update with only name), which a workspace admin member may also make. Listing members is open to any member of the workspace. Changing members requires org admin or workspace admin membership, so an org admin can seat themselves as admin of any workspace, including one left with no admin member. add_member takes the person's userId or the email of someone in the organization. list_archives and purge_archive (org admin) list the archives deleted workspaces leave under archived/ and permanently remove one, named by its directory. Conversation sharing was removed in Stage 1 of the cross-workspace refactor and returns in Stage 4 with policy-gated primitives.",
+      "Manage workspaces and their members. Workspace CRUD requires org admin, except a rename (update with only name), which a workspace admin member may also make. Listing members is open to any member of the workspace. Changing members requires org admin or workspace admin membership, so an org admin can seat themselves as admin of any workspace, including one left with no admin member. add_member takes the person's userId or the email of someone in the organization. list_archives and purge_archive (org admin) list the archives deleted workspaces leave under archived/ and permanently remove one, named by its directory.",
     meta: { ui: { visibility: ["app"] }, ...WORKSPACE_OPTIONAL_META },
     inputSchema: {
       type: "object",
@@ -660,7 +660,7 @@ async function handlePurgeArchive(
 /**
  * Check whether the requesting user may take a member action in the given
  * workspace. Listing is open to any member (`canReadWorkspaceMembers`);
- * changing the roster needs an org admin/owner or an `admin` member of this
+ * changing the roster needs an org admin or an `admin` member of this
  * workspace (`canManageWorkspaceMembers`).
  */
 async function memberActionAllowed(
@@ -782,7 +782,7 @@ async function handleAddMember(
  * Count workspace admins whose underlying user is still active (not
  * soft-deleted). The last-admin guards use this so a deactivated admin — who
  * can't actually act, since the auth layer denies them — never counts toward
- * the minimum. Mirrors `activeOwnerCount` in user-tools.ts at the workspace level.
+ * the minimum. Mirrors `activeAdminCount` in user-tools.ts at the workspace level.
  */
 async function activeAdminCount(members: WorkspaceMember[], userStore: UserStore): Promise<number> {
   const admins = members.filter((m) => m.role === "admin");

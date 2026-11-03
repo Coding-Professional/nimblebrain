@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ManagedConnectorProvider } from "../../src/connectors/providers/managed-provider.ts";
 import { managedConnectorRegistryOf } from "../../src/connectors/providers/registry.ts";
 import { WORKSPACE_PRINCIPAL_ID } from "../../src/connectors/runtime/connection.ts";
@@ -6,7 +9,10 @@ import { connectorHasStaticAuth } from "../../src/connectors/runtime/connector-a
 import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import type { ConnectorRef } from "../../src/connectors/runtime/types.ts";
 import type { EngineEvent, EventSink } from "../../src/engine/types.ts";
-import { legacyConnectorRef } from "../helpers/connector-fixtures.ts";
+import {
+  installTestCredentialStore,
+  resetTestCredentialStore,
+} from "../helpers/credential-store.ts";
 
 class NoopSink implements EventSink {
   emit(_event: EngineEvent): void {}
@@ -49,20 +55,29 @@ describe("connectorHasStaticAuth", () => {
     ).toBe(true);
   });
 
-  test("auth:none and no-auth url connectors are NOT static (they take the OAuth path)", () => {
+  test("auth:none url connectors are static (they need no credential)", () => {
     expect(
       connectorHasStaticAuth({ url: "u", serverName: "s", transport: { auth: { type: "none" } } }),
-    ).toBe(false);
-    expect(connectorHasStaticAuth({ url: "u", serverName: "s" })).toBe(false);
+    ).toBe(true);
   });
 
-  test("named and local-path connectors are not static-auth url sources", () => {
-    expect(connectorHasStaticAuth(legacyConnectorRef({ name: "n" }))).toBe(false);
-    expect(connectorHasStaticAuth(legacyConnectorRef({ path: "/p" }))).toBe(false);
+  test("url connectors with no auth are NOT static (they take the OAuth path)", () => {
+    expect(connectorHasStaticAuth({ url: "u", serverName: "s" })).toBe(false);
   });
 });
 
 describe("seedInstance — provider-auth fleet source", () => {
+  // The seed reads a brokered connection's `auth_lost` flag from the store.
+  let storeDir: string;
+  beforeEach(() => {
+    storeDir = mkdtempSync(join(tmpdir(), "nb-provider-boot-"));
+    installTestCredentialStore(storeDir);
+  });
+  afterEach(() => {
+    resetTestCredentialStore();
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
   // Regression: a provider-auth source mints on demand and has no persisted OAuth
   // tokens, so the OAuth-centric boot gate seeded it `not_authenticated` — the
   // agent never saw its tools, and the UI showed a "Connect" button that would
@@ -83,6 +98,28 @@ describe("seedInstance — provider-auth fleet source", () => {
       ?.connections.get(WORKSPACE_PRINCIPAL_ID);
     expect(conn?.state).toBe("running");
     expect(conn?.state).not.toBe("not_authenticated");
+  });
+
+  // A server that takes no credential has nothing to connect: `auth: none` must
+  // seed `running` with no stored tokens, not wait for an OAuth Connect.
+  test("an auth:none url connector seeds running with no stored tokens", async () => {
+    const lifecycle = new ConnectorLifecycleManager(new NoopSink());
+    await lifecycle.seedInstance(
+      "internal",
+      "https://internal.svc.test/mcp",
+      {
+        url: "https://internal.svc.test/mcp",
+        serverName: "internal",
+        transport: { type: "streamable-http", auth: { type: "none" } },
+      },
+      undefined,
+      "ws_0076759dbbe19fcc",
+    );
+
+    const conn = lifecycle
+      .getInstance("internal", "ws_0076759dbbe19fcc")
+      ?.connections.get(WORKSPACE_PRINCIPAL_ID);
+    expect(conn?.state).toBe("running");
   });
 
   // Regression guard for the asymmetry that bit the first cut of this fix: a

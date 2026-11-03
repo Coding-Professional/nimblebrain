@@ -1,16 +1,14 @@
 /**
  * Shared predicate: "how would this skill load?"
  *
- * Single source of truth for the callers that must agree on whether a skill is
- * reachable by any loader path:
+ * Single source of truth for the callers that must agree on how a skill
+ * reaches the model:
  *
  *   - `skills__list` reports a `loading` descriptor, and `skills__read` shows a
- *     `loads:` header, so a dead (catalog-only) skill is visible instead of
- *     silently inert.
+ *     `loads:` header.
  *   - `createSkill` surfaces the resolved mechanism in its confirmation note.
  *   - the skills editor renders the verdict live while the form is being
- *     filled, so a dead skill is visible at the moment it is authored rather
- *     than after a save. It reads `web/src/_generated/skill-loading.ts`, which
+ *     filled. It reads `web/src/_generated/skill-loading.ts`, which
  *     `bun run codegen` emits as a verbatim copy of `src/skills/loading.ts` —
  *     which is why that module imports nothing: a copy with an import would not
  *     resolve in the web package, and a hand-written second predicate would
@@ -19,9 +17,11 @@
  * The precedence below mirrors the real loader/selector/matcher behavior:
  *   - `loading-strategy: always` → the always-on context channel
  *     (`select.ts` `partitionSkillsByRole`).
- *   - `dynamic` + tool-affinity → Layer 3 (`select.ts` `selectLayer3Skills`).
+ *   - `dynamic` + tool-affinity → before its bound tool's first call (the
+ *     engine's hold, ADR-0053).
  *   - `dynamic` + triggers → the per-request matcher (`matcher.ts`).
- *   - otherwise catalog-only — no active loader path until the catalog ships.
+ *   - otherwise on request — the skill catalog lists it, and the model loads it
+ *     with `nb__use_skill` when the job needs it.
  *
  * Pure — no I/O, no Runtime, no globals.
  */
@@ -38,15 +38,16 @@ export type LoadingSignals = {
 };
 
 /**
- * The mechanism by which a skill would load *today*. `"none"` means no loader
- * path reaches it — the dead state issue #391 is about.
+ * The mechanism by which a skill loads. Every skill has one: a `dynamic` skill
+ * with no tool binding and no trigger is `on_request`, loaded from the catalog
+ * when the model asks for it.
  *
  * Note the value names differ from `SkillLoadingStrategy` deliberately:
  * `"tool_affinity"` matches the `loadedBy` event vocabulary in `select.ts`
  * (the strategy is `dynamic`; the load reason is `tool_affinity`), and
  * `"trigger"` is the matcher path which has no strategy enum at all.
  */
-export type SkillLoadingMechanism = "always" | "tool_affinity" | "trigger" | "none";
+export type SkillLoadingMechanism = "always" | "tool_affinity" | "trigger" | "on_request";
 
 /**
  * Resolve how `manifest` would load. Precedence is significant: `always` wins
@@ -57,18 +58,12 @@ export function resolveLoadingMechanism(manifest: LoadingSignals): SkillLoadingM
   if (manifest.loadingStrategy === "always") return "always";
 
   // `dynamic` skills reach the prompt via one of two signals today:
-  // 2. Tool-affinity (Layer 3, `selectLayer3Skills`).
+  // 2. Tool-affinity: delivered before the bound tool's first call.
   if (manifest.toolAffinity && manifest.toolAffinity.length > 0) return "tool_affinity";
 
   // 3. Trigger phrases (the matcher, Layer 4).
   if (manifest.triggers && manifest.triggers.length > 0) return "trigger";
 
-  // 4. Otherwise catalog-only (model-activated) — no active loader path until
-  //    the catalog ships, so nothing reaches it yet.
-  return "none";
-}
-
-/** True when some loader path would reach `manifest`. */
-export function wouldLoad(manifest: LoadingSignals): boolean {
-  return resolveLoadingMechanism(manifest) !== "none";
+  // 4. Otherwise on request: the catalog lists it and the model loads it.
+  return "on_request";
 }

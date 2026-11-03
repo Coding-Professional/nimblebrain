@@ -7,7 +7,7 @@ import { HOOK_ROTATION_GRACE_MS, type HookRegistration } from "./types.ts";
 /**
  * Reading and writing hook registrations, which live on the workspace record.
  *
- * They sit beside `oauthOperatorApps` because they are the same kind of thing
+ * They sit beside `oauthClients` because they are the same kind of thing
  * in every dimension that matters: operator-plane, workspace-scoped, and with a
  * lifecycle that is related to but not identical to a connector install. Putting
  * them there also makes the delivery path ONE read — the door already has to
@@ -15,9 +15,9 @@ import { HOOK_ROTATION_GRACE_MS, type HookRegistration } from "./types.ts";
  * separate store would make it two on the one path the spec insists stays thin.
  *
  * Writes are SERIALIZED PER WORKSPACE (`updateRegistrations`), and that is not
- * optional. `oauthOperatorApps` shares the read-modify-write shape and does not
+ * optional. `oauthClients` shares the read-modify-write shape and does not
  * serialize, so the comparison invites dropping the lock — it does not hold,
- * because the two lose different things. A lost `oauthOperatorApps` write costs
+ * because the two lose different things. A lost `oauthClients` write costs
  * an operator a repeated action they can see failed. A lost hooks write costs a
  * dead inbound stream: the server has already been handed a URL whose `kid`
  * exists nowhere, so every delivery on it 404s silently, with a healthy-looking
@@ -126,7 +126,7 @@ export function listRegistrations(ws: Pick<Workspace, "hooks">): HookRegistratio
  * writer of a workspace record shares — see its doc for why the lock is keyed by
  * workspace rather than by field. It also closes the `hooks__rotate_webhook`-vs-reconcile
  * window that `ensureHooks` leaves open by bypassing the flight for a rotation:
- * the two can still run concurrently, but they can no longer interleave inside
+ * the two can still run concurrently, but they cannot interleave inside
  * the write.
  */
 export async function updateRegistrations(

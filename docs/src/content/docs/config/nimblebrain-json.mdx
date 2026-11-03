@@ -3,14 +3,14 @@ title: nimblebrain.json
 description: Complete reference for the NimbleBrain instance configuration file.
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 
 NimbleBrain splits configuration into two files:
 
 - **`nimblebrain.json`** — instance-level settings (models, HTTP, logging, limits, feature flags). One file per deployment. **This page.**
 - **`workspace.json`** — per-workspace settings (connectors, skill directories, optional model overrides). See [`workspace.json`](/config/workspace-json).
 
-Top-level `skillDirs`, `home`, and `preferences` entries in `nimblebrain.json` are stripped at load — they belong in `workspace.json` now. See [workspace configuration](/config/workspace-json) for where they live. A workspace's `connectors` array belongs there too; in this file the name `connectors` is the [provider and gateway block](#connectors).
+Top-level `skillDirs` and `home` entries in `nimblebrain.json` are stripped at load — they belong in `workspace.json`. See [workspace configuration](/config/workspace-json) for where they live. A workspace's `connectors` array belongs there too; in this file the name `connectors` is the [provider and gateway block](#connectors). Preferences (display name, timezone, locale, theme, model) are not config in either file: each person sets their own with the `nb__set_preferences` tool or [profile settings](/guide/settings), and they are stored on that user's record.
 
 ## Config resolution
 
@@ -107,22 +107,23 @@ A sibling `nimblebrain.overrides.json` next to the resolved config file is **dee
 | `maxOutputTokens` | `integer` | the model's catalog output limit | Max output tokens per LLM call. Leave unset to use each model's own limit (`limits.output` in the synced catalog; 16,384 for a model the catalog lacks). A set value applies to every model, clamped to that model's limit, and thinking counts toward it, so a low cap can leave a reasoning model little room for its answer. |
 | `maxToolResultSize` | `integer` | `1000000` | Max characters for a single tool result. `0` disables the cap. |
 | `thinking` | `"off" \| "adaptive" \| "enabled"` | `enabled` on reasoning models | Extended-thinking mode, applied to every provider that supports reasoning. `off`: do not reason — **not enforceable on Anthropic's adaptive-only models** (Opus 4.7/4.8, Sonnet 5, Opus 5), which have no such state: the AI SDK validates `thinking.type=disabled` and then never sends it, so the model applies its own default ([#738](https://github.com/NimbleBrainInc/nimblebrain/issues/738)). `adaptive`: model decides per call, at no stated depth. `enabled`: reason every turn, at `thinkingEffort`. **Applies only to models the catalog carries and flags reasoning-capable** — an override can ask for reasoning but cannot make the parameter exist. A pinned model id, or one served by an OpenAI-compatible proxy under its own name, isn't in the catalog and so gets no reasoning options; the runtime logs a warning naming the model when it drops an override this way. Typically set via the admin `set_model_config` tool, which writes it to `nimblebrain.overrides.json`. |
-| `thinkingEffort` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `medium` | How hard to think when reasoning is on. **The portable control** — see [reasoning depth](#reasoning-depth) for how it reaches each provider. Ignored for `off` and `adaptive`. |
+| `thinkingEffort` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `medium` | How hard to think when reasoning is on. **The portable control** — see [reasoning depth](#reasoning-depth) for how it reaches each provider. Ignored for `off` and `adaptive`. A task's own `thinkingEffort` replaces it for that task's runs ([Tasks](/using/tasks/#limiting-spend-and-tools)). |
 | `thinkingBudgetTokens` | `integer` | — | Explicit token budget, for metering thinking in tokens instead of naming a depth. Only honored by providers that meter it that way (Anthropic up to 4.6, Gemini 2.5); elsewhere `thinkingEffort` applies — Gemini 3 takes a level, not a budget. Counts toward `maxOutputTokens`. Anthropic requires a minimum of 1,024. Prefer `thinkingEffort` unless you need a hard token cap. |
-| `sessionStore` | `object` | `{ "type": "memory", "ttlSeconds": 28800 }` | MCP session metadata store for `/mcp`. See [sessionStore](#sessionstore). |
 | `logging` | `object` | — | Structured logging config. See [logging](#logging). |
 | `http` | `object` | `{ "port": 27247, "host": "127.0.0.1" }` | HTTP server config. Omit for programmatic-only use. |
 | `features` | `object` | all `true` | Feature flags. See [Feature Flags](/config/features). |
 | `connectors` | `object` | — | Managed-connector provider settings (Composio). See [connectors](#connectors). |
 | `notifications` | `object` | — | Pacing for the notification outbox poll. See [notifications](#notifications). |
 | `tasks` | `object` | — | Task run slots, queue, and per-run ceilings. See [tasks](#tasks). |
+| `execution` | `object` | native engine | Which agent runtime executes a run: the native engine, or an agent worker the runtime dials. Experimental. See [execution](#execution). |
 | `files` | `object` | — | File upload limits. See [files](#files). |
 | `allowInsecureRemotes` | `boolean` | `false` | Allow HTTP (non-TLS) remote connector connections. Dev only. |
 | `telemetry` | `object` | `{ "enabled": true }` | Anonymous usage telemetry. See [telemetry](#telemetry). |
+| `brand` | `object` | — | White-label name, logos, accent colour and fonts. See [Branding](/config/branding). |
 | `workDir` | `string` | `"~/.nimblebrain"` | Working directory for runtime state (conversations, logs, workspaces). |
 
 <Aside type="note">
-  **Workspace-owned fields** — `skillDirs`, `home`, `preferences` — are stripped if placed at the top level. They live in [`workspace.json`](/config/workspace-json). A workspace-shaped `connectors` **array** is rejected outright, because in this file that name is the [provider and gateway block](#connectors) and takes an object.
+  **Workspace-owned fields** — `skillDirs`, `home` — are stripped if placed at the top level. They live in [`workspace.json`](/config/workspace-json). A top-level `preferences` key is ignored: preferences are per person, not per deployment. A workspace-shaped `connectors` **array** is rejected outright, because in this file that name is the [provider and gateway block](#connectors) and takes an object.
 </Aside>
 
 ## Reasoning depth
@@ -135,8 +136,9 @@ and the runtime translates.
 |---|---|
 | Anthropic — Opus 4.7/4.8, Sonnet 5, Opus 5 | `thinking: {type: "adaptive"}` + `output_config.effort`, the tier verbatim |
 | Anthropic — up to Sonnet 4.6 | `thinking: {type: "enabled"}` + a `budgetTokens` sized from the tier |
-| OpenAI, and Nebius-hosted open-weight models (Qwen, Kimi, GLM, gpt-oss, Cosmos3) | `reasoningEffort`. Its usable range stops at `high`, so `xhigh` and `max` both land there. On OpenAI, acceptance is also per model — see below |
+| OpenAI, and Nebius-hosted open-weight models (Qwen, DeepSeek, Kimi, GLM, Nemotron, gpt-oss) | `reasoningEffort`. Its usable range stops at `high`, so `xhigh` and `max` both land there. On OpenAI, acceptance is also per model — see below |
 | xAI (Grok) | `reasoningEffort`, tops out at `high`. Acceptance is per model and some Grok models take no effort parameter at all — see below |
+| GreenPT | `reasoningEffort`, tops out at `high`. Acceptance is per model — see [GreenPT](#greenpt) |
 | Google Gemini 3 | `thinkingConfig.thinkingLevel`, tops out at `high` |
 | Google Gemini 2.5 | `thinkingConfig.thinkingBudget`, sized from the tier and held inside the model's documented range |
 
@@ -173,7 +175,12 @@ In both cases a requested depth a model doesn't offer steps **down** to the
 nearest one it does, never up. Where nothing at or below the request is
 offered, no depth is sent and the model runs at its own default — so an
 explicitly set `thinkingEffort` can end up not applied on a model that doesn't
-accept it, rather than the call failing.
+accept it, rather than the call failing. When a known tier ladder steps down or
+drops an operator's requested tier, the runtime logs a `[thinking]` warning
+naming the requested tier and the tier sent (or the provider default), once per
+model and requested tier. An xAI model measured to accept no effort parameter
+sends none without this warning; an xAI or GreenPT model with no measured ladder
+warns when the operator's tier cannot be applied.
 
 `off` is not universally enforceable, and where it isn't, nothing is sent
 rather than a flag that would be rejected or ignored:
@@ -188,10 +195,12 @@ rather than a flag that would be rejected or ignored:
   On Gemini 3 it depends on the model: those offering a `minimal` level get it,
   and those that don't (both Pro entries) get nothing rather than the next tier
   up, which would answer "don't reason" with an instruction to reason.
+- **GreenPT** — models that accept `none` get it; the others (`gpt-oss-120b`,
+  `green-r`, `green-r-raw`, `minimax-m2.5`) get nothing.
 
 ## models
 
-The `models` object declares two role-based slots. Each value is a `provider:model-id` string (e.g. `"anthropic:claude-sonnet-4-6"`).
+The `models` object declares two role-based slots. Each value is a `provider:model-id` string (e.g. `"anthropic:claude-sonnet-4-6"`). The provider is part of the id: a value without one (`"claude-sonnet-4-6"`) is refused at startup, with an error naming the qualified form to write.
 
 ```json
 {
@@ -211,7 +220,9 @@ A slot left unset resolves to the built-in default model, `anthropic:claude-sonn
 
 A workspace can override individual slots via `workspace.json → models`. When a per-request model specifies a slot name (e.g. `"model": "fast"`), it's resolved against these slots. `"alias:fast"` is the same reference written explicitly; both spellings resolve identically.
 
-A bare model string that is **neither** a slot name nor a model in the catalog is passed through to the provider unchanged, with `anthropic:` prepended — the deliberate fallback for pinned or bespoke ids served under their own name (for example through an OpenAI-compatible proxy). That means a typo here is not rejected at config load; it fails at the provider on the first call that uses the slot, reporting a model you did not configure.
+A model the catalog does not list is still accepted when it names its provider (`"openai:my-fine-tune"`, or a model served under its own name through an OpenAI-compatible proxy). It is passed to that provider unchanged, so a typo in the model half is not rejected at config load; it fails at the provider on the first call that uses the slot.
+
+A catalog model's rates price its usage lines, which keep the rates of the moment each call is made, and size what each call reserves against a spend account. Where a provider runs an introductory price that ends on a published date, the catalog carries the price that holds after it. `google:gemini-4-argon` is listed at $4 input, $20 output, and $0.20 cache read per million tokens, Google's price from 2026-12-01; through 2026-11-30 Google charges half that, so usage recorded and budget consumed on it during that period read at twice what Google bills.
 
 ### Changing a slot affects new conversations only
 
@@ -257,7 +268,7 @@ an existing deployment changes nothing and an org opts *into* restriction.
 
 | Field | Type | Description |
 |---|---|---|
-| `allowed` | `string[]` | Qualified `provider:model-id` strings. |
+| `allowed` | `string[]` | Qualified `provider:model-id` strings. An entry without a provider is refused at startup. |
 
 Policy can only **subtract**. It narrows what the configured providers can
 already reach — naming a model whose provider has no key does not make it
@@ -292,15 +303,61 @@ Per-provider API keys. With no `providers` block, the runtime uses Anthropic, ke
 }
 ```
 
-Each provider key is optional. If a provider's `apiKey` is omitted, the runtime falls back to that provider's standard env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `NEBIUS_API_KEY`, `XAI_API_KEY`).
+Each provider key is optional. If a provider's `apiKey` is omitted, the runtime falls back to that provider's standard env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GREENPT_API_KEY`, `NEBIUS_API_KEY`, `XAI_API_KEY`).
 
 <Aside type="caution">
   Prefer environment variables for API keys in production. Config files end up in version control and backup snapshots by accident.
 </Aside>
 
+### Through a model gateway
+
+With [`execution.modelGateway`](#execution) set, every provider's calls go through the installation's model gateway instead of to the provider, and the runtime holds no provider config: the gateway holds the keys and says which providers it serves.
+
+```json
+{
+  "execution": { "modelGateway": "http://model-gateway.my-namespace.svc" }
+}
+```
+
+- **Each provider at its own path.** The provider's client calls `<modelGateway>/<provider>` (`/anthropic/v1/messages`, `/google/v1beta/...`) in its own API, so caching, reasoning and file inputs work as they do direct.
+- **A credential per call.** Each call presents a model credential the runtime mints from its [run key](/config/secrets/) for that call alone, naming the run it belongs to, so the gateway attributes and budgets per run. Work a run forks, such as a conversation's title, carries that run's subject; a call outside any run gets a single-use subject of its own. When the gateway refuses a call because the run's budget is spent (429 with the body `rate limit exceeded`), the run ends at once with stop reason [`spend_limit`](/concepts/), not retried; a provider's own 429 passed through the gateway is retried as before.
+- **The gateway says which providers it serves.** At startup the runtime asks `GET <modelGateway>/providers` and offers only those providers' models. Until the gateway answers it offers every provider, and keeps asking, waiting longer each time; `nb_model_gateway_providers_unknown` is 1 meanwhile.
+- **A gateway that doesn't answer is named.** A call the gateway never answers, because the connection fails or no response arrives before the model stream's first-output deadline (90 seconds), is retried as before and then ends the run with the error `The model gateway didn't respond: <cause>` (type `ModelGatewayNoResponseError`), not as a model stream stall. A stall after the gateway answered is still the model's.
+- **No provider config in the runtime.** `providers.<id>.apiKey`, `baseURL` or `models` beside a gateway refuses to start: the gateway holds the keys and decides where each provider is, and `modelPolicy` narrows models. A gateway also needs the run key.
+- **Policy stays here.** Which models a workspace may use (`modelPolicy`, slots, the model picker) and the spend checks before each call are the runtime's, whichever path a call takes.
+
+### GreenPT
+
+GreenPT is a European AI provider with an OpenAI-compatible API, optimized infrastructure, and data centers powered by 100% renewable energy. Configure it with the `greenpt:` prefix:
+
+```json
+{
+  "providers": {
+    "greenpt": { "apiKey": "..." }
+  },
+  "models": {
+    "default": "greenpt:glm-5.2",
+    "fast": "greenpt:kimi-k2.7-code"
+  }
+}
+```
+
+The key falls back to `GREENPT_API_KEY`. Like `nebius` below, this key is **required when `greenpt` is configured** — the runtime fails to start if neither `providers.greenpt.apiKey` nor `GREENPT_API_KEY` is set, because the GreenPT adapter reads no environment variable of its own and a keyless provider has nothing to authenticate with. Override the endpoint with `baseURL` (default `https://api.greenpt.ai/v1`). The catalog lists GreenPT's chat models as published on [models.dev](https://models.dev), the same source as the Anthropic, OpenAI, Google, and xAI entries; other model IDs still route as free text. Use `GET https://api.greenpt.ai/v1/models` with your API key for the current model list.
+
+Effort acceptance is per model, measured against GreenPT's API. No GreenPT model accepts `max`, so `xhigh` and `max` land on `high`:
+
+| Model | Effort tiers accepted |
+|---|---|
+| `deepseek-v4-flash-0731`, `deepseek-v4.1-flash`, `gemma4`, `glm-5.2`, `glm-5.3`, `glm-5.3-flash`, `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`, `qwen3.5-397b-a17b`, `qwen3.6-35b-a3b` | `low`, `medium`, `high`, plus `none` to suppress reasoning |
+| `gpt-oss-120b`, `green-r`, `green-r-raw` | `low`, `medium`, `high` |
+| `minimax-m2.5` | `low`, `medium`, `high` |
+| `mistral-medium-3.5-128b` | `high`, plus `none` |
+
+On `mistral-medium-3.5-128b` the platform's default `medium` is not offered, so the model runs at its own default unless you set `thinkingEffort` explicitly.
+
 ### Nebius Token Factory
 
-`nebius` is an OpenAI-compatible gateway for open-weight models (Qwen, Kimi, GLM, gpt-oss). Configure it like any other provider and reference models with the `nebius:` prefix:
+`nebius` is an OpenAI-compatible gateway for open-weight models (Qwen, DeepSeek, Kimi, GLM, Nemotron, gpt-oss). Configure it like any other provider and reference models with the `nebius:` prefix:
 
 ```json
 {
@@ -315,7 +372,7 @@ Each provider key is optional. If a provider's `apiKey` is omitted, the runtime 
 }
 ```
 
-The key falls back to `NEBIUS_API_KEY`. Unlike the other providers, this key is **required when `nebius` is configured** — the runtime fails to start if neither `providers.nebius.apiKey` nor `NEBIUS_API_KEY` is set, because the Nebius adapter reads no environment variable of its own and a keyless provider has nothing to authenticate with. Override the endpoint with `baseURL` (default `https://api.tokenfactory.nebius.com/v1`). A curated set of flagship models ships in the catalog so they appear in the model picker with pricing; any other Nebius model id still routes as free text (`nebius:<org>/<model>`), just without catalog metadata. Nebius requests use the Chat Completions API and rely on the provider's automatic prefix caching — the Anthropic-style explicit cache breakpoints don't apply.
+The key falls back to `NEBIUS_API_KEY`. Unlike the other providers, this key is **required when `nebius` is configured** — the runtime fails to start if neither `providers.nebius.apiKey` nor `NEBIUS_API_KEY` is set, because the Nebius adapter reads no environment variable of its own and a keyless provider has nothing to authenticate with. Override the endpoint with `baseURL` (default `https://api.tokenfactory.nebius.com/v1`). A curated set of flagship models ships in the catalog so they appear in the model picker with pricing; any other Nebius model id still routes as free text (`nebius:<org>/<model>`), just without catalog metadata. Nebius requests use the Chat Completions API and rely on the provider's automatic prefix caching — the Anthropic-style explicit cache breakpoints don't apply. Nebius reports cached prompt tokens in usage but publishes no cache-read price, so a cached token costs the same as any other input token; when a model's listing carries one, `sync-nebius` records it and usage prices cached tokens at it.
 
 Reasoning models hosted here stream their thinking back and it is shown in the chat. Those blocks carry no provider signature, so a Nebius turn that hits the output limit mid-answer stops there and reports why, instead of automatically continuing the way an Anthropic turn does.
 
@@ -359,93 +416,14 @@ Two other notes. xAI publishes no per-model max-output cap and accepts `max_toke
 
 Conversations are **workspace-owned and persisted automatically** — there is nothing to configure. Every turn is written to a per-conversation JSONL file at `{workDir}/workspaces/<wsId>/conversations/<ownerId>/<convId>.jsonl` in the **event-sourced** format (one append-only event log per conversation), which is what enables crash-resilient run replay and history [compaction](/config/features/).
 
-## sessionStore
-
-Pluggable metadata store for MCP HTTP sessions. Tracks each `Mcp-Session-Id` and its idle TTL across the cluster.
-
-<Tabs>
-  <TabItem label="In-memory (default)">
-    ```json
-    {
-      "sessionStore": {
-        "type": "memory",
-        "ttlSeconds": 28800
-      }
-    }
-    ```
-
-    Process-local Map with periodic TTL sweep. No external dependencies. Default; fine for any single-replica deploy.
-  </TabItem>
-  <TabItem label="Redis">
-    ```json
-    {
-      "sessionStore": {
-        "type": "redis",
-        "ttlSeconds": 28800,
-        "redis": {
-          "url": "${REDIS_URL}",
-          "keyPrefix": "nb:mcp:session:"
-        }
-      }
-    }
-    ```
-
-    Hash-per-session with native `PEXPIRE` TTL. Required when `platform.replicas > 1`; also useful at single-replica if you want cluster-wide visibility into active sessions for ops/admin tooling. The `redis.url` field expands `${VAR}` placeholders from `process.env` at boot, so the deployment configmap can carry a literal `"${REDIS_URL}"` and have the actual URL injected from a secret via `envFrom`.
-  </TabItem>
-</Tabs>
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `type` | `"memory"` \| `"redis"` | `"memory"` | Provider. `redis` requires `redis.url`. |
-| `ttlSeconds` | `integer` (s) | `28800` (8 h) | Idle TTL. Each request resets the clock — actively-used sessions never expire. |
-| `redis.url` | `string` | — | Redis connection URL (`redis://` or `rediss://`). Required when `type` is `"redis"`. Supports `${VAR}` env expansion. |
-| `redis.keyPrefix` | `string` | `"nb:mcp:session:"` | Hash key prefix for session entries. |
-
-### Why a session store at all
-
-The MCP `/mcp` endpoint is stateful. Each session has two parts:
-
-- **Metadata** — `sessionId`, `identityId`, `workspaceId`, timestamps. Just data; lives in the session store.
-- **Live transport** — open HTTP response stream, SDK `Server` instance, registered request handlers, in-flight JSON-RPC state. Process-bound — holds open file descriptors and JS object references that cannot be serialized or moved.
-
-Metadata is shareable across processes; the live transport is not. Routing requests to the process that owns a session's transport is the **load balancer's** job (cookie affinity; hashing the random `Mcp-Session-Id` cannot find the pod that created the session), not the session store's. The session store is deliberately deployment-vocabulary-free — no notion of "which pod owns this" — so the same interface fits any deployment topology.
-
-When a request arrives at a process that doesn't have the live transport for the requested session, the 404 carries `error.data.reason`:
-
-| Reason | Meaning |
-|--------|---------|
-| `not_found` | Session store has no record. Idle-TTL eviction, or session never existed. |
-| `unavailable` | Session exists in the store, but the live transport isn't on this process. Possible causes: process restart, sticky-routing miss, transport closed locally. |
-
-Spec-compliant clients re-initialize on either reason. Operators distinguish `unavailable` causes via deploy timing, process uptime, and "session-store size vs local transport count" signals.
-
-### Configuration matrix
-
-| Replicas | Store | Use case |
-|----------|-------|----------|
-| 1 | `memory` | Default. Dev, programmatic use, simple production. Sessions die on process restart; clients re-initialize. |
-| 1 | `redis` | Single-process with cluster-shared metadata for ops visibility, audit trails, or future scale-out. |
-| N | `redis` | Horizontal scale. **Pair with sticky load-balancing** (e.g. ALB `lb_cookie`) — without it, every cross-process request returns `unavailable` and clients re-initialize constantly. |
-| N | `memory` | **Not supported.** Sessions partition across processes. |
-
-When `type: "redis"` is set without a `redis.url`, NimbleBrain refuses to fall back to in-memory and fails the boot — silently degrading would mask a misconfiguration.
-
-### Scaling to multiple replicas
+## Scaling to multiple replicas
 
 Run `platform.replicas: 1`. More than one replica is **not supported**: the runtime assumes it is the only process on a tenant's data, and no combination of settings makes a second replica safe today. With two replicas:
 
 - **Work runs twice.** Every pod's scheduler fires every due task, and every pod polls every notification outbox, so runs, posts and deliveries happen once per pod.
 - **Writes are lost.** Workspace records and notification files are rewritten whole, with locks that hold within one process only.
 - **State goes stale between pods.** A connector installed or removed on one pod, a deactivated user, a changed model config, and live events (including an in-flight chat turn) stay on the pod that saw them.
-- **Sticky routing does not fix this.** Load-balancer cookie affinity pins a browser, not an MCP client or a webhook sender, and routing on `Mcp-Session-Id` cannot pin a session to the pod that created it.
-
-`sessionStore.type: "redis"` is valid at one replica, for cluster-wide visibility into sessions, but it is not what makes more than one replica work.
-
-### Tuning `ttlSeconds`
-
-The 8 h default is tuned for a connector left open during a working day. Tighten it (e.g. `1800` for 30 minutes) if you want sessions to evict faster on idle; loosen it if your typical usage pattern leaves connectors open across days.
-
-`MCP_SESSION_TTL_SECONDS` env var overrides this when set.
+- **Sticky routing does not fix this.** Load-balancer cookie affinity pins a browser, not an MCP client or a webhook sender.
 
 ## logging
 
@@ -646,11 +624,47 @@ Guardrails on [task](/using/tasks) runs: how many the runtime holds in flight an
 | `maxQueuedRuns` | `integer` | `50` | Run now and event runs held waiting for a slot. A freed slot goes to the waiting run whose workspace holds the fewest slots, oldest first among equals. Beyond it a run is refused and recorded as skipped. `0` refuses at the limit. Range: 0--1000. |
 | `maxRunIterations` | `integer` | `50` | Ceiling on one run's agentic iterations. Range: 1--50. |
 | `maxRunInputTokens` | `integer` | none | Ceiling on one run's input tokens, summed over every model call. Unset, there is no ceiling. Range: 1,000--100,000,000. |
-| `maxRunDurationMs` | `integer` (ms) | `600000` | Ceiling on one run's wall-clock time. Range: 10,000--600,000. |
+| `maxRunDurationMs` | `integer` (ms) | `600000` | Ceiling on one run's wall-clock time. Range: 10,000--600,000. A chat turn on an external runtime is held to it too, since its model credential lasts no longer. |
 
 The three per-run ceilings apply when a run starts, so they cover every stored task however it was written. A cap a task sets above its ceiling is lowered to it; one it leaves unset takes the runtime default (the chat `maxIterations` for iterations, 120 seconds for duration) held to the ceiling. Input tokens have no runtime default: a task with no `maxInputTokens` runs under `maxRunInputTokens` when it is set, and with no input-token cap when it is not. The create and update tools report the caps that result.
 
 A scheduled run that finds every slot busy is deferred rather than queued: it keeps its next-run time and runs on the first scheduler tick with a free slot, so its place survives a restart. The queue is held in memory: runs still queued when the runtime stops are recorded as skipped.
+
+## execution
+
+Experimental. Runs a turn on an agent other than NimbleBrain's own engine: a [nimblebrain-agent](https://github.com/NimbleBrainInc/nimblebrain-agent) worker (`nimblebrain-agent serve`), which the runtime dials over the [Agent Client Protocol](https://agentclientprotocol.com)'s Streamable HTTP transport. NimbleBrain never starts the worker; you run it, and in a cluster you put it behind an internal Service that only the runtime can reach.
+
+```json
+{
+  "execution": {
+    "default": "pool",
+    "modelGateway": "http://model-gateway.my-namespace.svc",
+    "runtimes": {
+      "pool": {
+        "driver": "nimblebrain-agent",
+        "url": "http://agent-pool.my-namespace.svc:8080/acp"
+      }
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `default` | The runtime every run executes on: `native`, or a name under `runtimes`. Default `native`. |
+| `modelGateway` | The installation's model gateway, by its root URL: each provider is at `<modelGateway>/<provider>`. The one model endpoint every external agent calls, with a per-turn credential, at each call's provider; and the native engine's for [every provider](#through-a-model-gateway). Required for external runtimes outside the `dev` identity provider. |
+| `runtimes.<name>.driver` | The agent the worker serves: `nimblebrain-agent`. |
+| `runtimes.<name>.url` | The worker's ACP endpoint. |
+
+What stays with NimbleBrain, whichever runtime runs a turn:
+
+- **The conversation.** Every turn is recorded in NimbleBrain's own log, the same way as a native turn, so a conversation can move between runtimes.
+- **Tools.** The agent reaches the run's tools on its own connection to the runtime, through the same workspace wall, tool allow-list and permission checks as a native call. Nothing listens for it.
+- **Credentials.** The runtime signs a connection credential with the installation's [run key](/config/secrets/), which the worker checks against the runtime's `/.well-known/run-keys.json`. Each turn's model calls carry a credential minted for that turn, which the gateway verifies against the same key set.
+
+A worker runtime does not check a run's spend accounts or input-token cap before each model call, so a run that sets either is refused on it; chat runs. Each turn's model credential lasts as long as the turn may run: a task's own duration cap, or for a chat turn `tasks.maxRunDurationMs`, at which the turn is stopped with an error naming the limit. Outside the `dev` identity provider external runtimes need the run key and a `modelGateway`, and the runtime refuses to start without them. On a developer's machine, run a worker on loopback with `NB_AGENT_AUTH=none` and leave out `modelGateway`: it calls its provider with its own key.
+
+A worker holds a turn's connection in memory, so a worker that stops mid-turn (a rollout drains it, it restarts) cuts the turn, as a runtime restart cuts a native one. The run ends with the error `The agent restarted mid-turn, so this turn was cut off. Try again; tool calls made before the cut may already have run.` (type `AgentConnectionLostError`). It is not retried mid-turn, because the tools it called already ran; a task records it as a transient failure.
 
 ## files
 
@@ -692,7 +706,7 @@ NimbleBrain validates `nimblebrain.json` at startup against the [JSON Schema (dr
 
 - **Unknown keys** produce a warning on stderr and are ignored.
 - **Structural errors** (wrong types, missing required fields) throw an error and prevent startup.
-- **Workspace-owned keys** (`skillDirs`, `home`, `preferences`) warn as unknown keys and are stripped before the runtime config is built.
+- **Workspace-owned keys** (`skillDirs`, `home`) and `preferences` warn as unknown keys and are ignored.
 - The **override file** (`nimblebrain.overrides.json`) is validated structurally, but unknown-key warnings are suppressed for it. Every key `set_model_config` writes is in the published schema; the suppression is for version drift, since the file is preserved across deploys and can outlive the schema of whichever image reads it.
 
 ```

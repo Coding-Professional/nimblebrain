@@ -11,19 +11,27 @@
  */
 
 import { type EffectiveRunLimits, effectiveRunLimits } from "../../config/tasks.ts";
-import { wrapContained } from "../../prompt/compose.ts";
+import type { ThinkingEffort, WrapUpLimit } from "../../engine/types.ts";
+import { MODEL_GATEWAY_BUDGET_ACCOUNT } from "../../model/gateway-refusal.ts";
+import { wrapContained } from "../../prompt/containment.ts";
 import type { AdmissionLease } from "../../runtime/admission.ts";
-import { estimateCost } from "../../usage/cost.ts";
 import { checkAgainstSchema, parseJsonDeliverable } from "./json-schema.ts";
 import {
   BATCH_ACCOUNT_PREFIX,
   budgetSpendAccounts,
-  isTransientError,
+  RUN_DURATION_EXCEEDED,
   type RunInput,
   type RunSpendAccount,
   type TaskRunTrigger,
 } from "./scheduler.ts";
-import type { RunFileRef, RunToolCall, Task, TaskRun, TaskRunResult } from "./types.ts";
+import type {
+  RunFileRef,
+  RunSkillDelivery,
+  RunToolCall,
+  Task,
+  TaskRun,
+  TaskRunResult,
+} from "./types.ts";
 
 /** Max chars of the deliverable kept in the run-list `resultPreview`. The full
  *  output lives in the `TaskRunResult` sidecar. */
@@ -61,8 +69,12 @@ export interface TaskFnRequest {
    */
   trigger?: "schedule" | "manual" | "event";
   model?: string;
+  /** The task's reasoning depth; absent, the operator's applies. */
+  thinkingEffort?: ThinkingEffort;
   maxIterations?: number;
   maxRunInputTokens?: number;
+  /** The run's duration cap, which the executor enforces; it bounds the run's model credential. */
+  maxRunDurationMs?: number;
   /**
    * The task's token budget as spend accounts (`budgetSpendAccounts`).
    * The runtime clamps each model call's output to what they allow and stops
@@ -70,6 +82,8 @@ export interface TaskFnRequest {
    */
   spendAccounts?: RunSpendAccount[];
   allowedTools?: string[];
+  /** Skills the run is given in full before its first model call (`Task.skills`). */
+  skills?: string[];
   metadata?: Record<string, unknown>;
   /**
    * The task's workspace: tools scoped to it + identity tools, and
@@ -112,6 +126,8 @@ export interface TaskFnToolCall {
   ms: number;
   /** Structured failure reason when `ok === false`. */
   errorReason?: string;
+  /** The engine held the call for guidance; it did not run. */
+  held?: true;
 }
 
 /** Minimal task result shape (matches runtime `TaskResult`). */
@@ -129,10 +145,13 @@ export interface TaskFnResult {
   finishReasonRaw?: string;
   /** The spend account that stopped the run, when `stopReason` is `spend_limit`. */
   spendAccountId?: string;
-  /**
-   * The run's usage (runtime `TurnUsage`): `model` and the cache and reasoning
-   * counts price it (`costUsd`).
-   */
+  /** See runtime `TaskResult.wrapUpLimit`. */
+  wrapUpLimit?: WrapUpLimit;
+  /** The run's cost in USD, each call priced on its own card (runtime `TaskResult.costUsd`). */
+  costUsd?: number;
+  /** Every skill the run was given, or that missed it (runtime `TaskResult`). */
+  skillsDelivered?: RunSkillDelivery[];
+  /** The run's usage (runtime `TurnUsage`). */
   usage: {
     inputTokens: number;
     outputTokens: number;
@@ -157,6 +176,16 @@ export interface ExecutorContext {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The instruction a task with skills and no prompt runs on. The skills
+ * themselves reach the run in full ahead of it (`TaskRequest.skills`).
+ */
+function skillsOnlyInstruction(skills: string[] | undefined): string | undefined {
+  if (!skills?.length) return undefined;
+  const names = skills.map((s) => `"${s}"`).join(", ");
+  return `Carry out the ${names} skill${skills.length === 1 ? "" : "s"} on this run's input, and give the result as the deliverable.`;
+}
 
 /**
  * Recursive-call guard. A task whose `allowedTools` includes a
@@ -213,7 +242,7 @@ function buildRequest(
   const prompt = [
     input?.preamble,
     input?.data !== undefined ? renderRunInput(input.data) : undefined,
-    task.prompt,
+    task.prompt || skillsOnlyInstruction(task.skills),
     task.outputSchema ? renderOutputSchemaInstruction(task.outputSchema) : undefined,
   ]
     .filter((part): part is string => typeof part === "string" && part.length > 0)
@@ -233,16 +262,19 @@ function buildRequest(
     },
   };
   if (task.model != null) req.model = task.model;
+  if (task.thinkingEffort != null) req.thinkingEffort = task.thinkingEffort;
   // Already clamped to the operator's per-run ceilings (see
   // `effectiveRunLimits`). Iterations are always capped; input tokens only when
   // the definition or the operator sets a cap.
   req.maxIterations = limits.maxIterations;
   if (limits.maxInputTokens != null) req.maxRunInputTokens = limits.maxInputTokens;
+  req.maxRunDurationMs = limits.maxRunDurationMs;
   const spendAccounts = [...budgetSpendAccounts(task, Date.now()), ...extraAccounts];
   if (spendAccounts.length > 0) req.spendAccounts = spendAccounts;
   // An empty list means no narrowing, as the form shows it ("all"), not a run
   // with only the system tools.
   if (task.allowedTools?.length) req.allowedTools = task.allowedTools;
+  if (task.skills?.length) req.skills = task.skills;
   if (ctx?.workspaceId) req.workspaceId = ctx.workspaceId;
   if (ctx?.identity) req.identity = ctx.identity;
   return req;
@@ -509,6 +541,27 @@ function unreachableConnectorCalls(toolCalls: TaskFnResult["toolCalls"]): string
 }
 
 /**
+ * The tool calls that tell what work happened, without the calls the engine
+ * held for guidance (`ToolCallRecord.held`). A held call ran nothing, so it is
+ * neither a failure nor a call. A model that re-issues it shows the outcome in
+ * the re-issue; one that, having read the guidance, rightly never re-issues it
+ * did no wrong. The exception is a run that stopped short (any stop but
+ * `complete`) before re-issuing a held call: there the work it asked for never
+ * happened and nothing else will say so, so it stays, as the failure it is.
+ */
+function withoutSettledHolds(
+  toolCalls: TaskFnResult["toolCalls"],
+  stopReason: TaskRun["stopReason"],
+): TaskFnResult["toolCalls"] {
+  if (!Array.isArray(toolCalls)) return toolCalls;
+  return toolCalls.filter((tc, i) => {
+    if (!tc.held) return true;
+    if (stopReason === "complete") return false;
+    return !toolCalls.slice(i + 1).some((later) => later.name === tc.name);
+  });
+}
+
+/**
  * What the tool calls say about a run the model called complete, or null when
  * they agree with it. Checked most-specific first; see `mapResultToRun`.
  */
@@ -576,6 +629,57 @@ function unrecognizedStopError(
   return `Model turn ended without a recognized stop (${raw}).`;
 }
 
+/** Which input cap applied to a run, and what would lift it, for its error. */
+function inputCapTerms(applied: number | undefined, own: number | undefined) {
+  const limit = applied != null ? ` of ${applied.toLocaleString("en-US")}` : "";
+  const ownApplied = own != null && (applied == null || own <= applied);
+  const which = ownApplied
+    ? "its own Max Input Tokens"
+    : "this runtime's per-run ceiling (tasks.maxRunInputTokens)";
+  const remedy = ownApplied
+    ? "Raise Max Input Tokens or narrow the task."
+    : "Ask the operator to raise the ceiling, or narrow the task.";
+  return { limit, which, remedy };
+}
+
+/**
+ * A run the engine told to stop because a limit was near, and which did. That
+ * can't be told apart from a run that had really finished, but a person can, so
+ * it reads Needs review. Its answer is kept and it is not a failure.
+ */
+function wrapUpVerdict(
+  data: Pick<TaskFnResult, "wrapUpLimit">,
+  limits: EffectiveRunLimits,
+  task: Pick<Task, "maxInputTokens" | "maxIterations">,
+): { status: "degraded"; error: string } | null {
+  if (!data.wrapUpLimit) return null;
+  return {
+    status: "degraded",
+    error: `Told to finish early: ${
+      data.wrapUpLimit === "max_iterations"
+        ? lastIterationReason(limits.maxIterations, task.maxIterations)
+        : nearInputCapReason(limits.maxInputTokens, task.maxInputTokens)
+    }`,
+  };
+}
+
+function lastIterationReason(applied: number, own: number | undefined): string {
+  const ownApplied = own != null && own <= applied;
+  const which = ownApplied ? "its own Max Iterations" : "this runtime's limit";
+  const remedy = ownApplied
+    ? "Raise Max Iterations or narrow the task."
+    : "Set a higher Max Iterations if the runtime's ceiling allows, or narrow the task.";
+  return `this was the last of the ${applied} iterations allowed by ${which}. Its answer may leave work undone. ${remedy}`;
+}
+
+function nearInputCapReason(applied: number | undefined, own: number | undefined): string {
+  const { limit, which, remedy } = inputCapTerms(applied, own);
+  return (
+    `another model call could have passed the input-token cap${limit}, which is ${which}. ` +
+    `Its answer may leave work undone. ${remedy}`
+  );
+}
+
 /**
  * The error for a run the engine stopped at its input-token cap. `applied` is
  * the cap the run executed under; it names the task's own cap when that
@@ -588,14 +692,7 @@ function runInputCapError(
   applied: number | undefined,
   own: number | undefined,
 ): string {
-  const limit = applied != null ? ` of ${applied.toLocaleString("en-US")}` : "";
-  const ownApplied = own != null && (applied == null || own <= applied);
-  const which = ownApplied
-    ? "its own Max Input Tokens"
-    : "this runtime's per-run ceiling (tasks.maxRunInputTokens)";
-  const remedy = ownApplied
-    ? "Raise Max Input Tokens or narrow the task."
-    : "Ask the operator to raise the ceiling, or narrow the task.";
+  const { limit, which, remedy } = inputCapTerms(applied, own);
   return (
     `Stopped at the input-token cap${limit}, which is ${which}: the run had spent ` +
     `${spent.toLocaleString("en-US")} input tokens, and its next step was projected to pass ` +
@@ -606,9 +703,22 @@ function runInputCapError(
 /**
  * The error for a run stopped at `spend_limit`: what was left of its token
  * budget's window could not pay for its next model call, even with that call's
- * output clamped. `account` is the budget's account that stopped it, if one did.
+ * output clamped, or the model gateway's budget for the run refused it.
+ * `account` is the budget's account that stopped it, if one did.
  */
-function budgetStopError(account: RunSpendAccount | undefined, task: Task): string {
+function budgetStopError(
+  accountId: string | undefined,
+  account: RunSpendAccount | undefined,
+  task: Task,
+): string {
+  // The installation's model gateway refused the run's next call: the budget
+  // spent is the run's own, held by the gateway, not the task's.
+  if (accountId === MODEL_GATEWAY_BUDGET_ACCOUNT) {
+    return (
+      "Model budget reached: this run's model budget is spent, so the model gateway refused " +
+      "its next step and the run stopped there."
+    );
+  }
   if (account?.id.startsWith(BATCH_ACCOUNT_PREFIX)) {
     return (
       `Batch budget reached: too little of the batch's budget was left for the next step ` +
@@ -638,6 +748,7 @@ function mapResultToRun(
 ): TaskRun {
   const stopReason = data.stopReason as TaskRun["stopReason"];
   let status: TaskRun["status"] = mapStopReasonToStatus(stopReason);
+  const accounted = withoutSettledHolds(data.toolCalls, stopReason);
 
   // De-mask the silently-failed run. `stopReason: "complete"` only says the
   // MODEL decided it was done, and a model that cannot do the work commonly
@@ -666,11 +777,14 @@ function mapResultToRun(
   // which is the model's account of the run and says "done" in exactly the
   // runs these exist to catch.
   //
+  // A run told to wrap up by a limit also reads `degraded`, when no tool call
+  // says worse.
+  //
   // Only overrides an otherwise-`success` run; a run already classified
   // failure/timeout keeps its (stronger) status.
   let error: string | undefined;
   if (status === "success") {
-    const verdict = toolCallVerdict(data.toolCalls);
+    const verdict = toolCallVerdict(accounted) ?? wrapUpVerdict(data, limits, task);
     if (verdict) {
       status = verdict.status;
       error = verdict.error;
@@ -681,6 +795,7 @@ function mapResultToRun(
   }
   if (stopReason === "spend_limit") {
     error = budgetStopError(
+      data.spendAccountId,
       spendAccounts.find((a) => a.id === data.spendAccountId),
       task,
     );
@@ -699,9 +814,9 @@ function mapResultToRun(
   error ??= unrecognizedStopError(status, stopReason, data);
   // Recorded whatever the status, and read without any criteria: the derived
   // label never reads Succeeded while part of the work did not happen.
-  const unrecovered = unresolvedFailures(data.toolCalls).map((u) => u.name);
-  // Priced as the door debits a `usd` spend account: the run model's rates.
-  const costUsd = data.usage.model ? estimateCost(data.usage.model, data.usage) : undefined;
+  const unrecovered = unresolvedFailures(accounted).map((u) => u.name);
+  // Priced as the door debits a `usd` spend account: each call on its own card.
+  const costUsd = data.costUsd;
 
   return {
     // Adopt the runtime's runId verbatim — the run, its index summary, and its
@@ -713,7 +828,7 @@ function mapResultToRun(
     status,
     inputTokens: data.usage.inputTokens,
     outputTokens: data.usage.outputTokens,
-    toolCalls: Array.isArray(data.toolCalls) ? data.toolCalls.length : 0,
+    toolCalls: Array.isArray(data.toolCalls) ? data.toolCalls.filter((tc) => !tc.held).length : 0,
     iterations: data.usage.iterations,
     // Truncated preview for the run list; the full deliverable lives in the
     // TaskRunResult sidecar (see `buildRunResult`).
@@ -741,6 +856,7 @@ export function buildRunResult(task: Task, data: TaskFnResult): TaskRunResult {
     output: typeof tc.output === "string" ? tc.output : String(tc.output ?? ""),
     ok: tc.ok === true,
     ms: typeof tc.ms === "number" ? tc.ms : 0,
+    ...(tc.held === true ? { held: true as const } : {}),
   }));
   return {
     runId: data.runId,
@@ -755,6 +871,7 @@ export function buildRunResult(task: Task, data: TaskFnResult): TaskRunResult {
       iterations: data.usage.iterations,
     },
     stopReason: data.stopReason as TaskRun["stopReason"],
+    ...(data.skillsDelivered?.length ? { skillsDelivered: data.skillsDelivered } : {}),
   };
 }
 
@@ -808,8 +925,7 @@ export function extractOutputFiles(toolCalls: TaskFnResult["toolCalls"]): RunFil
  *                                              operator knows)
  *
  * Defaulting unknown values to `failure` is intentional: the alternative
- * is silent green status, which is exactly the masking this PR's parent
- * change is meant to eliminate. Any new stop reason from the engine
+ * is silent green status, which would mask a failed run as a success. Any new stop reason from the engine
  * should explicitly opt into `success` here.
  */
 function mapStopReasonToStatus(stopReason: TaskRun["stopReason"]): TaskRun["status"] {
@@ -869,7 +985,9 @@ function classifyAbortedRun(
   } else {
     run.status = "timeout";
     run.error = `Task ${opts.taskId} timed out after ${Math.round(opts.timeoutMs / 1000)}s`;
-    run.transient = isTransientError(run.error);
+    // Not read from the text, which quotes the task's id: a run that used its
+    // whole time allowance meets the same limit next time.
+    run.transient = false;
   }
   // "aborted" is not part of TaskRun's stopReason union; the status field
   // carries the operational outcome. Record the engine's stop as "other" (no
@@ -917,15 +1035,10 @@ export function createDirectExecutor(
     // OR the per-run timeout elapses. The combined signal goes into
     // taskFn → runtime.executeTask → engine.run → every tool call, so an
     // abort actually cancels in-flight LLM/tool work instead of
-    // orphaning it the way the old `Promise.race` pattern did.
-    //
-    // Production bug this fixes: `morning-brief-6am-pt` runs took
-    // 6–7 minutes while the 5-minute Promise.race rejected at the
-    // 5-minute mark, returning to dispatchRun. The task kept running,
-    // finished cleanly 1–2 minutes later, wrote a complete conversation
-    // to disk — and the result was discarded. The agent saw a "timeout"
-    // run record with `iterations: 0, toolCalls: 0` despite the agent
-    // doing all the work.
+    // orphaning it. A `Promise.race` against a timer would reject at the
+    // deadline and return to dispatchRun while the task kept running,
+    // finished, and had its result discarded — a "timeout" run record
+    // with `iterations: 0, toolCalls: 0` for a run that did all the work.
     const runController = new AbortController();
     let timedOut = false;
     const timeoutTimer = setTimeout(() => {
@@ -973,7 +1086,10 @@ export function createDirectExecutor(
       // "I cancelled", not "the clock ran out at the same moment". Drift here
       // would silently restamp a cancel as a timeout in the run record.
       if (timedOut && !externalAbort.wasExternal()) {
-        throw new Error(`Task ${task.id} timed out after ${Math.round(timeoutMs / 1000)}s`);
+        throw Object.assign(
+          new Error(`Task ${task.id} timed out after ${Math.round(timeoutMs / 1000)}s`),
+          { code: RUN_DURATION_EXCEEDED },
+        );
       }
       throw err;
     } finally {

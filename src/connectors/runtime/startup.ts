@@ -1,7 +1,11 @@
+import { oauthClientIdentity } from "../../brand/index.ts";
 import type { EventSink } from "../../engine/types.ts";
-import type { HostResourcesRateLimit, HostResourcesResolver } from "../../host-resources/index.ts";
+import type {
+  HostResourcesRateLimit,
+  HostResourcesResolver,
+  ResourceArgumentsResolver,
+} from "../../host-resources/index.ts";
 import { resolveUserDisplayName } from "../../identity/user.ts";
-import { fleetIssuerOption } from "../../oauth/fleet-assertion.ts";
 import { mcpAuthCallbackUrl } from "../../oauth/mcp-callback-url.ts";
 import { isMintedFleetSource } from "../../oauth/minted-credential-provider.ts";
 import { log } from "../../observability/log.ts";
@@ -11,7 +15,10 @@ import type { ToolRegistry } from "../../tools/registry.ts";
 import { WorkspaceOAuthProvider } from "../../tools/workspace-oauth-provider.ts";
 import type { WorkspaceContext } from "../../workspace/context.ts";
 import { resolveWorkspaceDisplayName } from "../../workspace/workspace-store.ts";
+import { type CatalogEntriesReader, resolveMintedTransport } from "../catalog/binding.ts";
+import type { ConnectorCatalogEntry } from "../catalog/types.ts";
 import { connectorHasStaticAuth } from "./connector-auth.ts";
+import { inBandAuthErrorsOption } from "./in-band-auth-errors.ts";
 import { resolveStaticOAuthClient } from "./oauth-static-client.ts";
 import { validateServerName } from "./paths.ts";
 import { notifyConnectionRunning } from "./pending-auth-buffer.ts";
@@ -32,6 +39,8 @@ export interface ConnectorMcpDeps {
   workspaceId: string;
   hostResources: HostResourcesResolver;
   rateLimit: HostResourcesRateLimit;
+  /** Resolves the `ai.nimblebrain/resource-arguments` a tool declares, in this workspace. */
+  resourceArguments?: ResourceArgumentsResolver;
 }
 
 /**
@@ -50,12 +59,20 @@ export function composeConnectorMcpContext(
     connectorId: sourceName,
     hostResources: deps.hostResources,
     rateLimit: deps.rateLimit,
+    ...(deps.resourceArguments ? { resourceArguments: deps.resourceArguments } : {}),
   };
 }
 
 /** Options accepted by `startConnectorSource`. */
 interface StartConnectorOpts {
   allowInsecureRemotes?: boolean;
+  /**
+   * The operator catalog. A minted fleet connector's credential settings come
+   * from its catalog entry at every start (`resolveRefTransport`); no other
+   * connector reads it. Required, so no start path can skip the catalog by
+   * omission: a caller that starts no minted connector passes `NO_CATALOG`.
+   */
+  readCatalog: CatalogEntriesReader;
   /**
    * Keep a URL source REGISTERED (unstarted, `down`) when `start()` fails,
    * instead of leaving the registry without it. Off by default: a deliberate
@@ -80,14 +97,14 @@ interface StartConnectorOpts {
    * which already registers an unstarted source for the same reason.
    *
    * Applies to EVERY boot failure mode, not only an unreachable endpoint — a
-   * rejected credential is retained too. That is deliberate but worth stating,
-   * because it drops a brake: the old `removeSource` set `stopped`, which is what
-   * made `HealthMonitor` treat the source as terminal. Retained sources instead
-   * get its exponential-backoff bursts followed by the slow re-probe cooldown,
-   * which is what bounds the cost of a source that will not come back on its own.
-   * Classifying the failure here to keep only "retryable" ones was tried and
-   * removed: a 401 arrives as a `ServerError`, not `UnauthorizedError`, so the
-   * gate missed the common shape while implying a protection it did not provide.
+   * rejected credential is retained too. Removing the source would set
+   * `stopped`, which is what makes `HealthMonitor` treat a source as terminal.
+   * A retained source gets its exponential-backoff bursts followed by the slow
+   * re-probe cooldown, unless its connection is `reauth_required`, which the
+   * monitor leaves to the user's Reconnect. That brake is the lifecycle's
+   * connection state, not a classification here: a 401 arrives as a
+   * `ServerError`, not `UnauthorizedError`, so a gate on the error would miss
+   * the common shape while implying a protection it does not provide.
    */
   keepRegisteredOnStartFailure?: boolean;
   /**
@@ -106,11 +123,8 @@ interface StartConnectorOpts {
    * records. Mutually exclusive with `workspaceContext` — a personal connector
    * belongs to no workspace.
    *
-   * Honored ONLY on the URL-connector path (a personal connector is a remote MCP
-   * connection). A named/local ref ignores it and falls through to the
-   * workspace path — the caller (`getIdentityConnectorSource`) already gates on
-   * `"url" in ref`, so this is a documentation guard against a future caller,
-   * not a live case.
+   * Read by the OAuth-provider step: when set, it takes the user arm and
+   * `workspaceContext` is not consulted.
    */
   identityOwner?: { userId: string; workDir: string };
   dataDir?: string;
@@ -150,6 +164,12 @@ interface StartConnectorOpts {
   connectorMcp?: ConnectorMcpDeps;
 }
 
+/**
+ * The start options the OAuth-provider step reads. It builds an auth provider
+ * and never resolves a transport, so it takes no catalog reader.
+ */
+type OAuthProviderOpts = Omit<StartConnectorOpts, "readCatalog">;
+
 /** A resolvable promise handle: calling `resolve()` settles `promise`. Used to
  *  race an interactive-auth early return against a longer-running `start()`. */
 function createDeferred(): { resolve: () => void; promise: Promise<void> } {
@@ -179,33 +199,35 @@ function warnUnrecognizedUrlAuthType(ref: ConnectorRef, serverName: string): voi
 /**
  * The `{type:"user"}` arm of {@link buildUrlOAuthProvider} — a personal
  * connector's OAuth provider. Credentials live in the store at user scope,
- * with no `workspaceContext`. Static-client (non-DCR) resolution is
- * workspace-scoped and not wired for personal connectors here; the DCR /
- * provider auth paths apply.
+ * with no `workspaceContext`. A pre-registered (non-DCR) client resolves only
+ * when it is an instance OAuth client; a workspace's own client has no workspace
+ * to read its secret from here, and `resolveStaticOAuthClient` refuses it.
  */
 async function buildUserOAuthProvider(
   ref: ConnectorRef,
   serverName: string,
   identityOwner: { userId: string; workDir: string },
-  opts: StartConnectorOpts | undefined,
+  opts: OAuthProviderOpts | undefined,
   onInteractiveAuthRequired: (authorizationUrl: string) => void,
 ): Promise<WorkspaceOAuthProvider> {
   const { workDir } = identityOwner;
-  // Human-readable owner for the vendor consent screen ("NimbleBrain (<name>)")
+  // Human-readable owner for the vendor consent screen ("<brand> (<name>)")
   // in place of the opaque `user:<id>`; mirrors the workspace arm's
   // `resolveWorkspaceDisplayName`. Best-effort — falls back to the id.
   const ownerDisplayName = await resolveUserDisplayName(workDir, identityOwner.userId);
+  const staticClient = await resolveStaticOAuthClient({ ref, serverName });
   return new WorkspaceOAuthProvider({
+    clientIdentity: oauthClientIdentity(),
     owner: { type: "user", userId: identityOwner.userId },
     ...(ownerDisplayName ? { ownerDisplayName } : {}),
     serverName,
     callbackUrl: mcpAuthCallbackUrl(),
     allowInsecureRemotes: opts?.allowInsecureRemotes === true,
     headlessAuthProbe: ref.headlessAuthProbe === true,
-    ...fleetIssuerOption(),
     onInteractiveAuthRequired,
     ...(opts?.onAuthLost ? { onAuthLost: opts.onAuthLost } : {}),
     ...(opts?.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+    ...(staticClient ? { staticClient } : {}),
     ...(ref.scopes ? { scopes: ref.scopes } : {}),
     ...(ref.additionalAuthorizationParams
       ? { additionalAuthorizationParams: ref.additionalAuthorizationParams }
@@ -226,7 +248,7 @@ export async function buildUrlOAuthProvider(
   ref: ConnectorRef,
   serverName: string,
   wsContext: WorkspaceContext | undefined,
-  opts: StartConnectorOpts | undefined,
+  opts: OAuthProviderOpts | undefined,
   onInteractiveAuthRequired: (authorizationUrl: string) => void,
 ): Promise<WorkspaceOAuthProvider | undefined> {
   // Attach an OAuthClientProvider only when no static auth is configured.
@@ -289,6 +311,7 @@ export async function buildUrlOAuthProvider(
   // place of the opaque wsId; best-effort, falls back to the id.
   const ownerDisplayName = await resolveWorkspaceDisplayName(workDir, wsId);
   return new WorkspaceOAuthProvider({
+    clientIdentity: oauthClientIdentity(),
     owner: { type: "workspace", wsId },
     ...(ownerDisplayName ? { ownerDisplayName } : {}),
     serverName,
@@ -296,10 +319,6 @@ export async function buildUrlOAuthProvider(
     callbackUrl,
     allowInsecureRemotes: opts?.allowInsecureRemotes === true,
     headlessAuthProbe: ref.headlessAuthProbe === true,
-    // Fleet tenant binding. Safe for every server: the provider only
-    // attaches an assertion when the token endpoint's origin matches this
-    // issuer (the fleet authorizer), never to a vendor.
-    ...fleetIssuerOption(),
     onInteractiveAuthRequired,
     ...(opts?.onAuthLost ? { onAuthLost: opts.onAuthLost } : {}),
     ...(staticClient ? { staticClient } : {}),
@@ -356,9 +375,21 @@ async function finalizeUrlSourceStart(
   };
 }
 
-/** Start a remote (URL) connector source: validate, wire OAuth, race `start()`
- *  against an interactive-auth early return, and register on success or
- *  pending-auth. */
+/**
+ * A minted fleet connector the catalog no longer offers. It stays installed and
+ * does not start: the catalog entry it binds to is the only source of the
+ * credential settings it mints with (`resolveMintedTransport`).
+ */
+export class FleetConnectorUnavailableError extends Error {
+  constructor(
+    readonly serverName: string,
+    readonly reason: string,
+  ) {
+    super(`[connectors] "${serverName}" is ${reason}; it stays installed and does not start`);
+    this.name = "FleetConnectorUnavailableError";
+  }
+}
+
 /**
  * The transport config and SSRF posture a persisted ref resolves to.
  *
@@ -366,26 +397,68 @@ async function finalizeUrlSourceStart(
  * transport must judge the same config, so a single ref gets one trust verdict,
  * and the pair has one testable surface.
  *
- *   - **transport** — the ref's persisted transport config, as written.
+ *   - **transport** — the ref's persisted transport config, except a minted
+ *     fleet connector's `auth`, which comes from the catalog entry it binds to
+ *     (`resolveMintedTransport`). Every path that builds a connection from an
+ *     installed ref reads it here, so none can mint from the stored copy.
  *   - **fleetInternal** — the in-cluster plain-HTTP exception, granted only to
  *     the `minted` fleet rail. Provider auth alone does not earn it: a brokered
  *     connector names a provider too, but its URL comes from a vendor response.
+ *
+ * `readCatalog` is required by type and read only for a minted ref. A minted
+ * ref whose catalog cannot be read (including `NO_CATALOG`), or no longer
+ * offers it, throws `FleetConnectorUnavailableError`.
  */
-export function resolveRefTransport(ref: ConnectorRef): {
+export async function resolveRefTransport(
+  ref: ConnectorRef,
+  readCatalog: CatalogEntriesReader,
+): Promise<{
   transportConfig: RemoteTransportConfig | undefined;
   fleetInternal: boolean;
-} {
-  const transportConfig = ref.transport;
-  return { transportConfig, fleetInternal: isMintedFleetSource(transportConfig) };
+}> {
+  if (!isMintedFleetSource(ref.transport)) {
+    return { transportConfig: ref.transport, fleetInternal: false };
+  }
+  let entries: readonly ConnectorCatalogEntry[] | null;
+  try {
+    entries = await readCatalog();
+  } catch (err) {
+    log.warn("[connectors] catalog unreadable; minted fleet connectors cannot start", {
+      server: ref.serverName,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    entries = null;
+  }
+  const resolved = resolveMintedTransport(ref, entries);
+  if (resolved.kind === "unavailable") {
+    throw new FleetConnectorUnavailableError(ref.serverName, resolved.reason);
+  }
+  return {
+    transportConfig: resolved.transport,
+    fleetInternal: isMintedFleetSource(resolved.transport),
+  };
 }
 
-async function startUrlConnectorSource(
+/**
+ * Create and start an `McpSource` for a `ConnectorRef`, then add it to the
+ * registry. Every ref is a remote MCP endpoint: the runtime connects to a URL
+ * with a credential. It never downloads, unpacks, or spawns server code.
+ *
+ * Validates the ref, wires OAuth, races `start()` against an interactive-auth
+ * early return, and registers the source on success or pending-auth.
+ */
+export async function startConnectorSource(
   ref: ConnectorRef,
   registry: ToolRegistry,
+  // Required. The runtime event sink is threaded into the McpSource so
+  // task-augmented tool calls can emit `tool.task_status` and a crashed or
+  // restarted source its `connector.health`. Callers without a real sink
+  // (rare) must pass `new NoopEventSink()` explicitly, so dropping events is a
+  // decision rather than an omission.
   eventSink: EventSink,
-  wsContext: WorkspaceContext | undefined,
-  opts: StartConnectorOpts | undefined,
+  opts: StartConnectorOpts,
 ): Promise<StartConnectorResult> {
+  const wsContext = opts?.workspaceContext;
   const serverName = ref.serverName;
   validateServerName(serverName);
   const sourceName = serverName;
@@ -401,7 +474,7 @@ async function startUrlConnectorSource(
   // the vendor's API response, so it carries no operator provenance.
   // One derivation feeds both the URL gate and the transport below — see
   // `resolveRefTransport` for why they must not be read separately.
-  const { transportConfig, fleetInternal } = resolveRefTransport(ref);
+  const { transportConfig, fleetInternal } = await resolveRefTransport(ref, opts.readCatalog);
   validateConnectorUrl(new URL(ref.url), {
     allowInsecure: opts?.allowInsecureRemotes,
     fleetInternal,
@@ -448,8 +521,11 @@ async function startUrlConnectorSource(
       type: "remote",
       url: new URL(ref.url),
       transportConfig,
+      resolveTransportConfig: async () =>
+        (await resolveRefTransport(ref, opts.readCatalog)).transportConfig,
       allowInsecure: opts?.allowInsecureRemotes === true,
       authProvider,
+      ...(authProvider ? await inBandAuthErrorsOption(ref) : {}),
     },
     eventSink,
     composeConnectorMcpContext(opts?.connectorMcp, sourceName),
@@ -538,23 +614,4 @@ async function startUrlConnectorSource(
 
   // Headless path or already-completed auth. start() succeeded.
   return await startPromise;
-}
-
-/**
- * Create and start an `McpSource` for a `ConnectorRef`, then add it to the
- * registry. Every ref is a remote MCP endpoint: the runtime connects to a URL
- * with a credential. It never downloads, unpacks, or spawns server code.
- */
-export async function startConnectorSource(
-  ref: ConnectorRef,
-  registry: ToolRegistry,
-  // Required. The runtime event sink is threaded into the McpSource so
-  // task-augmented tool calls can emit `tool.task_status` and a crashed or
-  // restarted source its `connector.health`. Callers without a real sink
-  // (rare) must pass `new NoopEventSink()` explicitly, so dropping events is a
-  // decision rather than an omission.
-  eventSink: EventSink,
-  opts?: StartConnectorOpts,
-): Promise<StartConnectorResult> {
-  return startUrlConnectorSource(ref, registry, eventSink, opts?.workspaceContext, opts);
 }

@@ -13,9 +13,10 @@ export const CONNECTOR_FIXTURE_DIR = join(import.meta.dir, "..", "fixtures", "co
 
 /**
  * A pre-URL connector ref (`{ name }` or `{ path }`) as JSON.parse leaves a
- * legacy record on disk. ConnectorRef no longer admits these shapes; the
+ * legacy record on disk. ConnectorRef does not admit these shapes; the
  * `"url" in ref` guards that tests feed them to exist for exactly those rows.
  */
 export function legacyConnectorRef(shape: { name: string } | { path: string }): ConnectorRef {
+  // biome-ignore lint/plugin/double-cast: A legacy row is deliberately a shape `ConnectorRef` refuses (no `url`).
   return shape as unknown as ConnectorRef;
 }

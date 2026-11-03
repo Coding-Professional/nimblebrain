@@ -26,7 +26,6 @@
               "oneOf": [{ "type": "string" }, { "$ref": "#/$defs/credentialRef" }],
               "description": "Provider API key. May instead be a credential reference — { \"ref\": \"credential\", \"key\": \"<key>\" } — resolved from the instance scope of the credential store at startup, so the value never sits in this file. See /config/secrets/."
             },
-            "promptCaching": { "type": "boolean", "default": true },
             "models": {
               "type": "array",
               "items": { "type": "string" },
@@ -58,6 +57,26 @@
             "apiKey": {
               "oneOf": [{ "type": "string" }, { "$ref": "#/$defs/credentialRef" }],
               "description": "Provider API key. May instead be a credential reference — { \"ref\": \"credential\", \"key\": \"<key>\" } — resolved from the instance scope of the credential store at startup, so the value never sits in this file. See /config/secrets/."
+            },
+            "models": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Allowlist of model IDs. Omit to allow all."
+            }
+          },
+          "additionalProperties": false
+        },
+        "greenpt": {
+          "type": "object",
+          "description": "GreenPT — European AI provider with an OpenAI-compatible API and infrastructure powered by 100% renewable energy. Reference models as greenpt:<model-id>.",
+          "properties": {
+            "apiKey": {
+              "type": "string",
+              "description": "GreenPT API key. Falls back to GREENPT_API_KEY env var."
+            },
+            "baseURL": {
+              "type": "string",
+              "description": "Override the inference endpoint. Default: https://api.greenpt.ai/v1"
             },
             "models": {
               "type": "array",
@@ -119,8 +138,16 @@
       "type": "object",
       "description": "Role-based model slots.",
       "properties": {
-        "default": { "type": "string", "description": "Primary model for chat." },
-        "fast": { "type": "string", "description": "Cheap/fast model for auxiliary tasks." }
+        "default": {
+          "type": "string",
+          "nbQualifiedModelId": true,
+          "description": "Primary model for chat, as provider:model-id (e.g. anthropic:claude-sonnet-4-6)."
+        },
+        "fast": {
+          "type": "string",
+          "nbQualifiedModelId": true,
+          "description": "Cheap/fast model for auxiliary tasks, as provider:model-id."
+        }
       },
       "additionalProperties": false
     },
@@ -130,7 +157,7 @@
       "properties": {
         "allowed": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "type": "string", "nbQualifiedModelId": true },
           "description": "Qualified provider:model-id strings. Can only subtract from what the configured providers can reach."
         }
       },
@@ -243,41 +270,6 @@
         }
       }
     },
-    "sessionStore": {
-      "description": "MCP session metadata store for /mcp. Tracks each Mcp-Session-Id and its idle TTL. Default: in-memory (process-local). Use 'redis' for multi-replica deploys; the same provider also gives single-replica deploys cluster-wide visibility for ops/admin tooling.",
-      "type": "object",
-      "properties": {
-        "type": {
-          "description": "Provider. 'memory' is process-local (default). 'redis' is cluster-shared (required for platform.replicas > 1).",
-          "type": "string",
-          "enum": ["memory", "redis"],
-          "default": "memory"
-        },
-        "ttlSeconds": {
-          "description": "Idle TTL for sessions in seconds. Each request resets the clock — actively-used sessions never expire. Default: 28800 (8 h).",
-          "type": "integer",
-          "minimum": 1,
-          "default": 28800
-        },
-        "redis": {
-          "description": "Redis-specific options. Required when type='redis'.",
-          "type": "object",
-          "properties": {
-            "url": {
-              "description": "Redis connection URL (redis:// or rediss://). Typically injected via environment from a secret.",
-              "type": "string"
-            },
-            "keyPrefix": {
-              "description": "Hash key prefix for session entries. Default: 'nb:mcp:session:'.",
-              "type": "string",
-              "default": "nb:mcp:session:"
-            }
-          },
-          "additionalProperties": false
-        }
-      },
-      "additionalProperties": false
-    },
     "secrets": {
       "description": "Which backend holds the deployment's secrets. Omit the block for the default: one plaintext file per secret under the work directory. See /config/secrets/.",
       "type": "object",
@@ -290,6 +282,11 @@
           "type": "object",
           "description": "That backend's own settings, passed through verbatim. MUST NOT contain key material: this file is commonly rendered from a values file in version control, so a key written here is a key committed to a repository. Name an environment variable instead — a property whose name ends in \"Env\" holds the NAME of one.",
           "nbNoInlineKeyMaterial": true
+        },
+        "runKeyEnv": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "The NAME of the environment variable holding the installation's run key (a JWK Set of Ed25519 private keys), never the key. Named, the run key is read from it at boot instead of the instance secret nimblebrain.run_key; named but unset, the runtime refuses to start. See /config/secrets/#the-run-key."
         }
       },
       "additionalProperties": false
@@ -421,6 +418,24 @@
             },
             "additionalProperties": false
           }
+        },
+        "oauthClients": {
+          "description": "Pre-registered OAuth clients for `auth: static` catalog entries, keyed by catalog id and held once for the instance. Declaring one makes the entry installable in every workspace and as a personal connector, each connection signing in with its own account, and replaces any workspace's own Set up for that id. The client is used only for the URL the catalog publishes for its id; an id the catalog does not publish as `auth: static` is logged and unused. See /config/connectors-catalog/#an-oauth-client-for-the-whole-instance.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "clientId": {
+                "type": "string",
+                "description": "The client's public client_id. Required."
+              },
+              "clientSecret": {
+                "oneOf": [{ "type": "string" }, { "$ref": "#/$defs/credentialRef" }],
+                "description": "The client's client_secret. Falls back to <CATALOG_ID>_CLIENT_SECRET (catalog id upper-cased, non-alphanumerics to underscore), so `com.example/mcp` reads COM_EXAMPLE_MCP_CLIENT_SECRET. May instead be a credential reference — { \"ref\": \"credential\", \"key\": \"<key>\" } — resolved from the instance scope of the credential store at startup. Startup fails when a declared client has no secret."
+              }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false
@@ -455,6 +470,42 @@
             }
           },
           "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution": {
+      "description": "Which agent runtime executes a run. Absent, every run executes on the native engine. An external runtime is an ACP agent served as a worker the runtime dials (nimblebrain-agent serve); it runs no spend gate, so a run that names spend accounts or caps its input tokens is refused on it. Outside the dev identity provider, external runtimes need a modelGateway and the installation's run key.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "type": "string",
+          "description": "The runtime every run executes on: native, or a name under runtimes. Default: native.",
+          "default": "native"
+        },
+        "modelGateway": {
+          "type": "string",
+          "description": "The installation's model gateway, by its root URL: each provider is served at <gateway>/<provider>. Every external agent's model endpoint, reached with a per-turn credential the runtime mints, and the native engine's for every provider: the runtime asks the gateway which providers it serves (GET <gateway>/providers) and holds no provider config, so providers.<id>.apiKey, baseURL and models refuse the boot beside it (narrow models with modelPolicy). Required outside the dev identity provider for external runtimes. Absent, a worker calls its own provider with its own key."
+        },
+        "runtimes": {
+          "type": "object",
+          "description": "Runtimes beside the native engine, keyed by the name default refers to.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "driver": {
+                "type": "string",
+                "enum": ["nimblebrain-agent"],
+                "description": "The agent the worker serves, which names the driver that speaks to it. nimblebrain-agent: NimbleBrain's agent loop as a standalone worker."
+              },
+              "url": {
+                "type": "string",
+                "description": "The worker's ACP endpoint, dialed over Streamable HTTP, e.g. http://agent-pool.<namespace>.svc:8080/acp. In a cluster, an internal Service only the runtime can reach."
+              }
+            },
+            "required": ["driver", "url"],
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false
@@ -526,9 +577,152 @@
         }
       },
       "additionalProperties": false
+    },
+    "brand": {
+      "description": "White-label branding: the product name, logos, accent color and typefaces a tenant's users see in place of NimbleBrain's. Every key is optional, and an absent block is NimbleBrain. The runtime rejects at load a palette that fails any WCAG AA contrast pair the canonical palette is held to. Served unauthenticated at GET /v1/brand.js. See https://docs.nimblebrain.ai/config/branding/.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[^\\u0000-\\u001f<>{}]+$",
+          "description": "Product name shown in place of \"NimbleBrain\": the agent's identity line, OAuth consent screens, the OAuth success page, error pages. Default: \"NimbleBrain\"."
+        },
+        "defaultTheme": {
+          "type": "string",
+          "enum": ["light", "dark", "system"],
+          "description": "The color theme a person starts in until they choose one. \"system\" follows the operating system. Default: \"system\"."
+        },
+        "homepageUrl": {
+          "$ref": "#/$defs/brandUrl",
+          "description": "Homepage sent as `client_uri` when registering OAuth clients with connector vendors."
+        },
+        "logo": {
+          "type": "object",
+          "description": "Logo artwork URLs. A URL that is set must resolve; a broken URL renders a broken image, not the default logo.",
+          "properties": {
+            "light": {
+              "$ref": "#/$defs/brandUrl",
+              "description": "Full logo for light mode."
+            },
+            "dark": {
+              "$ref": "#/$defs/brandUrl",
+              "description": "Full logo for dark mode."
+            },
+            "mark": {
+              "$ref": "#/$defs/brandUrl",
+              "description": "Square mark, used where the full logo does not fit."
+            },
+            "raster": {
+              "$ref": "#/$defs/brandUrl",
+              "description": "PNG mark sent as `logo_uri` in OAuth client registration. Raster because several identity providers refuse SVG there."
+            }
+          },
+          "additionalProperties": false
+        },
+        "favicon": {
+          "$ref": "#/$defs/brandUrl",
+          "description": "Favicon URL."
+        },
+        "colors": {
+          "type": "object",
+          "description": "Color roles, each a [light, dark] pair of #rrggbb values. Each role derives a family of tokens; the merged palette must clear WCAG AA in both modes.",
+          "properties": {
+            "primary": {
+              "$ref": "#/$defs/brandColorPair",
+              "description": "The accent: primary actions, links, accent text. Its hue also tints the neutrals (text, borders, gray surfaces) at their canonical lightness."
+            },
+            "ring": {
+              "$ref": "#/$defs/brandColorPair",
+              "description": "The focus ring. Usually the same value as primary."
+            },
+            "highlight": {
+              "$ref": "#/$defs/brandColorPair",
+              "description": "The fill of the active sidebar row, under white or black text, whichever reads better."
+            },
+            "sidebar": {
+              "$ref": "#/$defs/brandColorPair",
+              "description": "Light: the light-mode sidebar ground; a dark color renders the sidebar under the dark palette. Dark: the deepest dark-mode surface, from which the page, card, muted and border surfaces are derived as lighter steps."
+            }
+          },
+          "additionalProperties": false
+        },
+        "fonts": {
+          "type": "object",
+          "description": "Typeface overrides per role. A role with no url must name a system font.",
+          "properties": {
+            "sans": {
+              "$ref": "#/$defs/brandFont"
+            },
+            "heading": {
+              "$ref": "#/$defs/brandFont"
+            },
+            "reading": {
+              "$ref": "#/$defs/brandFont"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   },
   "$defs": {
+    "brandUrl": {
+      "type": "string",
+      "pattern": "^https?://[^\\s\"'()<>]+$"
+    },
+    "brandColorPair": {
+      "type": "array",
+      "description": "[light, dark]",
+      "items": {
+        "type": "string",
+        "pattern": "^#[0-9A-Fa-f]{6}$"
+      },
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "brandFontUrl": {
+      "type": "string",
+      "description": "A woff2 font file. Not a stylesheet: Google Fonts CSS URLs are rejected.",
+      "pattern": "^https?://[^\\s\"'()<>]+\\.woff2(\\?[^\\s\"'()<>]*)?$"
+    },
+    "brandFontWeight": {
+      "type": "string",
+      "description": "CSS font-weight descriptor: \"400\", or a variable range \"400 700\".",
+      "pattern": "^[1-9][0-9]{0,2}( [1-9][0-9]{0,2})?$"
+    },
+    "brandFont": {
+      "type": "object",
+      "description": "One typeface role: a CSS stack, and optionally one woff2 file (typically a variable font) declared under family.",
+      "required": ["stack"],
+      "properties": {
+        "stack": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^;{}<>\\\\]+$",
+          "description": "CSS font-family value, fallbacks included."
+        },
+        "family": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^;{}<>\\\\'\"]+$",
+          "description": "Family name the file is declared under. Required with url."
+        },
+        "url": {
+          "$ref": "#/$defs/brandFontUrl"
+        },
+        "weight": {
+          "$ref": "#/$defs/brandFontWeight"
+        }
+      },
+      "dependencies": {
+        "url": ["family"],
+        "weight": ["url"]
+      },
+      "additionalProperties": false
+    },
     "connectorRef": {
       "description": "One entry in a workspace's `connectors[]` — a remote MCP server, addressed by URL. Workspace records live at `<workDir>/workspaces/<wsId>/workspace.json`, not in this file.",
       "type": "object",

@@ -1,9 +1,9 @@
 /**
  * Skills platform source — in-process MCP server.
  *
- * Owns Phase 2 read-only Layer 3 (cross-connector agent orchestration) skill
- * visibility plus a single Layer 1 vendored resource: the platform-authored
- * guide for writing good skills. Mirrors `instructions.ts` structurally.
+ * Owns Layer 3 (cross-connector agent orchestration) skill visibility and
+ * mutation, plus a single Layer 1 vendored resource: the platform-authored
+ * guide for writing good skills.
  *
  * Tools surfaced (read-only):
  *   skills__list           — enumerate skills with scope/layer/status filters
@@ -17,9 +17,8 @@
  * Resource surfaced:
  *   skill://skills/authoring-guide — Layer 1 vendored markdown
  *
- * Mutation tools (create/update/delete/activate/etc.) are Phase 3 — see the
- * comment block at the bottom of this file for the intended surface so the
- * next implementer registers them in the right place.
+ * Mutation tools (create/update/history/restore/delete/set_status) and the
+ * per-conversation mute (activate/deactivate) register here too.
  */
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -37,7 +36,7 @@ import {
 } from "../../engine/types.ts";
 import { ORG_ADMIN_ROLES } from "../../identity/types.ts";
 import { log } from "../../observability/log.ts";
-import { formatActivatedSkillBlock } from "../../prompt/compose.ts";
+import { formatActivatedSkillBlock } from "../../prompt/containment.ts";
 import { getRequestContext } from "../../runtime/request-context.ts";
 import type { Runtime } from "../../runtime/runtime.ts";
 import {
@@ -51,10 +50,18 @@ import {
 } from "../../skills/load-ledger.ts";
 import { parseSkillContent, parseSkillFile, readSkillMtime } from "../../skills/loader.ts";
 import { resolveLoadingMechanism, type SkillLoadingMechanism } from "../../skills/loading.ts";
-import { SKILL_NAME_PATTERN } from "../../skills/schemas/skill-manifest.ts";
+import {
+  DEFAULT_LOADING_STRATEGY,
+  DEFAULT_SKILL_PRIORITY,
+  SKILL_NAME_PATTERN,
+} from "../../skills/schemas/skill-manifest.ts";
 import { toolMatches } from "../../skills/select.ts";
 import { approxTokens } from "../../skills/tokens.ts";
-import { MAX_SKILL_BODY_CHARS, truncateMarkdownToBudget } from "../../skills/truncate.ts";
+import {
+  MAX_SKILL_BODY_CHARS,
+  skillBodyChars,
+  truncateMarkdownToBudget,
+} from "../../skills/truncate.ts";
 import type { Skill, SkillManifest } from "../../skills/types.ts";
 import { validateSkill } from "../../skills/validator.ts";
 import {
@@ -65,38 +72,46 @@ import {
 } from "../../skills/versions.ts";
 import {
   deleteSkill,
+  mergeSkillBody,
   readSkill,
   type SkillBodyMode,
   updateSkill,
   writeSkill,
 } from "../../skills/writer.ts";
-import { defineInProcessApp, type InProcessTool } from "../../tools/in-process-app.ts";
+import {
+  defineInProcessApp,
+  type InProcessTool,
+  type ToolErrorResult,
+  type TypedToolResult,
+  typedTool,
+} from "../../tools/in-process-app.ts";
 import type { McpSource } from "../../tools/mcp-source.ts";
 import { WORKSPACE_OPTIONAL_META } from "../../tools/workspace-optional.ts";
 import { splitInnerToolName } from "../../util/tool-name.ts";
 import { canWriteWorkspaceScoped } from "../../workspace/authz.ts";
-import type {
-  SkillDetail,
-  SkillLoading,
-  SkillSummary,
-  SkillsListOutput,
-  SkillsReadOutput,
-  SkillsUseOutput,
-  SkillsWriteOutput,
-} from "../schemas/skills.ts";
+import type { SkillDetail, SkillLoading, SkillSummary } from "../schemas/skills.ts";
 import {
   SkillPriority,
   SkillsActivateInput,
+  SkillsActivationOutput,
   SkillsCreateInput,
   SkillsDeactivateInput,
   SkillsDeleteInput,
+  SkillsDeleteOutput,
   SkillsHistoryInput,
+  SkillsHistoryOutput,
   SkillsListInput,
+  SkillsListOutput,
   SkillsLoadingLogInput,
+  SkillsLoadingLogOutput,
   SkillsReadInput,
+  SkillsReadOutput,
   SkillsRestoreInput,
+  SkillsRestoreOutput,
   SkillsSetStatusInput,
   SkillsUpdateInput,
+  SkillsUseOutput,
+  SkillsWriteOutput,
   UseSkillInput,
 } from "../schemas/skills.ts";
 
@@ -146,7 +161,8 @@ const SKILLS_CREATE_DESCRIPTION =
 const SKILLS_UPDATE_DESCRIPTION =
   "Update an existing Layer 3 skill. The `id` is the filesystem path returned by `skills__list` " +
   "(call that first — bare names and scope-prefixed forms are NOT valid). Provide a partial " +
-  "`manifest` patch (any subset of the create-shape fields) and/or a `body`. When you pass a " +
+  "`manifest` patch (any subset of the create-shape fields) and/or a `body`. A field you omit " +
+  "keeps its value; `null` clears one (`description` cannot be cleared). When you pass a " +
   "`body` you MUST also pass `body_mode`: `append` adds it to the skill (use this to add a " +
   "rule — it keeps everything already there), `replace` overwrites the whole body. Snapshots " +
   "the current version to `_versions/` first; `skills__history` lists those snapshots and " +
@@ -210,10 +226,8 @@ const SKILLS_DEACTIVATE_DESCRIPTION =
 /**
  * Create the skills platform source.
  *
- * The `eventSink` parameter is currently unused but kept on the signature to
- * mirror `createInstructionsSource` and reserve the wiring for Phase 3
- * mutation tools, which will emit `skill.created` / `skill.updated` /
- * `skill.deleted` engine events.
+ * The `eventSink` carries the mutation tools' `skill.created` /
+ * `skill.updated` / `skill.deleted` engine events.
  */
 /**
  * Skills tools that stay reachable inside an unattended run: the read-only
@@ -229,9 +243,7 @@ const SKILLS_DEACTIVATE_DESCRIPTION =
  * untrusted content (email, web pages, tickets). A write from inside one would
  * put attacker-authored text into future interactive sessions with nothing
  * standing between them — a foothold that outlives the run and then loads
- * itself. That is the argument `createInstructionsSource` makes for the same
- * wall, and it is stronger here: instructions are one document a scope opts
- * into, while a skill can auto-load on a tool match and there can be many.
+ * itself.
  *
  * Reads stay open deliberately. A task that audits the catalog and
  * reports what it found — stale skills, overlapping guidance, a recommendation
@@ -289,49 +301,45 @@ export function createSkillsSource(
   );
 
   const tools: InProcessTool[] = [
-    {
+    typedTool({
       name: "list",
       description: SKILLS_LIST_DESCRIPTION,
       meta: { ...WORKSPACE_OPTIONAL_META },
       inputSchema: SkillsListInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsListOutput,
+      handler: async (input) => {
         try {
           const list = await listSkills(runtime, authoringGuidePath, input);
-          // Construct via the canonical envelope so a shape drift on
-          // either side surfaces at compile time. The cast at the
-          // boundary is needed because `structuredContent`'s wire type
-          // is `Record<string, unknown>`, which TS doesn't infer
-          // structural interfaces into; validation still happens on
-          // `out`'s declaration.
-          const out: SkillsListOutput = { skills: list };
           return {
             content: textContent(summarizeList(list)),
-            structuredContent: out as unknown as Record<string, unknown>,
+            structuredContent: { skills: list },
             isError: false,
           };
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "read",
       description: SKILLS_READ_DESCRIPTION,
       meta: { ...WORKSPACE_OPTIONAL_META },
       inputSchema: SkillsReadInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsReadOutput,
+      handler: async (input) => {
         try {
           return await readSkillHandler(runtime, authoringGuidePath, input);
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "loading_log",
       description: SKILLS_LOADING_LOG_DESCRIPTION,
       inputSchema: SkillsLoadingLogInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsLoadingLogOutput,
+      handler: async (input) => {
         try {
           const loads = await loadingLog(runtime, input);
           return {
@@ -343,77 +351,82 @@ export function createSkillsSource(
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "create",
       description: SKILLS_CREATE_DESCRIPTION,
       meta: { ...WORKSPACE_OPTIONAL_META },
       inputSchema: SkillsCreateInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsWriteOutput,
+      handler: async (input) => {
         try {
-          const result = await createSkill(runtime, input, eventSink);
-          return result;
+          return await createSkill(runtime, input, eventSink);
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "update",
       description: SKILLS_UPDATE_DESCRIPTION,
       meta: { ...WORKSPACE_OPTIONAL_META },
       inputSchema: SkillsUpdateInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsWriteOutput,
+      handler: async (input) => {
         try {
           return await updateSkillHandler(runtime, input, eventSink, authoringGuidePath);
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "history",
       description: SKILLS_HISTORY_DESCRIPTION,
       inputSchema: SkillsHistoryInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsHistoryOutput,
+      handler: async (input) => {
         try {
           return await historySkillHandler(runtime, input, authoringGuidePath);
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "restore",
       description: SKILLS_RESTORE_DESCRIPTION,
       inputSchema: SkillsRestoreInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsRestoreOutput,
+      handler: async (input) => {
         try {
           return await restoreSkillHandler(runtime, input, eventSink, authoringGuidePath);
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "delete",
       description: SKILLS_DELETE_DESCRIPTION,
       meta: { ...WORKSPACE_OPTIONAL_META },
       inputSchema: SkillsDeleteInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsDeleteOutput,
+      handler: async (input) => {
         try {
           return await deleteSkillHandler(runtime, input, eventSink, authoringGuidePath);
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "set_status",
       description: SKILLS_SET_STATUS_DESCRIPTION,
       meta: { ui: { visibility: ["app"] }, ...WORKSPACE_OPTIONAL_META },
       inputSchema: SkillsSetStatusInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsWriteOutput,
+      handler: async (input) => {
         try {
           const status = input.status === "disabled" ? "disabled" : "active";
           return await updateSkillHandler(
@@ -427,31 +440,33 @@ export function createSkillsSource(
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "activate",
       description: SKILLS_ACTIVATE_DESCRIPTION,
       inputSchema: SkillsActivateInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsActivationOutput,
+      handler: async (input) => {
         try {
           return await setStatusHandler(runtime, input, "active");
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
-    {
+    }),
+    typedTool({
       name: "deactivate",
       description: SKILLS_DEACTIVATE_DESCRIPTION,
       inputSchema: SkillsDeactivateInput,
-      handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+      outputSchema: SkillsActivationOutput,
+      handler: async (input) => {
         try {
           return await setStatusHandler(runtime, input, "disabled");
         } catch (err) {
           return errorResult(err);
         }
       },
-    },
+    }),
   ];
 
   // A feature-disabled tool is never BUILT. That is the enforcement — no
@@ -484,8 +499,7 @@ export function createSkillsSource(
   // `unattended` rides the ambient request context (set by `executeTask`,
   // preserved across the per-call restamp), so the wall does not depend on
   // which router dispatched the call, or on the tool ever having been surfaced
-  // to the model. Same placement and reasoning as `createTasksSource` and
-  // `createInstructionsSource`.
+  // to the model. Same placement and reasoning as `createTasksSource`.
   const walled: InProcessTool[] = enabled.map((tool) =>
     SKILLS_TASK_SAFE_TOOLS.has(tool.name)
       ? tool
@@ -538,15 +552,6 @@ export function createSkillsSource(
 
 // ── Internal handler logic ───────────────────────────────────────────────
 
-interface ListInput {
-  scope?: string;
-  layer?: number;
-  loading_strategy?: "always" | "dynamic";
-  tool_affinity?: string;
-  status?: string;
-  modified_since?: string;
-}
-
 // Local aliases for the canonical output shapes from `schemas/skills.ts`.
 // Server and web both import from there — this alias just keeps the
 // historical local name in this file's body so the diff stays small.
@@ -572,7 +577,7 @@ function skillToListed(skill: Skill): ListedSkill {
     ...(m.toolAffinity && m.toolAffinity.length > 0 ? { toolAffinity: m.toolAffinity } : {}),
     ...(m.triggers && m.triggers.length > 0 ? { triggers: m.triggers } : {}),
     priority: m.priority,
-    loading: { wouldLoad: mechanism !== "none", mechanism },
+    loading: { mechanism },
   };
 }
 
@@ -596,10 +601,8 @@ function resolveCallContext(runtime: Runtime): { wsId: string | null; userId: st
 async function listSkills(
   runtime: Runtime,
   authoringGuidePath: string,
-  input: Record<string, unknown>,
+  filter: SkillsListInput,
 ): Promise<ListedSkill[]> {
-  const filter = input as ListInput;
-
   const out: ListedSkill[] = [];
   const includeLayer3 = filter.layer === undefined || filter.layer === 3;
   const includeLayer1 = filter.layer === undefined || filter.layer === 1;
@@ -620,11 +623,9 @@ async function listSkills(
     }
   }
 
-  // Layer 1: vendored connector resources. Phase 2 surfaces only the platform-
-  // authored authoring guide (`skill://skills/authoring-guide`). Future
-  // connectors that publish their own `skill://...` resources will be
-  // discovered via a runtime resource scan; for Phase 2 the catalog is
-  // static and small.
+  // Layer 1: vendored connector resources. Only the platform-authored
+  // authoring guide (`skill://skills/authoring-guide`) is surfaced, so the
+  // catalog is static and small.
   if (includeLayer1) {
     const entry = buildAuthoringGuideEntry(authoringGuidePath);
     if (entry) out.push(entry);
@@ -681,12 +682,12 @@ function buildAuthoringGuideEntry(authoringGuidePath: string): ListedSkill | nul
       ? { triggers: skill.manifest.triggers }
       : {}),
     priority: skill.manifest.priority,
-    loading: { wouldLoad: mechanism !== "none", mechanism },
+    loading: { mechanism },
   };
 }
 
 /** Scalar + tool-affinity filter for `skills__list`: true when `s` passes every provided filter. */
-function matchesListFilters(s: ListedSkill, filter: ListInput): boolean {
+function matchesListFilters(s: ListedSkill, filter: SkillsListInput): boolean {
   if (filter.scope && s.scope !== filter.scope) return false;
   if (filter.loading_strategy && s.loadingStrategy !== filter.loading_strategy) return false;
   if (filter.status && s.status !== filter.status) return false;
@@ -856,7 +857,7 @@ async function readSkillById(
   // Dispatch by id scheme.
   if (id === AUTHORING_GUIDE_URI || id.startsWith(SKILL_URI_PREFIX)) {
     if (id !== AUTHORING_GUIDE_URI) {
-      // Phase 2 only exposes the one Layer 1 resource by URI.
+      // Only the one Layer 1 resource is exposed by URI.
       return null;
     }
     if (!existsSync(authoringGuidePath)) return null;
@@ -905,7 +906,11 @@ async function readSkillById(
  * `readSkillHandler` so the live-read path keeps its shape; the caller has
  * already run every scope/permission/symlink gate.
  */
-function renderSkillVersion(id: string, version: string, isUri: boolean): ToolResult {
+function renderSkillVersion(
+  id: string,
+  version: string,
+  isUri: boolean,
+): TypedToolResult<typeof SkillsReadOutput> {
   if (isUri) {
     return errorResult(
       new Error(
@@ -932,7 +937,7 @@ function renderSkillVersion(id: string, version: string, isUri: boolean): ToolRe
       id,
       version,
       body: parsed.body,
-      manifest: parsed.manifest as unknown as Record<string, unknown>,
+      manifest: parsed.manifest,
     },
     isError: false,
   };
@@ -941,9 +946,9 @@ function renderSkillVersion(id: string, version: string, isUri: boolean): ToolRe
 async function readSkillHandler(
   runtime: Runtime,
   authoringGuidePath: string,
-  input: Record<string, unknown>,
-): Promise<ToolResult> {
-  const id = String(input.id ?? "");
+  input: SkillsReadInput,
+): Promise<TypedToolResult<typeof SkillsReadOutput>> {
+  const { id, version } = input;
   // Determine scope for the permission check before any FS work.
   // skill:// URIs always resolve to the Layer 1 connector resource;
   // anything else is path-derived.
@@ -1005,7 +1010,6 @@ async function readSkillHandler(
   // A snapshot read runs the SAME scope/permission/symlink gates above and
   // only then swaps which file is parsed — history must never be a side door
   // to content the live path would refuse.
-  const version = typeof input.version === "string" ? input.version : undefined;
   if (version) return renderSkillVersion(id, version, isUri);
   const result = await readSkillById(runtime, authoringGuidePath, id);
   if (!result) {
@@ -1014,17 +1018,13 @@ async function readSkillHandler(
       isError: true,
     };
   }
-  // Compile-time drift coverage on the read shape: `out`'s type
-  // pins it to the canonical `SkillsReadOutput`. Wire cast is
-  // the same shim explained in the `list` handler.
-  const out: SkillsReadOutput = result;
   return {
     // `content` carries the full body + manifest because the
     // engine never surfaces `structuredContent` to the model;
     // `structuredContent` keeps the typed copy for `/mcp` clients
     // and the UI. See `renderRead`.
     content: textContent(renderRead(result)),
-    structuredContent: out as unknown as Record<string, unknown>,
+    structuredContent: result,
     isError: false,
   };
 }
@@ -1050,18 +1050,19 @@ async function readSkillHandler(
  * mid-task. Different audience, different resting place.
  */
 export function createUseSkillToolDef(runtime: Runtime): InProcessTool {
-  return {
+  return typedTool({
     name: "use_skill",
     description: USE_SKILL_DESCRIPTION,
     inputSchema: UseSkillInput,
-    handler: async (input: Record<string, unknown>): Promise<ToolResult> => {
+    outputSchema: SkillsUseOutput,
+    handler: async (input) => {
       try {
         return await handleUseSkill(runtime, input);
       } catch (err) {
         return errorResult(err);
       }
     },
-  };
+  });
 }
 
 /**
@@ -1097,9 +1098,9 @@ function skillLoadFailureMessage(name: string, reason: "unreachable" | "unverifi
  */
 async function handleUseSkill(
   runtime: Runtime,
-  input: Record<string, unknown>,
-): Promise<ToolResult> {
-  const { name } = input as unknown as UseSkillInput;
+  input: UseSkillInput,
+): Promise<TypedToolResult<typeof SkillsUseOutput>> {
+  const { name } = input;
   const { wsId, userId } = resolveCallContext(runtime);
   if (!wsId) {
     return {
@@ -1138,7 +1139,7 @@ async function handleUseSkill(
         content: textContent(
           `Skill "${name}" is already loaded in this conversation — its guidance is in context above; no need to load it again.`,
         ),
-        structuredContent: out as unknown as Record<string, unknown>,
+        structuredContent: out,
         isError: false,
       };
     }
@@ -1160,7 +1161,7 @@ async function handleUseSkill(
   const out: SkillsUseOutput = { status: "loaded", name: skill.name, scope: skill.scope, tokens };
   return {
     content: textContent(formatActivatedSkillBlock(skill.name, skill.scope, capped.body)),
-    structuredContent: out as unknown as Record<string, unknown>,
+    structuredContent: out,
     isError: false,
     _meta: {
       [SKILL_ACTIVATED_META_KEY]: { skillName: skill.name, scope: skill.scope, tokens },
@@ -1195,6 +1196,9 @@ function buildReadResult(
       status: m.status,
     },
     ...(base.modifiedAt ? { modifiedAt: base.modifiedAt } : {}),
+    ...(skillBodyChars(skill.body) > MAX_SKILL_BODY_CHARS
+      ? { overLimitBy: skillBodyChars(skill.body) - MAX_SKILL_BODY_CHARS }
+      : {}),
   };
 }
 
@@ -1219,14 +1223,6 @@ function inferScopeFromPath(
   return "provided";
 }
 
-interface LoadingLogInput {
-  conversation_id?: string;
-  skill?: string;
-  loaded_by?: SkillLoadedBy;
-  since?: string;
-  until?: string;
-}
-
 /**
  * Replay the skill-load ledger — every channel, not just `skills.loaded`.
  *
@@ -1235,16 +1231,13 @@ interface LoadingLogInput {
  * is provided, scan just that conversation (owner-gated, and resolvable from
  * any workspace — the same by-id read a deep link does); otherwise scan every
  * conversation the caller owns in the active workspace. The cross-conv scan
- * reads each jsonl in turn — intentionally simple for Phase 2; a derived index
- * lands in Phase 6.
+ * reads each jsonl in turn — intentionally simple; there is no derived index.
  */
 async function loadingLog(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  filter: SkillsLoadingLogInput,
 ): Promise<SkillLoadRow[]> {
-  const filter = input as LoadingLogInput;
-
-  // Stage 1 single-owner: every conversation read here must belong to
+  // Conversations are single-owner: every conversation read here must belong to
   // the caller. Without an identity we refuse rather than scan — the
   // top-level store holds every user's conversations and an
   // unauthenticated scan would leak peer skills.loaded events.
@@ -1272,7 +1265,7 @@ async function loadingLog(
 /** Resolve the conversation ids to scan for `skills__loading_log`, scoped to the caller. */
 async function resolveLoadingLogConvIds(
   runtime: Runtime,
-  filter: LoadingLogInput,
+  filter: SkillsLoadingLogInput,
   access: { userId: string },
 ): Promise<string[]> {
   if (filter.conversation_id) {
@@ -1294,7 +1287,7 @@ async function resolveLoadingLogConvIds(
  * `activation` row — the two channels this tool exists to surface — and make a
  * per-skill query look like the skill never loaded.
  */
-function matchesLoadingLogFilter(row: SkillLoadRow, filter: LoadingLogInput): boolean {
+function matchesLoadingLogFilter(row: SkillLoadRow, filter: SkillsLoadingLogInput): boolean {
   if (filter.since && row.ts < filter.since) return false;
   if (filter.until && row.ts > filter.until) return false;
   if (filter.loaded_by && row.loaded_by !== filter.loaded_by) return false;
@@ -1304,8 +1297,8 @@ function matchesLoadingLogFilter(row: SkillLoadRow, filter: LoadingLogInput): bo
 
 /**
  * Read raw conversation events for the given id from the top-level
- * conversation store. Returns `null` for not-found, `[]` for legacy
- * (message-format) conversations.
+ * conversation store. Returns `null` for not-found, `[]` for a conversation
+ * that holds no events.
  */
 async function readConvEvents(
   runtime: Runtime,
@@ -1327,8 +1320,6 @@ async function readConvEvents(
  *
  * Workspace-scoped because `skills` is a workspace source and skills are
  * workspace-tiered: "which skills loaded" is a question about THIS workspace.
- * The unscoped version answered it across every workspace the caller belonged
- * to, contradicting this function's own contract.
  */
 async function listOwnedConversationIds(
   runtime: Runtime,
@@ -1352,7 +1343,7 @@ async function listOwnedConversationIds(
   return ids;
 }
 
-function errorResult(err: unknown): ToolResult {
+function errorResult(err: unknown): ToolErrorResult {
   const message = err instanceof Error ? err.message : String(err);
   return {
     content: textContent(message),
@@ -1394,10 +1385,7 @@ function summarizeList(skills: ListedSkill[]): string {
     if (s.status && s.status !== "active") tags.push(s.status);
     const meta = `(${tags.join(" ")})`;
     const desc = s.description ? ` — ${s.description.slice(0, 100)}` : "";
-    // Flag dead skills (no strategy, no triggers, no tool affinity) so the
-    // zero-signal failure mode is visible in the model-facing content.
-    const warn = s.loading?.wouldLoad === false ? " ⚠ never loads" : "";
-    return `- ${s.id} ${meta}${desc}${warn}`;
+    return `- ${s.id} ${meta}${desc}`;
   });
   return `${header}\n${lines.join("\n")}`;
 }
@@ -1441,11 +1429,18 @@ function renderRead(skill: ReadResult): string {
   if (m.toolAffinity?.length) fields.push(`tool-affinity: ${m.toolAffinity.join(", ")}`);
   if (m.triggers?.length) fields.push(`triggers: ${m.triggers.join(", ")}`);
   if (skill.modifiedAt) fields.push(`modified: ${skill.modifiedAt}`);
+  if (skill.overLimitBy) {
+    fields.push(
+      `over-limit-by: ${skill.overLimitBy} characters past the ${MAX_SKILL_BODY_CHARS}-character limit; its last sections are cut when it loads`,
+    );
+  }
   return `${fields.join("\n")}\n\n---\n\n${skill.content}`;
 }
 
 function summarizeLog(rows: SkillLoadRow[]): string {
   if (rows.length === 0) return "No skill loads match the filters.";
+  const missed = rows.filter((r) => r.status !== undefined).length;
+  const missedNote = missed > 0 ? `; ${missed} bound skill(s) did not arrive (see status)` : "";
   const conversations = new Set(rows.map((r) => r.conv_id)).size;
   // Channel breakdown is the point of the ledger — a channel that never fires
   // should be legible as a missing key, not inferred from a total.
@@ -1457,7 +1452,7 @@ function summarizeLog(rows: SkillLoadRow[]): string {
     .join(", ");
   const plural = rows.length === 1 ? "" : "s";
   const convPlural = conversations === 1 ? "" : "s";
-  return `${rows.length} skill load${plural} across ${conversations} conversation${convPlural} (${breakdown})`;
+  return `${rows.length} skill load${plural} across ${conversations} conversation${convPlural} (${breakdown})${missedNote}`;
 }
 
 // ── Mutation handlers ────────────────────────────────────────────────────
@@ -1485,7 +1480,7 @@ type AccessMode = "read" | "write";
  *
  * Tier rules (read | write):
  *   - connector      — read: anyone (Layer 1 vendored). write: refused (caller side).
- *   - org         — read: any tenant member.            write: org admin/owner.
+ *   - org         — read: any tenant member.            write: org admin.
  *   - workspace   — read+write: must be a member of the path's workspace.
  *                   write also requires `admin` role in that workspace.
  *   - user        — read+write: only the owning user.
@@ -1520,12 +1515,12 @@ function connectorAccess(mode: AccessMode): PermissionDecision {
   return { allowed: false, reason: "Connector (Layer 1) skills are vendored and not mutable" };
 }
 
-/** Org-tier access: any tenant member reads; only org admins/owners write. */
+/** Org-tier access: any tenant member reads; only org admins write. */
 function orgAccess(mode: AccessMode, isOrgAdmin: boolean): PermissionDecision {
   if (mode === "read") return { allowed: true };
   return isOrgAdmin
     ? { allowed: true }
-    : { allowed: false, reason: "Org-scope writes require org admin or owner" };
+    : { allowed: false, reason: "Org-scope writes require org admin" };
 }
 
 /** User-tier access: read+write only for the owning user named by the path (no org-admin override). */
@@ -1685,7 +1680,7 @@ async function reloadBootSkills(runtime: Runtime): Promise<void> {
 
 /**
  * Render a permission-denied error with causation. The bare reason from
- * `checkPathAccess` ("Org-scope writes require org admin or owner") leaves
+ * `checkPathAccess` ("Org-scope writes require org admin") leaves
  * the caller hypothesizing about why their path landed in that scope and
  * what role they actually have — surfaced as a real problem in production
  * when an agent looped trying to fix its role instead of fixing its `id`.
@@ -1704,7 +1699,7 @@ function permissionDenied(
     scope?: WritableScope | "provided";
     role?: string;
   },
-): ToolResult {
+): ToolErrorResult {
   const lines: string[] = [reason];
   if (context?.path && context.scope) {
     lines.push(
@@ -1751,7 +1746,7 @@ function currentRoleHint(runtime: Runtime, scope: WritableScope | "provided"): s
   return identity.orgRole;
 }
 
-function connectorNotMutable(): ToolResult {
+function connectorNotMutable(): ToolErrorResult {
   // Structured error shape per the skill management design doc — the
   // `suggested_action` discriminator lets calling agents present the
   // right next step without parsing prose.
@@ -1809,8 +1804,8 @@ function buildCreateManifest(
   return {
     name,
     description: manifest.description,
-    loadingStrategy: manifest.loadingStrategy ?? "dynamic",
-    priority: manifest.priority ?? 50,
+    loadingStrategy: manifest.loadingStrategy ?? DEFAULT_LOADING_STRATEGY,
+    priority: manifest.priority ?? DEFAULT_SKILL_PRIORITY,
     // Always active. `status` is not a create-time field — see
     // `CreateManifestFields`; `set_status` is the one door to the durable off
     // switch, and it is internal.
@@ -1843,7 +1838,7 @@ interface PastedFields {
   declaredName?: string;
 }
 
-type PastedFrontmatter = { error: ToolResult } | PastedFields;
+type PastedFrontmatter = { error: ToolErrorResult } | PastedFields;
 
 /**
  * Read a pasted `SKILL.md` out of a write's body, or refuse it.
@@ -1917,13 +1912,12 @@ function absorbPastedFrontmatter(
 }
 
 /**
- * How a written skill loads, said in a way a caller can act on. `none` is the
- * dead case, so it names the two signals that would revive it rather than
- * reporting a status word nothing follows from.
+ * How a written skill loads, said in a way a caller can act on. `on_request`
+ * names the signals that would make it load without the model asking.
  */
 function loadsNote(mechanism: SkillLoadingMechanism): string {
-  return mechanism === "none"
-    ? "catalog-only — won't auto-load yet; add a trigger or tool-affinity, or set loading-strategy: always"
+  return mechanism === "on_request"
+    ? "on request — the model loads it from the catalog when the job needs it; add tool-affinity or a trigger to load it without being asked"
     : mechanism;
 }
 
@@ -1949,10 +1943,10 @@ function frontmatterNote(absorbed: PastedFields | null, name: string): string {
 // — same place as the on-disk frontmatter.
 async function createSkill(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  input: SkillsCreateInput,
   eventSink: EventSink,
-): Promise<ToolResult> {
-  const { scope, manifest, body, frontmatter } = input as unknown as SkillsCreateInput;
+): Promise<TypedToolResult<typeof SkillsWriteOutput>> {
+  const { scope, manifest, body, frontmatter } = input;
   const { name } = manifest;
   assertValidName(name);
 
@@ -2015,6 +2009,8 @@ async function createSkill(
   if (!validation.valid) {
     return errorResult(new Error(`Validation failed — ${validation.errors.join("; ")}`));
   }
+  const sizeError = bodySizeError(pasted.body);
+  if (sizeError) return sizeError;
 
   // The writer canonically validates before touching disk and throws if the
   // manifest wouldn't load — surface that as a clean tool error, no file left
@@ -2031,46 +2027,46 @@ async function createSkill(
     data: { id: target, name, scope },
   });
 
-  // Cast at the wire boundary for the reason `listSkills` states: the envelope
-  // is `Record<string, unknown>`, which TS won't infer a structural interface
-  // into. The declaration above is what gets checked.
   const out: SkillsWriteOutput = {
     id: target,
     name,
     scope,
     loadingStrategy: fullManifest.loadingStrategy,
-    loading: { wouldLoad: mechanism !== "none", mechanism },
+    loading: { mechanism },
     ...(pasted.applied?.length ? { frontmatterApplied: pasted.applied } : {}),
   };
   return {
     content: textContent(
       `Created ${scope} skill "${name}" → ${target} (loads: ${loadsNote(mechanism)})${frontmatterNote(pasted, name)}`,
     ),
-    structuredContent: out as unknown as Record<string, unknown>,
+    structuredContent: out,
     isError: false,
   };
 }
 
 /**
- * Build a `Partial<SkillManifest>` from an update patch, keeping only the
- * fields the caller actually provided. `name` in the patch is ignored since
- * it's derived from the path (renaming is a separate operation). Metadata
- * sub-fields (keywords, triggers) are required arrays in the domain type but
- * optional in the LLM-facing schema, so we default-to-empty when they're
- * omitted — same boundary normalization as createSkill.
+ * Build a `Partial<SkillManifest>` from an update patch. An omitted field is
+ * left out, so the writer keeps its current value. A `null` clears the field
+ * (platform/AGENTS.md §1.3): a list becomes absent, which the writer leaves
+ * out of the file, and `loadingStrategy` / `priority` take the default the
+ * loader gives a skill that declares none. Those two are always written, so
+ * their default is how "unset" is stored. `name` is not in the patch: it is
+ * derived from the path.
  */
 function buildUpdatePatch(
   patch: SkillsUpdateInput["manifest"],
 ): Partial<SkillManifest> | undefined {
   if (!patch) return undefined;
-  return {
-    ...(patch.description !== undefined ? { description: patch.description } : {}),
-    ...(patch.loadingStrategy !== undefined ? { loadingStrategy: patch.loadingStrategy } : {}),
-    ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
-    ...(patch.toolAffinity !== undefined ? { toolAffinity: patch.toolAffinity } : {}),
-    ...(patch.triggers !== undefined ? { triggers: patch.triggers } : {}),
-    ...(patch.allowedTools !== undefined ? { allowedTools: patch.allowedTools } : {}),
-  };
+  const out: Partial<SkillManifest> = {};
+  if (patch.description !== undefined) out.description = patch.description;
+  if (patch.loadingStrategy !== undefined) {
+    out.loadingStrategy = patch.loadingStrategy ?? DEFAULT_LOADING_STRATEGY;
+  }
+  if (patch.priority !== undefined) out.priority = patch.priority ?? DEFAULT_SKILL_PRIORITY;
+  for (const key of ["toolAffinity", "triggers", "allowedTools"] as const) {
+    if (patch[key] !== undefined) out[key] = patch[key] ?? undefined;
+  }
+  return out;
 }
 
 // Input shape for `skills__update`. `manifest` is a partial of the
@@ -2084,7 +2080,7 @@ function buildUpdatePatch(
  * lets unknown keys through, so ignoring one would report a disable that never
  * happened — the silent no-op this whole change exists to remove.
  */
-function durableStatusError(manifest: unknown): ToolResult | null {
+function durableStatusError(manifest: unknown): ToolErrorResult | null {
   if ((manifest as { status?: unknown } | undefined)?.status === undefined) return null;
   return errorResult(
     new Error(
@@ -2102,7 +2098,7 @@ function durableStatusError(manifest: unknown): ToolResult | null {
  * the whole body when the caller sent a full rewrite. An error costs one
  * retry; both defaults cost content.
  */
-function bodyModeError(body: string | undefined, bodyMode: unknown): ToolResult | null {
+function bodyModeError(body: string | undefined, bodyMode: unknown): ToolErrorResult | null {
   if (body === undefined) return null;
   if (bodyMode === "append" || bodyMode === "replace") return null;
   return errorResult(
@@ -2115,11 +2111,67 @@ function bodyModeError(body: string | undefined, bodyMode: unknown): ToolResult 
 }
 
 /**
+ * Refuse a body the platform would not deliver whole.
+ *
+ * A body past `MAX_SKILL_BODY_CHARS` is cut from the end when it loads, so
+ * accepting one is accepting a silent loss, and the rules an author adds last
+ * are the ones dropped. A body already over the limit may still be saved when
+ * the save does not grow it: the editor sends the whole body on every save, so
+ * refusing those would stop an owner fixing one rule, or changing a trigger,
+ * until they had first cut the skill below the limit.
+ */
+function bodySizeError(next: string, current?: string): ToolErrorResult | null {
+  const size = skillBodyChars(next);
+  if (size <= MAX_SKILL_BODY_CHARS) return null;
+  if (current !== undefined && size <= skillBodyChars(current)) return null;
+  return errorResult(
+    new Error(
+      `Not saved: the skill body would be ${size} characters. A skill is delivered up to ` +
+        `${MAX_SKILL_BODY_CHARS} characters and anything past that is cut from the end when it ` +
+        "loads. Edit the section the rule belongs in rather than appending, or split the skill " +
+        "into two. Do not summarise the rest of the skill to make room.",
+    ),
+  );
+}
+
+/**
+ * An update's body, ready to write: the pasted document absorbed, then the body
+ * the write would leave checked against the size rule. `nextBody` is undefined
+ * when the update sends no body (a manifest-only patch or a status change),
+ * which is never refused on size.
+ */
+function prepareUpdateBody(
+  dir: string,
+  name: string,
+  body: string | undefined,
+  mode: SkillBodyMode,
+  frontmatter: "apply" | "ignore" | undefined,
+): { error: ToolErrorResult } | { pasted: PastedFields | null; nextBody: string | undefined } {
+  const absorbed = absorbForUpdate(body, mode, frontmatter);
+  if ("error" in absorbed) return absorbed;
+  const sentBody = absorbed.pasted ? absorbed.pasted.body : body;
+  if (sentBody === undefined) return { pasted: absorbed.pasted, nextBody: undefined };
+  const currentBody = readSkill(dir, name)?.body ?? "";
+  const nextBody = mergeSkillBody(currentBody, sentBody, mode);
+  const error = bodySizeError(nextBody, currentBody);
+  return error ? { error } : { pasted: absorbed.pasted, nextBody };
+}
+
+/** What a save that leaves the body over the limit owes the author: how far over it is. */
+function overLimitNote(body: string | undefined): string {
+  if (body === undefined) return "";
+  const over = skillBodyChars(body) - MAX_SKILL_BODY_CHARS;
+  return over > 0
+    ? ` It is still ${over} characters over the ${MAX_SKILL_BODY_CHARS}-character limit, so its last sections are cut when it loads.`
+    : "";
+}
+
+/**
  * Refuse a path that points into `_versions/` rather than at a live skill.
  * Mutating a snapshot would snapshot a snapshot, and the loader skips that
  * subtree, so the result would be unreachable by every reader.
  */
-function snapshotPathError(id: string): ToolResult | null {
+function snapshotPathError(id: string): ToolErrorResult | null {
   if (!isSnapshotPath(id)) return null;
   return errorResult(
     new Error(
@@ -2143,7 +2195,7 @@ function updatePreWriteRefusal(
   bodyMode: unknown,
   patch: unknown,
   allowStatus: boolean,
-): ToolResult | null {
+): ToolErrorResult | null {
   const modeError = bodyModeError(body, bodyMode);
   if (modeError) return modeError;
   // `set_status` is the one door to the durable off switch, and only it passes
@@ -2165,33 +2217,35 @@ function absorbForUpdate(
   body: string | undefined,
   mode: SkillBodyMode,
   frontmatter: "apply" | "ignore" | undefined,
-): { error: ToolResult } | { pasted: PastedFields | null } {
+): { error: ToolErrorResult } | { pasted: PastedFields | null } {
   if (body === undefined || mode === "append") return { pasted: null };
   const absorbed = absorbPastedFrontmatter(body, frontmatter);
   return "error" in absorbed ? absorbed : { pasted: absorbed };
 }
 
+/**
+ * `skills__update`'s input, plus the `manifest.status` that only `set_status`
+ * passes (and only with `opts.allowStatus`).
+ */
+type UpdateSkillArgs = SkillsUpdateInput & {
+  manifest?: { status?: SkillsSetStatusInput["status"] };
+};
+
 async function updateSkillHandler(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  input: UpdateSkillArgs,
   eventSink: EventSink,
   authoringGuidePath: string,
   /**
    * Let this call write `manifest.status`. ONLY `set_status` passes it — that
    * tool is app-only, so the door stays shut to the model. Without the flag a
-   * `status` in the patch is refused rather than dropped: the schema no longer
-   * declares the field, but the validator lets unknown keys through, so
+   * `status` in the patch is refused rather than dropped: the schema does not
+   * declare the field, but the validator lets unknown keys through, so
    * ignoring it would report a successful disable that never happened.
    */
   opts: { allowStatus?: boolean } = {},
-): Promise<ToolResult> {
-  const {
-    id,
-    manifest: patch,
-    body,
-    body_mode: bodyMode,
-    frontmatter,
-  } = input as unknown as SkillsUpdateInput;
+): Promise<TypedToolResult<typeof SkillsWriteOutput>> {
+  const { id, manifest: patch, body, body_mode: bodyMode, frontmatter } = input;
 
   // Same gate the history/restore pair runs: scope, existence-before-permission,
   // write authority, and the symlink-boundary check that stops a link from
@@ -2208,15 +2262,17 @@ async function updateSkillHandler(
   if (refusal) return refusal;
 
   const effectiveMode = bodyMode ?? "replace";
-  const absorbed = absorbForUpdate(body, effectiveMode, frontmatter);
-  if ("error" in absorbed) return absorbed.error;
-  const pasted = absorbed.pasted;
+  // The body is sized before the snapshot, so a refused update leaves neither a
+  // changed file nor a history entry.
+  const prepared = prepareUpdateBody(dir, name, body, effectiveMode, frontmatter);
+  if ("error" in prepared) return prepared.error;
+  const { pasted, nextBody } = prepared;
 
   snapshotSkillVersion(id);
 
   // `buildUpdatePatch` drops `status` by construction, so the only way it
   // reaches the writer is this explicit re-add on the allowed path.
-  const status = (patch as { status?: "active" | "disabled" } | undefined)?.status;
+  const status = patch?.status;
   const partial = {
     ...buildUpdatePatch(patch),
     // The pasted document is the more deliberate statement, so it wins over
@@ -2240,10 +2296,9 @@ async function updateSkillHandler(
   const loads = out.loading ? ` (loads: ${loadsNote(out.loading.mechanism)})` : "";
   return {
     content: textContent(
-      `Updated ${scope} skill "${name}"${loads}${frontmatterNote(pasted, name)}`,
+      `Updated ${scope} skill "${name}"${loads}${frontmatterNote(pasted, name)}${overLimitNote(nextBody)}`,
     ),
-    // Cast at the wire boundary for the reason `listSkills` states.
-    structuredContent: out as unknown as Record<string, unknown>,
+    structuredContent: out,
     isError: false,
   };
 }
@@ -2265,9 +2320,7 @@ function describeWrittenSkill(
 ): SkillsWriteOutput {
   const written = readSkill(dir, name);
   const mechanism = written ? resolveLoadingMechanism(written.manifest) : undefined;
-  const loading: SkillLoading | undefined = mechanism
-    ? { wouldLoad: mechanism !== "none", mechanism }
-    : undefined;
+  const loading: SkillLoading | undefined = mechanism ? { mechanism } : undefined;
   return {
     id,
     name,
@@ -2290,7 +2343,7 @@ async function gateSkillPath(
   id: string,
   authoringGuidePath: string,
   access: "read" | "write",
-): Promise<{ scope: WritableScope } | { error: ToolResult }> {
+): Promise<{ scope: WritableScope } | { error: ToolErrorResult }> {
   if (!id) return { error: errorResult(new Error("`id` is required")) };
   const snapErr = snapshotPathError(id);
   if (snapErr) return { error: snapErr };
@@ -2328,14 +2381,14 @@ async function gateSkillPath(
 
 async function historySkillHandler(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  input: SkillsHistoryInput,
   authoringGuidePath: string,
-): Promise<ToolResult> {
-  const { id } = input as { id?: string };
-  const gate = await gateSkillPath(runtime, id ?? "", authoringGuidePath, "read");
+): Promise<TypedToolResult<typeof SkillsHistoryOutput>> {
+  const { id } = input;
+  const gate = await gateSkillPath(runtime, id, authoringGuidePath, "read");
   if ("error" in gate) return gate.error;
 
-  const versions = listSkillVersions(id as string);
+  const versions = listSkillVersions(id);
   const summary = versions.length
     ? `${versions.length} saved version(s) of "${id}":\n` +
       versions.map((v) => `  ${v.version}  (${v.savedAt}, ${v.bytes} bytes)`).join("\n")
@@ -2349,15 +2402,13 @@ async function historySkillHandler(
 
 async function restoreSkillHandler(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  input: SkillsRestoreInput,
   eventSink: EventSink,
   authoringGuidePath: string,
-): Promise<ToolResult> {
-  const { id, version } = input as { id?: string; version?: string };
-  if (!version) return errorResult(new Error("`version` is required"));
-  const gate = await gateSkillPath(runtime, id ?? "", authoringGuidePath, "write");
+): Promise<TypedToolResult<typeof SkillsRestoreOutput>> {
+  const { id: path, version } = input;
+  const gate = await gateSkillPath(runtime, path, authoringGuidePath, "write");
   if ("error" in gate) return gate.error;
-  const path = id as string;
 
   const raw = readSkillVersionRaw(path, version);
   if (raw === null) {
@@ -2400,7 +2451,9 @@ async function restoreSkillHandler(
 
   eventSink.emit({ type: "skill.updated", data: { id: path, name, scope: gate.scope } });
   return {
-    content: textContent(`Restored ${gate.scope} skill "${name}" from version ${version}`),
+    content: textContent(
+      `Restored ${gate.scope} skill "${name}" from version ${version}.${overLimitNote(parsed.body)}`,
+    ),
     structuredContent: { id: path, name, scope: gate.scope, version },
     isError: false,
   };
@@ -2408,29 +2461,29 @@ async function restoreSkillHandler(
 
 async function deleteSkillHandler(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  input: SkillsDeleteInput,
   eventSink: EventSink,
   authoringGuidePath: string,
-): Promise<ToolResult> {
-  const { id } = input as { id?: string };
+): Promise<TypedToolResult<typeof SkillsDeleteOutput>> {
+  const { id } = input;
 
   // The same gate update / history / restore run. Delete is the last
   // destructive path that carried its own copy, which is why it was also the
   // last one that would accept a `_versions/` path — deleting a snapshot and
   // leaving a nested `_versions/_versions/` no reader can see.
-  const gate = await gateSkillPath(runtime, id ?? "", authoringGuidePath, "write");
+  const gate = await gateSkillPath(runtime, id, authoringGuidePath, "write");
   if ("error" in gate) return gate.error;
   const scope = gate.scope;
 
-  const dir = dirname(id as string);
-  const name = ((id as string).split("/").pop() ?? "").replace(/\.md$/, "");
+  const dir = dirname(id);
+  const name = (id.split("/").pop() ?? "").replace(/\.md$/, "");
   if (!name) return errorResult(new Error(`Cannot derive skill name from path "${id}"`));
 
-  snapshotSkillVersion(id as string);
+  snapshotSkillVersion(id);
   deleteSkill(dir, name);
   await reloadBootSkills(runtime);
 
-  eventSink.emit({ type: "skill.deleted", data: { id: id as string, name, scope } });
+  eventSink.emit({ type: "skill.deleted", data: { id, name, scope } });
   return {
     content: textContent(`Deleted ${scope} skill "${name}" (snapshotted to _versions/)`),
     structuredContent: { id, name, scope },
@@ -2441,17 +2494,16 @@ async function deleteSkillHandler(
 /**
  * Mute or un-mute a skill FOR THE CURRENT CONVERSATION.
  *
- * This used to write `status:` to the skill file, which is shared by every
+ * It does not write `status:` to the skill file, which is shared by every
  * conversation that loads it — for a user-scope skill, across every workspace
- * that user touches. So one chat's "not right now" silently reconfigured all
- * the others, with no signal to any of them, and an operator ended up policing
- * skill state by hand.
+ * that user touches. Writing it would let one chat's "not right now" silently
+ * reconfigure all the others, with no signal to any of them.
  *
- * The two intents behind that one write are genuinely different, and only one
+ * The two intents are genuinely different, and only one
  * of them is the agent's: "don't use this for the task at hand" is per
  * conversation, while "retire this skill" is a durable decision a human makes
  * in settings, where they can see the blast radius. Turning a skill off
- * permanently is no longer reachable from here at all.
+ * permanently is not reachable from here at all.
  *
  * Resolution is by NAME, not path: a mute is conversation state, so it never
  * touches the file and needs none of the path gates `update` runs. The name is
@@ -2460,10 +2512,10 @@ async function deleteSkillHandler(
  */
 async function setStatusHandler(
   runtime: Runtime,
-  input: Record<string, unknown>,
+  input: SkillsActivateInput,
   status: "active" | "disabled",
-): Promise<ToolResult> {
-  const name = typeof input.id === "string" ? input.id : "";
+): Promise<TypedToolResult<typeof SkillsActivationOutput>> {
+  const name = input.id;
   if (!name) return errorResult(new Error("`id` is required — the skill name from `skills__list`"));
 
   const { wsId, userId } = resolveCallContext(runtime);

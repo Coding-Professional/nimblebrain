@@ -11,30 +11,27 @@ import { shutdownTracing } from "../observability/index.ts";
 import { log } from "../observability/log.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import { HealthMonitor } from "../tools/health-monitor.ts";
+import type { McpSource } from "../tools/mcp-source.ts";
 import { createApp } from "./app.ts";
 import { ConversationEventManager } from "./conversation-events.ts";
 import { SseEventManager } from "./events.ts";
 import { McpServerHost } from "./mcp-server.ts";
-import { registerConnectorHealthGauge } from "./metrics.ts";
+import {
+  registerConnectorHealthGauge,
+  registerConnectorReauthGauge,
+  registerGatewayProvidersGauge,
+} from "./metrics.ts";
 import { RequestRateLimiter } from "./rate-limiter.ts";
 import {
   HOOK_ANON_BUCKET_MAX,
   HOOK_BUCKET_WINDOW_MS,
   HOOK_WORKSPACE_BUCKET_MAX,
 } from "./routes/hooks.ts";
-import { InMemorySessionRegistry, type SessionRegistry } from "./session-store/index.ts";
 import type { AppContext } from "./types.ts";
 
 export interface ServerOptions {
   runtime: Runtime;
   port?: number;
-  /**
-   * Pluggable cluster-shared session metadata store. When omitted, a process-
-   * local in-memory registry is constructed with the runtime's configured TTL
-   * — equivalent to legacy single-pod behavior. Multi-replica deploys must
-   * pass a Redis-backed registry built via `createSessionRegistry`.
-   */
-  sessionRegistry?: SessionRegistry;
 }
 
 export interface ServerHandle {
@@ -91,13 +88,35 @@ export function startServer(options: ServerOptions): ServerHandle {
     ? new Set([...envAllowedOrigins, ...canonicalOrigins()])
     : null;
 
-  const healthMonitor = new HealthMonitor(() => runtime.mcpSources(), runtime.getEventSink());
+  const lifecycle = runtime.getLifecycle();
+  // The sources whose connection needs the user's Reconnect, matched by object
+  // identity: the same connector in two workspaces is two sources of one name,
+  // and only the one whose connection lost its credential is left alone.
+  const awaitingReconnect = (source: McpSource): boolean => {
+    for (const conn of lifecycle.reauthRequiredConnections()) {
+      if (lifecycle.connectionSource(conn.serverName, conn.wsId) === source) return true;
+    }
+    return false;
+  };
+  const healthMonitor = new HealthMonitor(() => runtime.mcpSources(), runtime.getEventSink(), {
+    awaitingReconnect,
+  });
   healthMonitor.start();
-  // Expose currently-down connectors as the `nb_connector_unhealthy` gauge (read
-  // through this provider at scrape time). The gauge stays asserted for the
-  // whole outage, unlike the crash counter which goes flat once a source is
-  // dead-terminal — so the down-alert resolves only on recovery.
+  // Expose connectors whose transport is down as the `nb_connector_unhealthy`
+  // gauge (read through this provider at scrape time). The gauge stays asserted
+  // for the whole outage, unlike the crash counter which goes flat once a source
+  // is dead-terminal — so the down-alert resolves only on recovery.
   registerConnectorHealthGauge(() => healthMonitor.getStatus());
+  // Connections that need Reconnect, from the lifecycle's records, which hold
+  // that state across a restart whether or not a source is registered.
+  registerConnectorReauthGauge(() =>
+    lifecycle.reauthRequiredConnections().map((conn) => conn.serverName),
+  );
+  // Whether the model gateway has said which providers it serves.
+  const gatewayProviders = runtime.getGatewayProviders();
+  registerGatewayProvidersGauge(
+    gatewayProviders ? () => ({ known: gatewayProviders.served() !== undefined }) : null,
+  );
 
   // Connection credential re-validation (a disjoint concern from HealthMonitor's
   // transport liveness): poll brokered providers whose upstream account can lapse
@@ -187,22 +206,7 @@ export function startServer(options: ServerOptions): ServerHandle {
     sseManager.emit(event);
   };
 
-  // Construct the per-pod MCP host. The transport map lives here; the
-  // session-metadata registry is either supplied by the caller (production
-  // bootstrap building a Redis registry from config) or defaulted to an
-  // in-memory store using the runtime's configured TTL.
-  const sessionTtlMs = runtime.getSessionStoreTtlMs();
-  const sessionRegistry: SessionRegistry =
-    options.sessionRegistry ?? new InMemorySessionRegistry({ ttlMs: sessionTtlMs });
-  // The host's idle-eviction TTL mirrors the registry's TTL: both layers
-  // reclaim the same logical session on the same schedule, with the host's
-  // sweep being what actually frees the JS heap. The registry TTL is a
-  // backstop on the metadata layer for the cluster-shared view.
-  const mcpHost = new McpServerHost({
-    registry: sessionRegistry,
-    runtime,
-    idleTtlMs: sessionTtlMs,
-  });
+  const mcpHost = new McpServerHost(runtime);
 
   // Build shared context for all route groups
   const ctx: AppContext = {
@@ -228,7 +232,7 @@ export function startServer(options: ServerOptions): ServerHandle {
     // Post-login landing — a user-facing browser destination, so it uses
     // webOrigin() like the connectors return (one rule: browser-facing →
     // webOrigin, vendor-facing → publicOrigin). Identical to publicOrigin() in
-    // prod; decoupled from the CORS allowlist (no longer ALLOWED_ORIGINS[0]).
+    // prod; decoupled from the CORS allowlist (not ALLOWED_ORIGINS[0]).
     appOrigin: webOrigin(),
     mcpHost,
   };
@@ -259,7 +263,6 @@ export function startServer(options: ServerOptions): ServerHandle {
       conversationEventManager.stop();
       healthMonitor.stop();
       connectionRevalidator.stop();
-      mcpHost.shutdown().catch(() => {});
       server.stop(closeConnections);
     },
   };

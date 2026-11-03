@@ -9,15 +9,13 @@
 
 import { rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { ConversationsForkOutput } from "../../schemas/conversations.ts";
+import type {
+  ConversationsForkInput,
+  ConversationsForkOutput,
+} from "../../schemas/conversations.ts";
 import type { AccessContext, ConversationIndex } from "../index-cache.ts";
 import type { DisplayMessage, DisplayToolCall, DisplayUsage } from "../jsonl-reader.ts";
 import { readConversation } from "../jsonl-reader.ts";
-
-export interface ForkInput {
-  id: string;
-  atMessage?: number;
-}
 
 /** Recalculated token totals across copied assistant messages. */
 interface CopiedTotals {
@@ -139,8 +137,10 @@ function segmentEvents(
       input: JSON.stringify(tc.input ?? {}),
     });
   }
+  // A segment carrying tool calls ended to run them; anything else ended normally.
+  const finishReason = seg.tools && seg.tools.length > 0 ? "tool-calls" : "stop";
   return [
-    { ts, type: "llm.response", runId, model, content, usage, llmMs },
+    { ts, type: "llm.response", runId, model, content, usage, llmMs, finishReason },
     ...(seg.tools ?? []).flatMap((tc) => toolCallEvents(ts, runId, tc)),
   ];
 }
@@ -200,8 +200,11 @@ function derivePreview(messages: DisplayMessage[]): string {
   return "";
 }
 
+/** `ConversationsForkInput` once the source has resolved an omitted or "current" `id`. */
+type ResolvedInput = ConversationsForkInput & { id: string };
+
 export async function handleFork(
-  input: ForkInput,
+  input: ResolvedInput,
   index: ConversationIndex,
   access?: AccessContext,
 ): Promise<ConversationsForkOutput> {
@@ -240,12 +243,10 @@ export async function handleFork(
     // The fork inherits the source's owner: every reader refuses a
     // conversation without one.
     ...(conversation.meta.ownerId ? { ownerId: conversation.meta.ownerId } : {}),
-    format: "events",
     // A fork continues the source conversation, so it inherits the model
-    // binding along with the owner. Without this the copy would be unpinned
-    // and resolve from current config, replaying the source's history to a
-    // different provider.
-    ...(conversation.meta.model ? { model: conversation.meta.model } : {}),
+    // binding along with the owner. Re-resolving would move the copy onto the
+    // current default and replay the source's history to a different provider.
+    model: conversation.meta.model,
   };
   const lines = [JSON.stringify(header), ...messagesToEventLines(messagesToCopy)];
 

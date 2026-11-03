@@ -108,6 +108,12 @@ export type SkillFrontmatter = Static<typeof SkillFrontmatterSchema>;
 
 export type SkillScope = "org" | "workspace" | "user" | "provided";
 export type SkillLoadingStrategy = "always" | "dynamic";
+
+/** What a skill that declares no `loading-strategy` loads as. */
+export const DEFAULT_LOADING_STRATEGY: SkillLoadingStrategy = "dynamic";
+
+/** The priority of a skill that declares none. */
+export const DEFAULT_SKILL_PRIORITY = 50;
 export type SkillStatus = "active" | "disabled";
 
 export interface SkillProvenance {
@@ -197,10 +203,12 @@ export function mapFrontmatterToManifest(
   return {
     name: fm.name,
     description: fm.description,
-    loadingStrategy: nb?.["loading-strategy"] ?? "dynamic",
-    priority: nb?.priority ?? 50,
+    loadingStrategy: nb?.["loading-strategy"] ?? DEFAULT_LOADING_STRATEGY,
+    priority: nb?.priority ?? DEFAULT_SKILL_PRIORITY,
     status: nb?.status ?? "active",
-    ...(nb?.["tool-affinity"]?.length ? { toolAffinity: nb["tool-affinity"] } : {}),
+    // An explicit empty list is kept: on a connector skill it means "bound to
+    // no tool" (catalog-only), where an absent field means the whole server.
+    ...(nb?.["tool-affinity"] ? { toolAffinity: nb["tool-affinity"] } : {}),
     ...(nb?.triggers?.length ? { triggers: nb.triggers } : {}),
     ...(allowed ? { allowedTools: allowed.split(/\s+/) } : {}),
     ...(fm.license ? { license: fm.license } : {}),

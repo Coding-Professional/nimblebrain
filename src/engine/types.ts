@@ -1,6 +1,11 @@
 import type { LanguageModelV4Message } from "@ai-sdk/provider";
 import type { McpUiToolVisibility } from "@modelcontextprotocol/ext-apps";
-import type { ContentBlock, TextContent, ToolAnnotations } from "@modelcontextprotocol/server";
+import type {
+  ContentBlock,
+  InputRequests,
+  TextContent,
+  ToolAnnotations,
+} from "@modelcontextprotocol/server";
 import type { TokenUsage } from "../usage/types.ts";
 import type { EngineEventPayloads } from "./schemas/events.ts";
 
@@ -8,7 +13,9 @@ export type { ContentBlock, TextContent };
 
 /**
  * Metadata marker stamped on the synthetic message the reconstructor builds
- * from a `connector.skill.injected` event. The engine reads it on replay
+ * from a `connector.skill.injected` event that has no tool result to ride
+ * (otherwise the carrying tool result lists it in `connectorSkills`). The
+ * engine reads it on replay
  * (`history.some(m => m.metadata?.synthetic === CONNECTOR_SKILL_SYNTHETIC)`) to
  * detect an already-surfaced connector overlay and never re-inject it. Lives
  * here — the dependency-safe shared home — because both the engine (producer of
@@ -43,6 +50,20 @@ export const SKILL_ACTIVATED_SYNTHETIC = "skill_activated";
  * strips it from results arriving over a real wire; only in-process platform
  * sources (the `skills` source) may carry it through.
  */
+/**
+ * `structuredContent.reason` of a call the engine held rather than ran,
+ * because a skill bound to its tool had not reached the model yet. The bodies
+ * follow the result; the model re-issues the call.
+ */
+export const SKILL_GUIDANCE_PENDING = "skill_guidance_pending";
+
+/**
+ * The `finishReasonRaw` of a model call the run's cancel cut off. The provider
+ * never reported its usage, so the engine records it from estimates (see
+ * `recordCutOffCall` in `engine.ts`); this tells that record from a reported call.
+ */
+export const CUT_OFF_FINISH_RAW = "cut_off_by_cancel";
+
 export const SKILL_ACTIVATED_META_KEY = "ai.nimblebrain/skill-activated";
 
 /**
@@ -130,6 +151,12 @@ export interface ToolResult {
    * connector, can opt into a `_meta` hint and have it reach the engine.
    */
   _meta?: Record<string, unknown>;
+  /**
+   * The connector needs input from the client before it can answer (an MCP
+   * `input_required` result). Only a call made with `ToolExecuteOptions.caller`
+   * can come back this way; `content` is then empty.
+   */
+  inputRequired?: { inputRequests?: InputRequests; requestState?: string };
 }
 
 /**
@@ -423,6 +450,12 @@ export interface SpendGate {
 
 /** Engine configuration per run. */
 export interface EngineConfig {
+  /**
+   * The run's id, stamped on every event the engine emits. The door passes its
+   * own, so a run's events and its `execution.bound` name the same run. Absent,
+   * the engine mints one.
+   */
+  runId?: string;
   model: string;
   maxIterations: number;
   maxInputTokens: number;
@@ -478,8 +511,8 @@ export interface EngineConfig {
    * fires these immediately after `run.start` and before the first LLM call,
    * so the conversation log records what the prompt looked like.
    *
-   * Phase 2: `skills.loaded` and `context.assembled` payloads. Future phases
-   * may add more entries here without touching the engine signature.
+   * `skills.loaded` and `context.assembled` payloads. More entries can be
+   * added here without touching the engine signature.
    */
   runMetadata?: RunMetadata;
   /**
@@ -489,8 +522,8 @@ export interface EngineConfig {
    * first matching tool call — never into the cached system prefix. The engine
    * matches each candidate's `toolAffinity` globs against the called tool name;
    * on the first match (per conversation, deduped via history inspection) it
-   * emits `connector.skill.injected` and appends the body to the live history
-   * after that iteration's tool results; the reconstructor rebuilds it in the
+   * emits `connector.skill.injected` and appends the body to a tool result of
+   * that iteration (`guidanceByToolCall`); the reconstructor rebuilds it in the
    * same position. Empty / absent = the feature is off for this run.
    */
   connectorSkillCandidates?: ConnectorSkillCandidate[];
@@ -539,10 +572,19 @@ export interface ConnectorSkillCandidate {
    * resolves `null`. `body` is empty until then.
    */
   loadBody?: () => Promise<string | null>;
-  /** Scope label for containment / telemetry. Always `"connector"` in v1. */
+  /** Storage tier (`org` / `workspace` / `user` / `provided`), or `connector` for an overlay. */
   scope: string;
-  /** Tool-affinity globs (e.g. `["<server>__*"]`); the first match triggers surfacing. */
+  /** Tool-affinity globs (e.g. `["<server>__*"]`); a matching call or promotion delivers it. */
   toolAffinity: string[];
+  /** Lower delivers first when one call is held for several skills. Defaults to 50. */
+  priority?: number;
+  /**
+   * The affinity is the publisher's implicit whole-server default, not a list
+   * the skill declared. Only such a skill skips the hold on a tool its server
+   * annotates `readOnlyHint` — the annotation is the server's claim about
+   * itself, so it may waive only that server's own default binding.
+   */
+  implicitBinding?: boolean;
 }
 
 /**
@@ -589,16 +631,13 @@ export interface ContextAssembledPayload {
 export interface SkillsLoadedEntry {
   id: string;
   /**
-   * The skill's own name, for display. Always set by
-   * `buildSkillsLoadedPayload`; optional because events recorded before the
-   * field existed are read back through this same type — read it through
-   * `skillDisplayName` (`src/skills/display-name.ts`), never bare.
+   * The skill's own name, for display. Set by `buildSkillsLoadedPayload`.
    *
    * Carried on the event so no consumer derives a name from `id`: a connector
    * skill's id is its `skill://…/SKILL.md` entrypoint, whose last path segment
    * is the literal `SKILL`.
    */
-  name?: string;
+  name: string;
   /**
    * The MCP server that published this skill, when it came from one. Absent for
    * filesystem skills (org / workspace / user tiers), which have no publisher.
@@ -635,12 +674,6 @@ export interface ContextAssembledSource {
   userId?: string;
   /** `history`: how many messages the windowed history holds. */
   messages?: number;
-  /**
-   * `history`, as recorded before `messages` existed. Carried the same message
-   * count under a name that read as conversational turns; kept so historical
-   * events still render. Emitters set `messages`.
-   */
-  turns?: number;
   compacted?: boolean;
 }
 
@@ -662,7 +695,10 @@ export type FinishReason = "stop" | "length" | "content-filter" | "tool-calls" |
  *   - `spend_limit`      — the run's spend accounts (`EngineConfig.spend`)
  *                          cannot pay for the next model call's input and a
  *                          minimal output; the account is
- *                          `EngineResult.spendAccountId`
+ *                          `EngineResult.spendAccountId`. The model gateway's
+ *                          refusal for a spent run budget stops the run the
+ *                          same way, naming `MODEL_GATEWAY_BUDGET_ACCOUNT`
+ *                          (`src/model/gateway-refusal.ts`)
  *   - `length`           — last LLM call hit `maxOutputTokens` mid-turn
  *   - `content_filter`   — last LLM call was blocked by provider moderation
  *   - `error`            — last LLM call's finish reason was `error`
@@ -678,8 +714,7 @@ export type FinishReason = "stop" | "length" | "content-filter" | "tool-calls" |
  *
  * Note the casing asymmetry vs `FinishReason`: the V4 spec uses
  * kebab-case (`content-filter`, `tool-calls`); our run-level union uses
- * snake_case to match the legacy `max_iterations` value already in
- * persisted JSONL. They're related but not identical — see
+ * snake_case to match the `max_iterations` value persisted in JSONL. They're related but not identical — see
  * `deriveStopReason()` in engine.ts for the mapping.
  */
 export type StopReason =
@@ -694,6 +729,9 @@ export type StopReason =
   | "cancelled";
 
 /** Result returned from a single engine run. */
+/** The limits that send the final-step reminder before they stop a run. */
+export type WrapUpLimit = Extract<StopReason, "max_iterations" | "max_input_tokens">;
+
 export interface EngineResult {
   output: string;
   toolCalls: ToolCallRecord[];
@@ -715,6 +753,13 @@ export interface EngineResult {
   finishReasonRaw?: string;
   /** The account that stopped the run, when `stopReason` is `spend_limit`. */
   spendAccountId?: string;
+  /**
+   * The limit that made the call the run ended on its final step, when the model
+   * heeded the reminder and ended the run `complete`. It stopped when told to, so
+   * `complete` does not mean the work was finished. Absent otherwise, and for a
+   * one-iteration run, which was configured to end on its only step.
+   */
+  wrapUpLimit?: WrapUpLimit;
 }
 
 export interface ToolCallRecord {
@@ -736,6 +781,13 @@ export interface ToolCallRecord {
    * connector. Absent when the call succeeded or carried no structured reason.
    */
   errorReason?: string;
+  /**
+   * The call did not run: the engine held it until the guidance for its tool
+   * reached the model (`SKILL_GUIDANCE_PENDING`). `ok` is false, because
+   * nothing happened. The tasks executor does not count it as a failure unless
+   * the run stopped before re-issuing it.
+   */
+  held?: true;
   resourceUri?: string;
   /**
    * MCP `resource_link` content blocks surfaced by the tool result.

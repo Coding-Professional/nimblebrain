@@ -15,6 +15,7 @@
 import { randomBytes } from "node:crypto";
 import { Cron } from "croner";
 import { taskRunsTotal } from "../../api/metrics.ts";
+import { isRetryable } from "../../engine/retry.ts";
 import { log } from "../../observability/log.ts";
 import {
   type AdmissionLease,
@@ -25,11 +26,12 @@ import {
 } from "../../runtime/admission.ts";
 import { runDetached } from "../../runtime/request-context.ts";
 import { WorkspaceRootMissingError } from "../../workspace/context.ts";
-import { isAssessable, retryGuidance } from "./assessment.ts";
+import { executionOf, isAssessable, retryGuidance } from "./assessment.ts";
 import {
   appendRun,
   loadAllTasks,
   loadTask,
+  readRuns,
   saveIdempotencyKey,
   saveRunResult,
   saveRunTicket,
@@ -45,6 +47,7 @@ import {
   ONCE_RAN_REASON,
   type RunAssessment,
   type RunTicket,
+  type ScheduledRunInFlight,
   type Task,
   type TaskRun,
   type TaskRunResult,
@@ -60,8 +63,32 @@ const MAX_TIMER_MS = 60_000;
 /** Backoff delays indexed by (consecutiveErrors - 1). Capped at last entry. */
 const BACKOFF_DELAYS = [30_000, 60_000, 300_000, 900_000, 3_600_000] as const;
 
-/** Auto-disable after this many consecutive failures. */
+/** Auto-disable after this many non-transient failures in a streak. */
 export const MAX_CONSECUTIVE_ERRORS = 10;
+
+/**
+ * Auto-disable after this many failures in a streak, transient ones included.
+ * A provider outage must not turn a task off, but the transient verdict is not
+ * proof of an outage: a prompt larger than the account's per-minute token limit
+ * and an exhausted quota both answer 429 on every run, and each run may pay for
+ * model calls before it fails. At the one-hour backoff ceiling this is about
+ * four days of failing without one completed run, longer than an outage and
+ * short of paying indefinitely.
+ */
+export const MAX_CONSECUTIVE_TRANSIENT_ERRORS = 100;
+
+/**
+ * The record of a scheduled run the runtime stopped under (see
+ * `settleInterruptedRuns`). It says the run was not repeated, since what it
+ * already did may need checking by hand.
+ */
+export const INTERRUPTED_RUN_ERROR =
+  "The runtime stopped while this run was in flight, so it did not finish. It was not " +
+  "started again, because it may already have done part of its work; the task runs " +
+  "next at its next scheduled time.";
+
+/** The `code` on the error for a run that used its whole `maxRunDurationMs`. */
+export const RUN_DURATION_EXCEEDED = "run_duration_exceeded";
 
 /** Why a Run now or event run is refused once `stop()` has run: no slot frees and nothing drains the queue. */
 const STOPPED_REASON = "the scheduler is stopped";
@@ -92,7 +119,9 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   /timeout/i,
   /network/i,
   /ECONNREFUSED/i,
-  /5\d\d/,
+  /stream stalled/i,
+  /gateway didn't respond/i,
+  /\b5\d\d\b/,
 ];
 
 // ---------------------------------------------------------------------------
@@ -122,6 +151,19 @@ export interface RunInput {
   preamble?: string;
   /** The caller's JSON input, rendered as data ahead of the prompt (see the executor). */
   data?: unknown;
+}
+
+/** A run holding a slot or waiting for one, as `Scheduler.queueView` reports it. */
+export interface QueueViewEntry {
+  taskId: string;
+  runId?: string;
+  state: "running" | "queued";
+  /** Queued only: the place among this scheduler's queued runs, 1 next. */
+  position?: number;
+  /** Running only. */
+  startedAt?: string;
+  /** Running only: what started it. */
+  trigger?: TaskRunTrigger;
 }
 
 /**
@@ -267,6 +309,16 @@ export interface SchedulerConfig {
   assess?: (task: Task, run: TaskRun, result: TaskRunResult | null) => Promise<RunAssessment>;
   /** Tell the task's owner a run's assessment failed (`onPoorResult: "notify"`). */
   notifyPoorResult?: (task: Task, run: TaskRun) => void;
+  /**
+   * Tell the task's owner a run ended with no deliverable (the first such run
+   * of a failing stretch), or that a run's failure auto-disabled the task.
+   */
+  notifyRunFailed?: (task: Task, run: TaskRun, notice: RunFailedNotice) => void;
+}
+
+/** What a run-failed notice reports beyond the run: whether it disabled the task. */
+export interface RunFailedNotice {
+  disabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +326,10 @@ export interface SchedulerConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true if the error message matches any transient pattern.
+ * Returns true if the error message matches any transient pattern. The text is
+ * all a persisted or relayed error has; a thrown provider error also carries a
+ * structured verdict, which `classifyRunFailure` reads first because a 500
+ * arrives as "Internal server error", with no status in its text.
  */
 export function isTransientError(message: string): boolean {
   return TRANSIENT_PATTERNS.some((p) => p.test(message));
@@ -487,17 +542,16 @@ function getTimezoneOffsetMs(tz: string, date: Date): number {
 
 /**
  * How a thrown run maps to a persisted failure record. One guard-clause row per
- * outcome keeps `status`, the id `suffix`, the `error` text, and the `transient`
- * flag together so they can't drift apart.
+ * outcome keeps `status`, the `error` text, and the `transient` flag together
+ * so they can't drift apart.
  */
 function classifyRunFailure(err: unknown): {
   status: TaskRun["status"];
-  suffix: string;
   error: string;
   transient: boolean;
 } {
   if (err instanceof DOMException && err.name === "AbortError") {
-    return { status: "cancelled", suffix: "cancel", error: "Cancelled by user", transient: false };
+    return { status: "cancelled", error: "Cancelled by user", transient: false };
   }
   const errorMsg = err instanceof Error ? err.message : String(err);
   // Owner removed from the task's provenance workspace: the runtime denied
@@ -506,30 +560,33 @@ function classifyRunFailure(err: unknown): {
   // so the task self-heals the moment the owner is re-added. Matched by the
   // error's stable `code`, which crosses the in-process runtime→app boundary.
   if ((err as { code?: string })?.code === "workspace_membership_revoked") {
-    return { status: "skipped", suffix: "skip", error: errorMsg, transient: false };
+    return { status: "skipped", error: errorMsg, transient: false };
   }
   // A tool in the task's `allowedTools` matches nothing the run can reach
   // (`DeclaredToolsUnavailableError`, thrown before the first model call). A
   // FAILURE, never skipped: it feeds consecutiveErrors so a connector that
   // stays gone backs the task off and disables it, saying why. Not transient:
   // a retry minutes later meets the same missing connector.
-  if ((err as { code?: string })?.code === "declared_tools_unavailable") {
-    return { status: "failure", suffix: "err", error: errorMsg, transient: false };
+  const code = (err as { code?: string })?.code;
+  if (code === "declared_tools_unavailable" || code === "declared_skills_unavailable") {
+    return { status: "failure", error: errorMsg, transient: false };
   }
+  // The agent's worker went away mid-turn (`AgentConnectionLostError`): the
+  // same as a native run cut by a runtime restart. Transient: the next run
+  // reaches a worker that is up.
+  if (code === "agent_connection_lost") {
+    return { status: "failure", error: errorMsg, transient: true };
+  }
+  // The run used its whole time allowance. Not transient: the next run of a
+  // task too big for its limit meets the same limit, having paid for all of it.
+  if (code === RUN_DURATION_EXCEEDED) {
+    return { status: "timeout", error: errorMsg, transient: false };
+  }
+  const transient = isRetryable(err) || isTransientError(errorMsg);
   if (errorMsg.includes("timed out")) {
-    return {
-      status: "timeout",
-      suffix: "timeout",
-      error: errorMsg,
-      transient: isTransientError(errorMsg),
-    };
+    return { status: "timeout", error: errorMsg, transient };
   }
-  return {
-    status: "failure",
-    suffix: "err",
-    error: errorMsg,
-    transient: isTransientError(errorMsg),
-  };
+  return { status: "failure", error: errorMsg, transient };
 }
 
 // ---------------------------------------------------------------------------
@@ -550,22 +607,59 @@ function resolveLastRunStatus(status: TaskRun["status"]): NonNullable<Task["last
  * Skipped and cancelled runs don't affect consecutiveErrors. A degraded run
  * clears the streak like a success: it ran to completion, and backoff exists
  * for runs that could not run, not for work a tool refused.
+ *
+ * Every failure counts toward `consecutiveErrors`, so backoff holds during an
+ * outage. A transient one says nothing about the task, so it counts only toward
+ * the larger cap: the task disables at {@link MAX_CONSECUTIVE_ERRORS} other
+ * failures, with any transient ones between them neither adding to that count
+ * nor clearing it.
  */
 function applyConsecutiveErrors(auto: Task, run: TaskRun, now: number): void {
   if (run.status === "success" || run.status === "degraded") {
     auto.consecutiveErrors = 0;
+    delete auto.transientErrors;
+    delete auto.failureNoticeRunId;
     return;
   }
   if (run.status !== "failure" && run.status !== "timeout") return;
 
   auto.consecutiveErrors = (auto.consecutiveErrors ?? 0) + 1;
+  if (run.transient) auto.transientErrors = (auto.transientErrors ?? 0) + 1;
 
-  // Auto-disable after too many consecutive failures
-  if (auto.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+  const lastError = (run.error ?? "unknown").slice(0, 200);
+  const countedErrors = auto.consecutiveErrors - (auto.transientErrors ?? 0);
+  if (countedErrors >= MAX_CONSECUTIVE_ERRORS) {
     auto.enabled = false;
     auto.disabledAt = new Date(now).toISOString();
-    auto.disabledReason = `Auto-disabled after ${auto.consecutiveErrors} consecutive failures. Last error: ${(run.error ?? "unknown").slice(0, 200)}`;
+    auto.disabledReason = `Auto-disabled after ${countedErrors} consecutive failures. Last error: ${lastError}`;
+  } else if (auto.consecutiveErrors >= MAX_CONSECUTIVE_TRANSIENT_ERRORS) {
+    auto.enabled = false;
+    auto.disabledAt = new Date(now).toISOString();
+    auto.disabledReason = `Auto-disabled after ${auto.consecutiveErrors} consecutive failures that looked temporary but never cleared. Last error: ${lastError}`;
   }
+}
+
+/**
+ * Count the run toward the task's error streak and say whether it raises a
+ * run-failed notice, claiming the failing stretch's one notice on `auto` when
+ * it does. A batch item answers to its batch: its failures are the batch's to
+ * count (the stop rule, `rerun_failed`), never the task's own streak, which
+ * would back off and then disable the task's schedule, and it raises no
+ * notice. A run that left no deliverable raises the notice when no earlier run
+ * of the stretch has; a run whose failure auto-disabled the task raises it
+ * regardless. A run that stopped with a deliverable (`incomplete`) is the
+ * judge's to report, so it neither notifies nor claims the notice. Called
+ * before the once retirement, since a retired once is disabled too and is not
+ * a failure.
+ */
+function applyStreak(auto: Task, run: TaskRun, now: number): RunFailedNotice | null {
+  if (run.batchId) return null;
+  const wasEnabled = auto.enabled;
+  applyConsecutiveErrors(auto, run, now);
+  const disabled = wasEnabled && !auto.enabled;
+  const first = executionOf(run) === "failed" && !auto.failureNoticeRunId;
+  if (first) auto.failureNoticeRunId = run.id;
+  return first || disabled ? { disabled } : null;
 }
 
 /**
@@ -808,6 +902,35 @@ function notStartedRun(
   return { run: requested ? withRequest(run, requested) : run, started: false };
 }
 
+/** A fresh run id, in the runtime's shape (`run_<12 hex>`). */
+export function newRunId(): string {
+  return `run_${randomBytes(6).toString("hex")}`;
+}
+
+/**
+ * The result of a run that left none of its own: it threw before the engine
+ * returned, or it never started. Every recorded run has a result, so a reader
+ * needs one shape; this one says what the run has, its error or the reason
+ * it did not start, with no deliverable and an empty activity log.
+ */
+function resultOfRecord(run: TaskRun): TaskRunResult {
+  return {
+    runId: run.id,
+    taskId: run.taskId,
+    completedAt: run.completedAt ?? run.startedAt,
+    output: "",
+    activityLog: [],
+    outputFiles: [],
+    usage: {
+      inputTokens: run.inputTokens,
+      outputTokens: run.outputTokens,
+      iterations: run.iterations,
+    },
+    ...(run.stopReason !== undefined ? { stopReason: run.stopReason } : {}),
+    ...(run.error !== undefined ? { error: run.error } : {}),
+  };
+}
+
 /** A requested run's record, carrying its id and what it was asked with. */
 function withRequest(run: TaskRun, requested: RequestedRun): TaskRun {
   return {
@@ -855,6 +978,16 @@ export function countsAsEventFire(run: TaskRun): boolean {
   return run.trigger === "event" && run.status !== "skipped";
 }
 
+/** How `updateAfterRun` treats the run's dispatch id and record. */
+interface UpdateAfterRunOptions {
+  /** The id the run was dispatched under; a `scheduledRunInFlight` naming it is cleared. */
+  dispatchRunId?: string;
+  /** False when the run's record is already in the index. */
+  appendRecord?: boolean;
+  /** The run's result, written before its record; one built from the record when absent. */
+  result?: TaskRunResult;
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler
 // ---------------------------------------------------------------------------
@@ -869,6 +1002,11 @@ export class Scheduler {
   private definitions: Map<string, Task> = new Map();
   /** In-flight runs' abort controllers, for cancel and stop. Slots are admission's. */
   private readonly activeRuns: Map<string, AbortController> = new Map();
+  /** When each in-flight run started and what started it, by the same key, for `queueView`. */
+  private readonly activeInfo: Map<
+    string,
+    { startedAt: string; trigger: TaskRunTrigger; runId: string }
+  > = new Map();
   /**
    * Requested runs this process is carrying, by run id: queued or in flight,
    * with the task key and the promise of the run's record. A ticket that
@@ -876,10 +1014,19 @@ export class Scheduler {
    * process that stopped before the run ended (see `settleLostRun`).
    */
   private readonly openRuns: Map<string, { key: string; ended: Promise<TaskRun> }> = new Map();
+  /**
+   * Ids of the scheduled runs this process has marked in flight and not yet
+   * recorded. `stop()` leaves them, since an aborted run records itself after
+   * it, so `settleInterruptedRuns` never settles a run this process carries.
+   */
+  private readonly scheduledInFlight = new Set<string>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
-  /** Assessments in flight, so a test (or a caller) can wait for them. */
-  private readonly pendingAssessments = new Set<Promise<TaskRun>>();
+  /**
+   * Assessments in flight by run id, so a caller can wait for them and a run
+   * whose record has landed reads as not yet ended until its verdict has.
+   */
+  private readonly pendingAssessments = new Map<string, Promise<TaskRun>>();
 
   private readonly executor: Executor;
   private config: SchedulerConfig;
@@ -947,9 +1094,83 @@ export class Scheduler {
     if (this.running) return;
     this.running = true;
     this.definitions = this.loadAll();
+    this.settleInterruptedRuns();
     this.retireOncesMissedWhileDown();
     this.seedNextRunAt();
     this.armTimer();
+  }
+
+  /**
+   * At start, record every scheduled run the last process stopped under (its
+   * task still carries `scheduledRunInFlight`) and advance its schedule, so
+   * the occurrence is not run again from the beginning: the run may already
+   * have sent a message or written somewhere. The record is a failure, as
+   * `settleLostRun` records a requested run lost in flight. Runs before
+   * `retireOncesMissedWhileDown`, since an interrupted once did fire and is
+   * retired as `ran`, not judged missed.
+   */
+  private settleInterruptedRuns(): void {
+    const now = new Date().toISOString();
+    for (const auto of [...this.definitions.values()]) {
+      const inFlight = auto.scheduledRunInFlight;
+      // A run this process dispatched is still being recorded (a `start()`
+      // after `stop()` on one scheduler), and its own record clears the mark.
+      if (!inFlight || this.scheduledInFlight.has(inFlight.runId)) continue;
+      const { workspaceId: wsId, ownerId } = auto;
+      if (!wsId || !ownerId) continue;
+      // Inside the try with the write: one task's unreadable run index must
+      // not throw out of `start()`, or the mark it leaves fails every boot.
+      try {
+        // A stop between the record's append and the task's save leaves the
+        // record in the index: settle the task from it rather than append another.
+        const recorded = readRuns(this.config.workDir, wsId, ownerId, auto.id).find(
+          (r) => r.id === inFlight.runId,
+        );
+        const run: TaskRun = recorded ?? {
+          id: inFlight.runId,
+          taskId: auto.id,
+          startedAt: inFlight.startedAt,
+          completedAt: now,
+          status: "failure",
+          inputTokens: 0,
+          outputTokens: 0,
+          toolCalls: 0,
+          iterations: 0,
+          error: INTERRUPTED_RUN_ERROR,
+          trigger: "scheduled",
+        };
+        this.updateAfterRun(auto, run, "scheduled", inFlight.onceAt, {
+          appendRecord: recorded === undefined,
+        });
+        this.runRecorded(auto);
+      } catch (err) {
+        log.warn("[tasks] could not record a scheduled run interrupted by a stop", {
+          taskId: auto.id,
+          workspaceId: auto.workspaceId,
+          runId: inFlight.runId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * Mark a scheduled run in flight on its task's file before it starts, so a
+   * process that stops under it leaves the run for `settleInterruptedRuns`
+   * to record rather than an overdue `nextRunAt` the next process fires again.
+   * Re-reads the file, as `updateAfterRun` does, to keep concurrent edits.
+   */
+  private markScheduledRunInFlight(auto: Task, inFlight: ScheduledRunInFlight): void {
+    const { workspaceId: wsId, ownerId } = auto;
+    if (!wsId || !ownerId) return;
+    const fresh = loadTask(this.config.workDir, wsId, ownerId, auto.id);
+    if (!fresh) return;
+    fresh.workspaceId = wsId;
+    fresh.ownerId = ownerId;
+    fresh.scheduledRunInFlight = inFlight;
+    saveTask(this.config.workDir, wsId, ownerId, fresh);
+    this.scheduledInFlight.add(inFlight.runId);
+    this.definitions.set(Scheduler.keyOf(fresh), fresh);
   }
 
   /**
@@ -1025,6 +1246,7 @@ export class Scheduler {
     for (const [id, controller] of this.activeRuns) {
       controller.abort();
       this.activeRuns.delete(id);
+      this.activeInfo.delete(id);
     }
   }
 
@@ -1292,14 +1514,19 @@ export class Scheduler {
   }
 
   /**
-   * Cancel a requested run by its id, when this process is carrying it for
-   * that owner in that workspace: abort it in flight, or take it out of the
-   * queue. False when it carries no such run.
+   * Cancel a run by its id, when this process is carrying it for that owner
+   * in that workspace: abort it in flight (a requested run, or a scheduled or
+   * event run by the id minted at dispatch), or take a requested run out of
+   * the queue. False when it carries no such run.
    */
   cancelRunById(wsId: string, ownerId: string, runId: string): boolean {
+    const prefix = `${wsId}/${ownerId}/`;
     const open = this.openRuns.get(runId);
-    if (!open?.key.startsWith(`${wsId}/${ownerId}/`)) return false;
-    return this.cancelKey(open.key);
+    if (open) return open.key.startsWith(prefix) && this.cancelKey(open.key);
+    for (const [key, info] of this.activeInfo) {
+      if (info.runId === runId && key.startsWith(prefix)) return this.cancelKey(key);
+    }
+    return false;
   }
 
   /**
@@ -1310,6 +1537,18 @@ export class Scheduler {
    */
   settleLostRun(wsId: string, ownerId: string, ticket: RunTicket): RunTicket {
     if (!isOpenRun(ticket.run) || this.openRuns.has(ticket.runId)) return ticket;
+    // A process that recorded the run (result, then index line) and stopped
+    // before rewriting the ticket: settle the ticket from that record and
+    // write nothing else, so its result and its one line stand.
+    const recorded = readRuns(this.config.workDir, wsId, ownerId, ticket.taskId).find(
+      (r) => r.id === ticket.runId,
+    );
+    if (recorded) {
+      const settled: RunTicket = { ...ticket, run: recorded };
+      saveRunTicket(this.config.workDir, wsId, ownerId, settled);
+      this.config.onRunRecorded?.(ownerId);
+      return settled;
+    }
     const wasRunning = ticket.run.status === "running";
     const now = new Date().toISOString();
     const run: TaskRun = {
@@ -1320,6 +1559,7 @@ export class Scheduler {
         ? "The runtime stopped while this run was in flight, so it did not finish."
         : "The runtime stopped before this queued run started.",
     };
+    saveRunResult(this.config.workDir, wsId, ownerId, ticket.taskId, resultOfRecord(run));
     appendRun(this.config.workDir, wsId, ownerId, ticket.taskId, run);
     taskRunsTotal.inc({ status: run.status });
     const settled: RunTicket = { ...ticket, run };
@@ -1617,6 +1857,45 @@ export class Scheduler {
   }
 
   /**
+   * One owner's runs in one workspace that hold a slot or wait for one, read
+   * from this scheduler's own admission keys (the door knows nothing of tasks).
+   * A key is `<ws>/<owner>/<taskId>`, or `<ws>/<owner>/<taskId>#<runId>` for a
+   * batch run. `position` numbers the queued runs as `tasks__run` does: the
+   * place among this scheduler's queued runs, 1 next.
+   */
+  queueView(wsId: string, ownerId: string): QueueViewEntry[] {
+    const prefix = `${wsId}/${ownerId}/`;
+    const parse = (key: string): { taskId: string; runId?: string } => {
+      const rest = key.slice(prefix.length);
+      const hash = rest.indexOf("#");
+      return hash >= 0
+        ? { taskId: rest.slice(0, hash), runId: rest.slice(hash + 1) }
+        : { taskId: rest };
+    };
+    const runIdByKey = new Map<string, string>();
+    for (const [runId, open] of this.openRuns) runIdByKey.set(open.key, runId);
+    const out: QueueViewEntry[] = [];
+    for (const [key, info] of this.activeInfo) {
+      if (!key.startsWith(prefix)) continue;
+      const { taskId } = parse(key);
+      out.push({
+        taskId,
+        state: "running",
+        startedAt: info.startedAt,
+        trigger: info.trigger,
+        runId: info.runId,
+      });
+    }
+    this.getQueuedRunIds().forEach((key, index) => {
+      if (!key.startsWith(prefix)) return;
+      const { taskId, runId } = parse(key);
+      const id = runId ?? runIdByKey.get(key);
+      out.push({ taskId, state: "queued", position: index + 1, ...(id ? { runId: id } : {}) });
+    });
+    return out;
+  }
+
+  /**
    * Check if the scheduler is currently running.
    */
   isRunning(): boolean {
@@ -1789,6 +2068,10 @@ export class Scheduler {
     // to the millisecond — operators can't tell the failure modes apart
     // from the run record alone.
     const startedAt = new Date().toISOString();
+    // Every run has its id from dispatch, so one in flight is found (and
+    // cancelled) by it whatever started it; a requested run brings its own.
+    const runId = requested?.runId ?? newRunId();
+    this.activeInfo.set(key, { startedAt, trigger, runId });
     // The once occurrence this run is, if any: an `at` edited while it runs is
     // a new occurrence, which the run must not retire.
     const firedOnceAt =
@@ -1797,6 +2080,7 @@ export class Scheduler {
     let recorded: { run: TaskRun; result: TaskRunResult | null };
     try {
       recorded = await this.executeAndRecord(auto, controller, {
+        runId,
         startedAt,
         trigger,
         input,
@@ -1810,6 +2094,8 @@ export class Scheduler {
       // Releasing it admits the next queued run. `executeTask` releases it as
       // the run ends; this covers an executor that never reached it.
       this.activeRuns.delete(key);
+      this.activeInfo.delete(key);
+      this.scheduledInFlight.delete(runId);
       lease.release();
     }
     // After the slot is free and the task is no longer running, so a retry
@@ -1842,8 +2128,8 @@ export class Scheduler {
       });
       return run;
     });
-    this.pendingAssessments.add(pending);
-    pending.finally(() => this.pendingAssessments.delete(pending));
+    this.pendingAssessments.set(run.id, pending);
+    pending.finally(() => this.pendingAssessments.delete(run.id));
     return pending;
   }
 
@@ -1892,7 +2178,7 @@ export class Scheduler {
     const { workspaceId: wsId, ownerId } = auto;
     if (!wsId || !ownerId) return false;
     const requested: RequestedRun = {
-      runId: `run_${randomBytes(6).toString("hex")}`,
+      runId: newRunId(),
       requestedAt: new Date().toISOString(),
       ...(run.input !== undefined ? { input: run.input } : {}),
       retryOf: run.id,
@@ -1907,8 +2193,13 @@ export class Scheduler {
   /** Resolves once every assessment in flight has been recorded. */
   async assessmentsSettled(): Promise<void> {
     while (this.pendingAssessments.size > 0) {
-      await Promise.allSettled([...this.pendingAssessments]);
+      await Promise.allSettled([...this.pendingAssessments.values()]);
     }
+  }
+
+  /** Whether a recorded run is still being assessed, so its verdict is not yet on its record. */
+  isAssessing(runId: string): boolean {
+    return this.pendingAssessments.has(runId);
   }
 
   /** Run the executor and record the outcome; the slot is released by the caller. */
@@ -1916,6 +2207,7 @@ export class Scheduler {
     auto: Task,
     controller: AbortController,
     dispatch: {
+      runId: string;
       startedAt: string;
       trigger: TaskRunTrigger;
       input: RunInput | undefined;
@@ -1925,7 +2217,7 @@ export class Scheduler {
       batch?: BatchRunOptions;
     },
   ): Promise<{ run: TaskRun; result: TaskRunResult | null }> {
-    const { startedAt, trigger, input, lease, firedOnceAt, requested, batch } = dispatch;
+    const { runId, startedAt, trigger, input, lease, firedOnceAt, requested, batch } = dispatch;
     const ticket = (run: TaskRun) => {
       if (requested && auto.workspaceId && auto.ownerId) {
         this.writeTicket(auto.workspaceId, auto.ownerId, auto.id, requested, run);
@@ -1943,6 +2235,15 @@ export class Scheduler {
       trigger,
     });
     try {
+      // Inside the try: a mark that cannot be written fails the run, which is
+      // recorded and advances `nextRunAt`, rather than leaving it due.
+      if (trigger === "scheduled") {
+        this.markScheduledRunInFlight(auto, {
+          runId,
+          startedAt,
+          ...(firedOnceAt !== undefined ? { onceAt: firedOnceAt } : {}),
+        });
+      }
       batch?.onStarted?.();
       const executed = await this.executor(
         auto,
@@ -1950,24 +2251,25 @@ export class Scheduler {
         trigger,
         input,
         lease,
-        requested?.runId,
+        runId,
         batch?.accounts(),
       );
       const run = requested ? withRequest(executed.run, requested) : executed.run;
-      const result =
-        requested && executed.result ? { ...executed.result, runId: run.id } : executed.result;
-      this.updateAfterRun(auto, run, trigger, firedOnceAt);
-      // Persist the full deliverable sidecar alongside the run summary. Present
-      // for both the scheduled and manual (runNow) paths; null only when the
-      // executor had no clean data (it rejected instead — see the catch below).
-      if (result) this.persistRunResult(auto, result);
+      const result: TaskRunResult = executed.result
+        ? {
+            ...executed.result,
+            runId: run.id,
+            ...(run.error !== undefined ? { error: run.error } : {}),
+          }
+        : resultOfRecord(run);
+      this.updateAfterRun(auto, run, trigger, firedOnceAt, { dispatchRunId: runId, result });
       ticket(run);
       this.runRecorded(auto);
       return { run, result };
     } catch (err) {
-      const { status, suffix, error, transient } = classifyRunFailure(err);
+      const { status, error, transient } = classifyRunFailure(err);
       const failed: TaskRun = {
-        id: `run_${Date.now()}_${suffix}`,
+        id: runId,
         taskId: auto.id,
         startedAt,
         completedAt: new Date().toISOString(),
@@ -1981,10 +2283,13 @@ export class Scheduler {
         trigger,
       };
       const failedRun = requested ? withRequest(failed, requested) : failed;
-      this.updateAfterRun(auto, failedRun, trigger, firedOnceAt);
+      // The executor threw, so no activity reached the scheduler: the result
+      // carries the error alone.
+      const result = resultOfRecord(failedRun);
+      this.updateAfterRun(auto, failedRun, trigger, firedOnceAt, { dispatchRunId: runId, result });
       ticket(failedRun);
       this.runRecorded(auto);
-      return { run: failedRun, result: null };
+      return { run: failedRun, result };
     }
   }
 
@@ -2009,12 +2314,19 @@ export class Scheduler {
    * dispatch; defaults to the dispatched task's). The once is retired
    * only while the stored schedule still names that `at`: one edited during
    * the run is a new occurrence and stays armed.
+   *
+   * `dispatchRunId` is the id the run was dispatched under (defaults to the
+   * record's); a `scheduledRunInFlight` naming it is cleared by this write.
+   * `appendRecord: false` updates the task for a run whose record is already
+   * in the index. A record appended here has `result` written first (one
+   * built from the record when absent), so every index line has a result.
    */
   updateAfterRun(
     task: Task,
     run: TaskRun,
     trigger?: TaskRunTrigger,
     firedOnceAt: string | undefined = task.schedule?.at,
+    { dispatchRunId = run.id, appendRecord = true, result }: UpdateAfterRunOptions = {},
   ): void {
     const wsId = task.workspaceId;
     const ownerId = task.ownerId;
@@ -2033,6 +2345,11 @@ export class Scheduler {
 
     const now = Date.now();
 
+    // This run is recorded by the same write that advances `nextRunAt`, so it
+    // is no longer in flight. Another run's mark (a batch or Run now beside a
+    // scheduled run) is left for that run.
+    if (auto.scheduledRunInFlight?.runId === dispatchRunId) delete auto.scheduledRunInFlight;
+
     auto.lastRunAt = run.completedAt ?? run.startedAt;
     auto.lastRunStatus = resolveLastRunStatus(run.status);
     auto.runCount = (auto.runCount ?? 0) + 1;
@@ -2041,10 +2358,7 @@ export class Scheduler {
     auto.cumulativeInputTokens = (auto.cumulativeInputTokens ?? 0) + run.inputTokens;
     auto.cumulativeOutputTokens = (auto.cumulativeOutputTokens ?? 0) + run.outputTokens;
 
-    // A batch item answers to its batch: its failures are the batch's to count
-    // (the stop rule, `rerun_failed`), never the task's own streak, which
-    // would back off and then disable the task's schedule.
-    if (!run.batchId) applyConsecutiveErrors(auto, run, now);
+    const notice = applyStreak(auto, run, now);
     if (!isOnceSchedule(auto.schedule)) {
       applyNextRunAt(auto, now, this.config.defaultTimezone);
     } else if ((trigger ?? run.trigger) === "scheduled" && auto.schedule?.at === firedOnceAt) {
@@ -2060,19 +2374,15 @@ export class Scheduler {
 
     // Persist the run summary + the updated definition, then sync the single
     // in-memory entry so the timer sees the new nextRunAt without re-scanning.
-    appendRun(this.config.workDir, wsId, ownerId, task.id, run);
-    taskRunsTotal.inc({ status: run.status });
+    // The result lands before the index line, so every line has one.
+    if (appendRecord) {
+      saveRunResult(this.config.workDir, wsId, ownerId, task.id, result ?? resultOfRecord(run));
+      appendRun(this.config.workDir, wsId, ownerId, task.id, run);
+      taskRunsTotal.inc({ status: run.status });
+    }
     saveTask(this.config.workDir, wsId, ownerId, auto);
     this.definitions.set(Scheduler.keyOf(auto), auto);
-  }
-
-  /**
-   * Persist a run's full result sidecar under the task's provenance
-   * workspace + owner. No-op when either is missing (defensive).
-   */
-  private persistRunResult(auto: Task, result: TaskRunResult): void {
-    if (!auto.workspaceId || !auto.ownerId) return;
-    saveRunResult(this.config.workDir, auto.workspaceId, auto.ownerId, auto.id, result);
+    if (notice) this.config.notifyRunFailed?.(auto, run, notice);
   }
 
   /**
@@ -2159,6 +2469,13 @@ export class Scheduler {
     };
     const run = requested ? withRequest(notStarted, requested) : notStarted;
     if (!auto.workspaceId || !auto.ownerId) return run;
+    saveRunResult(
+      this.config.workDir,
+      auto.workspaceId,
+      auto.ownerId,
+      auto.id,
+      resultOfRecord(run),
+    );
     appendRun(this.config.workDir, auto.workspaceId, auto.ownerId, auto.id, run);
     taskRunsTotal.inc({ status: run.status });
     if (requested) this.writeTicket(auto.workspaceId, auto.ownerId, auto.id, requested, run);

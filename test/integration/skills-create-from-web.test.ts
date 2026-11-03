@@ -2,24 +2,21 @@
  * End-to-end contract test for the skills create flow as the web admin UI
  * ("rules for your agent") drives it.
  *
- * Two regressions are pinned here:
+ * Two contracts are pinned here:
  *
  *  1. Contract shape — the web client sends `name` inside `manifest`, not at
- *     the args root. Three hand-written declarations (server schema literal,
- *     server CreateInput, web CreateInput) once disagreed; the schema-derived
- *     `ToolInput<"skills", "create">` keeps them aligned.
+ *     the args root. The schema-derived `ToolInput<"skills", "create">` keeps
+ *     the server schema, server CreateInput, and web CreateInput aligned.
  *
- *  2. Valid-by-construction rules — the editor used to post `description: ""`
- *     and no `loading-strategy`. The empty description passed the (then-lax)
- *     tool schema and was written to disk, but the loader's canonical
- *     validation rejected it, so the skill was invisible to list/read (a
- *     silent orphan) and a retry collided with "already exists". And with no
- *     `loading-strategy` the skill defaulted to `dynamic` with no triggers —
- *     catalog-only, i.e. it never loaded. The UI now sends the title as a
- *     non-empty `description` and `loadingStrategy: "always"`. These tests
- *     post that exact shape and assert the rule is created, visible, and
- *     actually loads — and that the old broken shape is rejected with no
- *     orphan left behind.
+ *  2. Valid-by-construction rules — the UI sends the title as a non-empty
+ *     `description` and `loadingStrategy: "always"`. An empty description
+ *     that reached disk would fail the loader's canonical validation, so the
+ *     skill would be invisible to list/read (a silent orphan) and a retry
+ *     would collide with "already exists". And with no `loading-strategy` the
+ *     skill defaults to `dynamic` with no triggers, loaded only when the model
+ *     asks for it. These tests post that exact shape and assert the rule is
+ *     created, visible, and loads every turn — and that an empty description
+ *     is rejected with no orphan left behind.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
@@ -35,6 +32,7 @@ import { devProvider } from "../helpers/dev-provider.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 import { readJson } from "../helpers/http.ts";
 import { provisionTestWorkspace, TEST_WORKSPACE_ID } from "../helpers/test-workspace.ts";
+import { structuredOutput } from "../helpers/tool-result.ts";
 
 let runtime: Runtime;
 let handle: ServerHandle;
@@ -104,18 +102,15 @@ describe("skills__create — web 'rules' payload contract", () => {
     // Visible to list (the orphan bug made it invisible), and reported as a
     // skill that actually reaches the prompt.
     const list = await callTool("list", { scope: "workspace" });
-    const listed = (list.structuredContent as unknown as SkillsListOutput).skills.find(
-      (s) => s.id === id,
-    );
+    const listed = structuredOutput<SkillsListOutput>(list).skills.find((s) => s.id === id);
     expect(listed).toBeDefined();
     expect(listed?.loadingStrategy).toBe("always");
-    expect(listed?.loading?.wouldLoad).toBe(true);
     expect(listed?.loading?.mechanism).toBe("always");
 
     // Readable, with the title preserved as the description label.
     const read = await callTool("read", { id });
     expect(read.isError).toBeFalsy();
-    const detail = read.structuredContent as unknown as SkillDetail;
+    const detail = structuredOutput<SkillDetail>(read);
     expect(detail.metadata.loadingStrategy).toBe("always");
     expect(detail.metadata.description).toBe("Voice rules");
     expect(detail.content).toContain("Avoid em-dashes");
@@ -137,7 +132,7 @@ describe("skills__create — web 'rules' payload contract", () => {
 
     // No file was written → not in the list…
     const list = await callTool("list", { scope: "workspace" });
-    const orphan = (list.structuredContent as unknown as SkillsListOutput).skills.find((s) =>
+    const orphan = structuredOutput<SkillsListOutput>(list).skills.find((s) =>
       s.id.endsWith("orphan-rule.md"),
     );
     expect(orphan).toBeUndefined();

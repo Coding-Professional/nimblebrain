@@ -80,6 +80,24 @@ describe("defineInProcessApp — schema validation", () => {
     source = undefined;
   });
 
+  test("refuses a call when the tool's input schema does not compile", async () => {
+    const { handler, calls } = makeSpy();
+    const def = createDef(handler);
+    source = await buildSource("test", [
+      {
+        ...def,
+        inputSchema: { ...def.inputSchema, $schema: "http://json-schema.org/draft-04/schema#" },
+      },
+    ]);
+
+    const result = await source.execute("create", {});
+
+    expect(result.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    const body = parseFirst(result) as { error: string };
+    expect(body.error).toContain("input schema does not compile");
+  });
+
   test("blocks handler when a required field is missing", async () => {
     const { handler, calls } = makeSpy();
     source = await buildSource("test", [createDef(handler)]);
@@ -196,9 +214,7 @@ describe("McpSource — resource notifications", () => {
    * `notifications/resources/*` to leave the server.
    */
   async function buildResourceSource(name: string): Promise<McpSource> {
-    const resources = new Map<string, InProcessResource>([
-      ["instructions://workspace", "<p>hi</p>"],
-    ]);
+    const resources = new Map<string, InProcessResource>([["notes://today", "<p>hi</p>"]]);
     const built = defineInProcessApp(
       {
         name,
@@ -274,7 +290,7 @@ describe("McpSource — resource notifications", () => {
     await expect(
       client!.request({
         method: "resources/subscribe",
-        params: { uri: "instructions://workspace" },
+        params: { uri: "notes://today" },
       }),
     ).rejects.toThrow(/Method not found/i);
   });
@@ -314,7 +330,7 @@ describe("defineInProcessApp — parametric resources", () => {
 
   test("listResources entries are merged into resources/list alongside static map entries", async () => {
     const staticMap = new Map<string, InProcessResource>([
-      ["instructions://workspace", { text: "ws body", mimeType: "text/markdown" }],
+      ["notes://today", { text: "ws body", mimeType: "text/markdown" }],
     ]);
     source = defineInProcessApp(
       {
@@ -334,7 +350,7 @@ describe("defineInProcessApp — parametric resources", () => {
     const result = await source.getClient()!.listResources();
     const uris = result.resources.map((r) => r.uri);
     expect(uris).toEqual([
-      "instructions://workspace",
+      "notes://today",
       "instructions://connectors/foo",
       "instructions://connectors/bar",
     ]);

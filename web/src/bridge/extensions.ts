@@ -8,7 +8,7 @@
 // The declaration is the gate. `@nimblebrain/synapse` sends an extension only
 // where the host declared it, so a method served here but missing from
 // `NIMBLEBRAIN_EXTENSIONS` is one no app can ever reach — the picker rejects,
-// `action` sends nothing, and keys are not captured. Serving and declaring are
+// `open` resolves `false`, and keys are not captured. Serving and declaring are
 // the same edit because they read the same list.
 //
 // `experimental` is where they go because the ext-apps host-capability type has
@@ -20,8 +20,19 @@
 // spec names a third party's extensions.
 // ---------------------------------------------------------------------------
 
-/** App → host notification: run a host action (open an app or a conversation). */
-export const ACTION_METHOD = "ai.nimblebrain/action";
+/**
+ * App → host request: open what a resource URI names, `{ uri }`. The shell has
+ * the server resolve it (`nb__open_app`) and puts the destination on screen;
+ * answered `{}`, or an error naming the URI when nothing here shows it
+ * (ADR-0052).
+ */
+export const OPEN_METHOD = "ai.nimblebrain/open";
+/**
+ * App → host request: open the settings page of the connector whose view sent
+ * it, `{}`. The connector is the one the bridge names, never a param. Answered
+ * `{}`, or an error when it has none.
+ */
+export const OPEN_CONNECTOR_SETTINGS_METHOD = "ai.nimblebrain/open-connector-settings";
 /** App → host request: the host's file picker, answered `{ files }`. */
 export const REQUEST_FILE_METHOD = "ai.nimblebrain/request-file";
 /**
@@ -67,10 +78,23 @@ export const NOTIFY_METHOD = "ai.nimblebrain/notify";
 
 /** Every extension this host serves, and therefore declares. */
 export const NIMBLEBRAIN_EXTENSIONS = [
-  ACTION_METHOD,
+  OPEN_METHOD,
+  OPEN_CONNECTOR_SETTINGS_METHOD,
   NOTIFY_METHOD,
   REQUEST_FILE_METHOD,
   UPLOAD_FILES_METHOD,
   KEYDOWN_METHOD,
   LOCATION_METHOD,
 ] as const;
+
+/**
+ * Host-context key: the theme variables outside the spec's
+ * `styles.variables` enum that vary with the mode, as `{ variables }`
+ * (`getModeExtensionTokens`). Sent on `ui/initialize` and on every
+ * `host-context-changed`, so they follow a theme toggle the way the spec's
+ * variables do. A host-context field, not a method, so it is not declared in
+ * `hostCapabilities.experimental`: an app reads it where it is present. The
+ * spec's `McpUiHostContext` keeps unknown top-level keys, which is why it sits
+ * there and not inside `styles`, whose shape a spec client strips.
+ */
+export const HOST_STYLES_EXTENSION = "ai.nimblebrain/styles";

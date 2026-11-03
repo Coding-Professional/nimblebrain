@@ -8,6 +8,8 @@ import type { CatalogListing } from "../../src/connectors/catalog/types.ts";
 import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import { textContent } from "../../src/engine/content-helpers.ts";
 import type { UserIdentity } from "../../src/identity/provider.ts";
+import type { UserStore } from "../../src/identity/user.ts";
+import type { PermissionStore } from "../../src/permissions/permission-store.ts";
 import type { Runtime } from "../../src/runtime/runtime.ts";
 import {
   createManageConnectorsTool,
@@ -18,16 +20,17 @@ import { WorkspaceContext } from "../../src/workspace/context.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
 import { CONNECTOR_FIXTURE_DIR } from "../helpers/connector-fixtures.ts";
 import { installTestCredentialStore } from "../helpers/credential-store.ts";
+import { fakeFetch } from "../helpers/fake-fetch.ts";
+import { stub } from "../helpers/stub.ts";
 import { seedWorkspace } from "../helpers/test-workspace.ts";
 
 /**
- * Integration coverage for T010's `manage_connectors.install` contract:
+ * Integration coverage for the `manage_connectors.install` contract:
  *
  *   1. **Persisted shape**: after a successful install into a shared
  *      workspace, the on-disk `ConnectorInstance` carries
- *      `wsId: <picked>` and `oauthScope: "workspace"`. The legacy
- *      `oauthScope: "user"` literal is gone (T008) and stays gone —
- *      we read `workspace.json` directly to pin this.
+ *      `wsId: <picked>` and `oauthScope: "workspace"`, never
+ *      `oauthScope: "user"` — we read `workspace.json` directly to pin this.
  *
  *   2. **Every workspace installs the same way**: installing into a
  *      workspace the caller alone belongs to records that workspace's
@@ -46,7 +49,7 @@ import { seedWorkspace } from "../helpers/test-workspace.ts";
  *
  *   4. **Explicit wsId overrides the request workspace**: a caller may
  *      pass `wsId` to install into a workspace other than the session
- *      header (direct API / MCP callers). The web shell no longer does
+ *      header (direct API / MCP callers). The web shell does not do
  *      this — it installs where the route points — but the override
  *      stays supported. Pins audit attribution per install.
  *
@@ -92,7 +95,7 @@ async function buildHarness(
   });
   const personalWsId = ownWs.id;
 
-  const runtime = {
+  const runtime = stub<Runtime>({
     getWorkDir: () => workDir,
     getCredentialStore: () => credStore,
     getWorkspaceStore: () => workspaceStore,
@@ -100,14 +103,14 @@ async function buildHarness(
     getConnectorCatalog: () => new ConnectorCatalog(CONNECTOR_FIXTURE_DIR),
     getLifecycle: () => lifecycle,
     getRegistryForWorkspace: (_id: string) => workspaceRegistry,
-    getPermissionStore: () => ({
-      deleteConnector: async () => {},
-    }),
-    getUserStore: () => ({ get: async () => null }),
-    getUserConnectorStore: () => ({ get: async () => null }),
+    getPermissionStore: () =>
+      stub<PermissionStore>({
+        deleteConnector: async () => {},
+      }),
+    getUserStore: () => stub<UserStore>({ get: async () => null }),
     getConnectorInstancesForWorkspace: (_wsId: string) => lifecycle.getInstances(),
     getAllowInsecureRemotes: () => false,
-  } as unknown as Runtime;
+  });
 
   const ctx: ManageConnectorsContext = {
     runtime,
@@ -156,8 +159,7 @@ describe("manage_connectors.install (T010) — persisted shape + hard-error", ()
     expect(sc.scope).toBe("workspace");
 
     // Read workspace.json directly. The persisted ConnectorRef must
-    // carry `oauthScope: "workspace"` — never `"user"` (T008 removed
-    // that literal; this test pins it stays gone).
+    // carry `oauthScope: "workspace"` — never `"user"`.
     const wsDoc = JSON.parse(
       readFileSync(join(h.workDir, "workspaces", h.sharedWsId, "workspace.json"), "utf-8"),
     );
@@ -252,7 +254,7 @@ describe("manage_connectors.install (T010) — persisted shape + hard-error", ()
     // header by passing `wsId` explicitly (direct API / MCP callers).
     // Session header points at sharedWsId; the explicit arg names
     // the caller's own workspace, so the install lands there and sharedWsId
-    // stays empty. The web shell no longer exercises this (it omits
+    // stays empty. The web shell does not exercise this (it omits
     // wsId), but the override must keep working.
     h = await buildHarness({ sessionWsId: h.sharedWsId });
     const personalWsId = h.personalWsId;
@@ -281,12 +283,12 @@ describe("manage_connectors.install (T010) — persisted shape + hard-error", ()
     // the slug 404s and binds nothing — failing the assertion below.
     const overlayBody =
       "---\nname: granola-usage\ndescription: How to use Granola.\n---\nUse Granola carefully.\n";
-    const fetchOnlyGranola = (async (url: string | URL | Request) => {
+    const fetchOnlyGranola = fakeFetch(async (url) => {
       const u = typeof url === "string" ? url : url.toString();
       return u.includes("/granola/SKILL.md")
         ? new Response(overlayBody, { status: 200 })
         : new Response("", { status: 404 });
-    }) as unknown as typeof fetch;
+    });
     h.runtime.getLifecycle().setConnectorSkillFetch(fetchOnlyGranola);
 
     const result = await h.tool.handler({

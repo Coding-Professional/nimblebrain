@@ -30,7 +30,33 @@ describe("config schema validation", () => {
     expect(
       isValid({
         version: "1",
-        models: { default: "claude-sonnet-4-5-20250929" },
+        models: { default: "anthropic:claude-sonnet-4-5-20250929" },
+      }),
+    ).toBe(true);
+  });
+
+  // A model id names its provider. The refusal names the form to write, so an
+  // operator reading the boot error can paste the fix.
+  it.each([
+    [{ models: { default: "claude-sonnet-4-6" } }, "/models/default"],
+    [{ models: { fast: "claude-haiku-4-5" } }, "/models/fast"],
+    [
+      { modelPolicy: { allowed: ["anthropic:claude-sonnet-4-6", "gpt-4o"] } },
+      "/modelPolicy/allowed/1",
+    ],
+  ])("refuses a bare model id at %#, naming the qualified form", (config, path) => {
+    expect(isValid(config)).toBe(false);
+    const errors = getErrors(config);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toStartWith(`${path} nbQualifiedModelId:`);
+    expect(errors[0]).toMatch(/Write it as provider:model, e\.g\. "(anthropic|openai):/);
+  });
+
+  it("accepts qualified ids in every model field", () => {
+    expect(
+      isValid({
+        models: { default: "anthropic:claude-sonnet-4-6", fast: "nebius:openai/gpt-oss-120b" },
+        modelPolicy: { allowed: ["anthropic:claude-sonnet-4-6", "nebius:openai/gpt-oss-120b"] },
       }),
     ).toBe(true);
   });
@@ -71,6 +97,21 @@ describe("config schema validation", () => {
         },
       }),
     ).toBe(true);
+  });
+
+  it("accepts GreenPT provider config and rejects unknown provider fields", () => {
+    expect(
+      isValid({
+        providers: {
+          greenpt: {
+            apiKey: "test-key",
+            baseURL: "https://api.greenpt.ai/v1",
+            models: ["glm-5.2", "kimi-k2.7-code", "kimi-k3"],
+          },
+        },
+      }),
+    ).toBe(true);
+    expect(isValid({ providers: { greenpt: { unknown: true } } })).toBe(false);
   });
 
   it("rejects features with non-boolean value", () => {

@@ -11,6 +11,7 @@ import { MetricsEventSink } from "../adapters/metrics-events.ts";
 import { NoopEventSink } from "../adapters/noop-events.ts";
 import { WorkspaceLogSink } from "../adapters/workspace-log-sink.ts";
 import type { ConversationStreamEvents, TurnFrame } from "../api/schemas/events.ts";
+import { loadBrand } from "../brand/index.ts";
 import { isToolVisibleToRole, type ResolvedFeatures, resolveFeatures } from "../config/features.ts";
 import { deriveOverridePath } from "../config/overrides.ts";
 import { createPrivilegeHook, NoopConfirmationGate } from "../config/privilege.ts";
@@ -38,6 +39,8 @@ import {
 } from "../connectors/runtime/catalog-ui.ts";
 import { bootReconcileConnectorSkills } from "../connectors/runtime/connector-skill-reconcile.ts";
 import { sanitizePlacements } from "../connectors/runtime/defaults.ts";
+import { setInBandAuthErrorsCatalog } from "../connectors/runtime/in-band-auth-errors.ts";
+import { bindInstanceOAuthClients } from "../connectors/runtime/instance-oauth-clients.ts";
 import { ConnectorLifecycleManager } from "../connectors/runtime/lifecycle.ts";
 import { serverNameFromRef, slugifyServerName } from "../connectors/runtime/paths.ts";
 import { setConnectionRunningHandler } from "../connectors/runtime/pending-auth-buffer.ts";
@@ -74,7 +77,6 @@ import {
 } from "../conversation/types.ts";
 import { applyReasoningReplayPolicy, windowMessages } from "../conversation/window.ts";
 import { textContent } from "../engine/content-helpers.ts";
-import { AgentEngine } from "../engine/engine.ts";
 import type { AdminToolCallPayload } from "../engine/schemas/events.ts";
 import { estimateMessageTokens, estimateToolDescriptionTokens } from "../engine/token-estimate.ts";
 import type {
@@ -94,6 +96,8 @@ import type {
   ToolSchema,
 } from "../engine/types.ts";
 import { CONNECTOR_SKILL_SYNTHETIC, SKILL_ACTIVATED_SYNTHETIC } from "../engine/types.ts";
+import { type AgentRuntimes, createAgentRuntimes } from "../execution/registry.ts";
+import type { AgentRuntime } from "../execution/types.ts";
 import { FileLocator } from "../files/locator.ts";
 import { workspaceFilesDir } from "../files/paths.ts";
 import { rehydrateUserResources } from "../files/rehydrate.ts";
@@ -102,15 +106,20 @@ import { DEFAULT_FILE_CONFIG, type FileConfig } from "../files/types.ts";
 import type { HookReconcileDeps } from "../hooks/reconcile.ts";
 import { ensureHooksOnRunning } from "../hooks/reconcile.ts";
 import { readHookIdentity } from "../hooks/token.ts";
-import { FileBackedHostResourcesResolver, TokenBucketRateLimit } from "../host-resources/index.ts";
+import {
+  createResourceArgumentsResolver,
+  FileBackedHostResourcesResolver,
+  type RecordArgumentsGrant,
+  TokenBucketRateLimit,
+} from "../host-resources/index.ts";
 import { IdentityContext } from "../identity/context.ts";
 import type { InstanceConfig } from "../identity/instance.ts";
 import { loadInstanceConfig, missingInstanceConfigError } from "../identity/instance.ts";
 import { requireRequestIdentity, resolveRequestOwnerId } from "../identity/owner.ts";
 import type { IdentityProvider, UserIdentity } from "../identity/provider.ts";
 import { createIdentityProvider } from "../identity/provider.ts";
+import { DevIdentityProvider } from "../identity/providers/dev.ts";
 import { UserStore } from "../identity/user.ts";
-import { InstructionsStore } from "../instructions/index.ts";
 import {
   forgetLifecycleBinding,
   type LifecycleSourceLike,
@@ -129,13 +138,20 @@ import {
   isModelAllowed,
   isModelInPolicy,
 } from "../model/catalog.ts";
-import { buildModelResolver, resolveModelString } from "../model/registry.ts";
+import { isQualifiedModelId, requireQualifiedModelId } from "../model/model-id.ts";
+import {
+  buildModelResolver,
+  MODEL_PROVIDERS,
+  type ModelGatewayAccess,
+  providerModelAllowlists,
+} from "../model/registry.ts";
 import { type ModelSlot, parseModelSlotRef } from "../model/slots.ts";
 import { type ResolvedPollConfig, resolvePollConfig } from "../notifications/poll-config.ts";
 import { positionOutbox } from "../notifications/position.ts";
 import { NotificationStore } from "../notifications/store.ts";
 import type { NotificationsDeclaration } from "../notifications/types.ts";
 import { registerBuiltinCredentialProviders } from "../oauth/minted-credential-provider.ts";
+import { publicOrigin } from "../oauth/public-origin.ts";
 import { requestIdentityAttrs, withSpan } from "../observability/index.ts";
 import { log } from "../observability/log.ts";
 import {
@@ -192,7 +208,10 @@ import {
   discoveredSkillFromEntry,
   hydrateSkill,
   PUBLISHED_SKILL_SCOPE,
+  type PublishedSkillInfo,
+  parseConnectorSkillName,
   parseSkillMarkdown,
+  publishedSkillInfo,
   reportUnmatchedToolAffinity,
   synthesizeConnectorSkill,
 } from "../skills/connector-skills.ts";
@@ -202,10 +221,11 @@ import {
   loadScopedSkills,
   loadSkillDir,
   mergeScopedSkills,
+  parseSkillFile,
   partitionSkills,
 } from "../skills/loader.ts";
 import { type SkillMatch, SkillMatcher } from "../skills/matcher.ts";
-import { partitionSkillsByRole, type SelectedSkill, selectLayer3Skills } from "../skills/select.ts";
+import { partitionSkillsByRole } from "../skills/select.ts";
 import {
   listedSkillFiles,
   parseSkillEntry,
@@ -245,17 +265,21 @@ import {
 } from "../tools/instance-credentials.ts";
 import { McpSource } from "../tools/mcp-source.ts";
 import { SharedSourceRef, type ToolRegistry } from "../tools/registry.ts";
-import { APP_INSTRUCTIONS_URI } from "../tools/resource-schemes.ts";
+import { isReservedResourceScheme, readableRecordTemplates } from "../tools/resource-schemes.ts";
 import {
   announceResourceListChangedFor,
   relayIdentitySourceNotifications,
 } from "../tools/server-notifications.ts";
 import { surfaceTools } from "../tools/surfacing.ts";
-import { createSystemTools } from "../tools/system-tools.ts";
+import {
+  createSystemTools,
+  READ_RESOURCE_TOOL,
+  RECORD_READ_MAX_CHARS,
+} from "../tools/system-tools.ts";
 import { isToolAllowedForRun, unmatchedAllowedTools } from "../tools/tool-pattern.ts";
 import type { ResourceData, Tool, ToolSource } from "../tools/types.ts";
 import { toToolSchema } from "../tools/types.ts";
-import { resolveRates } from "../usage/cost.ts";
+import { estimateCost, resolveRates } from "../usage/cost.ts";
 import { createProcessLedger, type UsageLedger } from "../usage/ledger.ts";
 import { clearUsageLedger, recordLlmCall, setUsageLedger } from "../usage/record.ts";
 import type { TokenUsage } from "../usage/types.ts";
@@ -269,24 +293,39 @@ import {
   ConversationAccessDeniedError,
   ConversationNotFoundError,
   ConversationWorkspaceAccessDeniedError,
+  DeclaredSkillsUnavailableError,
   DeclaredToolsUnavailableError,
   ModelNotAllowedError,
   RunInProgressError,
+  RuntimeCannotHoldRunError,
   WorkspaceMembershipRevokedError,
 } from "./errors.ts";
 import { IdentityToolRouter } from "./identity-tool-router.ts";
+import { modelGatewayFetch } from "./model-gateway-fetch.ts";
+import { type GatewayProviders, watchGatewayProviders } from "./model-gateway-providers.ts";
 import { PlacementRegistry } from "./placement-registry.ts";
 import {
+  callMayUseTool,
   getRequestContext,
   type RequestContext,
   runWithRequestContext,
 } from "./request-context.ts";
 import { type BufferedRunEvent, RunBus } from "./run-bus.ts";
+import { type RunDeadline, runDeadline } from "./run-deadline.ts";
+import {
+  createRunKey,
+  parseRunKeyRing,
+  RUN_KEY_CREDENTIAL,
+  type RunKey,
+  RunKeyError,
+} from "./run-key.ts";
 import type {
+  DeclaredSkill,
   RunComposition,
   RunConversationBinding,
   RunHandle,
   RunSpec,
+  SkillDelivery,
   UserResourceLinkPart,
   UserTextPart,
 } from "./run-spec.ts";
@@ -309,7 +348,7 @@ import {
 } from "./workspace-runtime.ts";
 
 const DEFAULT_WORK_DIR = join(homedir(), ".nimblebrain");
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "anthropic:claude-sonnet-4-6";
 
 import { DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_ITERATIONS } from "../limits.ts";
 import { buildMidTurnCompaction } from "./mid-turn-compaction.ts";
@@ -330,9 +369,26 @@ function applyClearable<T>(current: T | undefined, patched: T | null | undefined
 }
 
 /**
+ * Refuse to start on a configured model id that is not `provider:model`.
+ *
+ * The CLI loader's schema already refuses one in `nimblebrain.json`; this is
+ * the same rule for a config handed to `Runtime.start` in code, which no schema
+ * sees. Checked after credential references resolve, since any string here may
+ * have been one.
+ */
+function assertQualifiedModelConfig(config: Pick<RuntimeConfig, "models" | "modelPolicy">): void {
+  for (const [slot, model] of Object.entries(config.models ?? {})) {
+    if (typeof model === "string") requireQualifiedModelId(model, `models.${slot}`);
+  }
+  for (const model of config.modelPolicy?.allowed ?? []) {
+    requireQualifiedModelId(model, "modelPolicy.allowed entry");
+  }
+}
+
+/**
  * Warn about a configured slot the org's own policy forbids.
  *
- * A config file can strand a slot the way `set_model_config` no longer can: it
+ * A config file can strand a slot the way `set_model_config` cannot: it
  * is written by hand, so nothing validates it against the policy beside it.
  *
  * Reported rather than refused — a deployment that boots with an error it can
@@ -368,6 +424,63 @@ type PreStoreConfigKey = "workDir" | "secrets" | "telemetry" | "logging" | "even
  */
 export type DeclaredRuntimeConfig = Pick<RuntimeConfig, PreStoreConfigKey> &
   WithCredentialRefs<Omit<RuntimeConfig, PreStoreConfigKey>>;
+
+/**
+ * Read the installation's run key at boot: from the environment variable
+ * `secrets.runKeyEnv` names, or else from the instance scope of the credential
+ * store.
+ *
+ * A named variable is the only source: a managed deployment delivers the key
+ * from its secret manager into the environment, as it does every per-tenant key,
+ * and a stored copy would be a second value nobody rotates. Named but unset is a
+ * deployment that asked for a key and did not get one, so the runtime refuses to
+ * start rather than start without it.
+ *
+ * With no variable named, absent is a legitimate state: an installation that runs
+ * no external agent needs no key, so it starts with none and mints nothing.
+ * Present, the key either opens and parses or the runtime refuses to start: a
+ * sealed value that does not open throws on `reveal()` (ADR-0035), and a
+ * malformed ring throws in the parse, so no key is served that this runtime
+ * cannot sign with.
+ */
+async function loadRunKey(
+  store: CredentialStore,
+  config: Pick<RuntimeConfig, "tasks" | "secrets">,
+): Promise<RunKey | null> {
+  const ringJson = await readRunKeyRingJson(store, config.secrets?.runKeyEnv);
+  if (ringJson === null) return null;
+  return createRunKey({
+    ring: parseRunKeyRing(ringJson),
+    issuer: publicOrigin(),
+    // The operator's wall-clock ceiling on a run is the longest turn this
+    // installation allows; a model credential outlives it by the leeway only.
+    maxRunMs: resolveTasksConfig(config.tasks).maxRunDurationMs,
+  });
+}
+
+/**
+ * The run key's JWK Set as text, from the named environment variable or the
+ * instance secret, or `null` when no variable is named and no secret is stored.
+ * Errors name the variable, never its value.
+ */
+async function readRunKeyRingJson(
+  store: CredentialStore,
+  envName: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
+  if (envName !== undefined) {
+    const value = env[envName]?.trim();
+    if (!value) {
+      throw new RunKeyError(`secrets.runKeyEnv names ${envName}, which holds no run key`);
+    }
+    return value;
+  }
+  const stored = await store.get({ kind: "instance" }, RUN_KEY_CREDENTIAL, {
+    caller: "runtime",
+    purpose: "run key",
+  });
+  return stored ? stored.reveal() : null;
+}
 
 function resolveWorkDir(config: Pick<RuntimeConfig, "workDir">): string {
   if (config.workDir) return config.workDir;
@@ -464,6 +577,8 @@ interface ConnectorGates {
 
 export class Runtime {
   private resolveModelFn: (modelString: string) => LanguageModelV4;
+  /** The agent runtimes runs execute on (`execution` in `nimblebrain.json`). */
+  private agentRuntimes: AgentRuntimes;
   private skillMatcher: SkillMatcher;
   private config: RuntimeConfig;
   private contextSkills: Skill[];
@@ -485,6 +600,10 @@ export class Runtime {
   private _workspaceStore: WorkspaceStore;
   private _permissionStore: PermissionStore | null = null;
   private _credentialStore: CredentialStore | null = null;
+  /** The installation's run key; see {@link getRunKey}. */
+  private _runKey: RunKey | null = null;
+  /** Which providers the model gateway serves, when there is one (`watchGatewayProviders`). */
+  private _gatewayProviders: GatewayProviders | null = null;
   private _managedConnectorRegistry: ManagedConnectorRegistry | null = null;
   private _identityProvider: IdentityProvider;
   /** Getter for the current request identity — reads from AsyncLocalStorage. */
@@ -616,6 +735,7 @@ export class Runtime {
 
   private constructor(
     resolveModelFn: (modelString: string) => LanguageModelV4,
+    agentRuntimes: AgentRuntimes,
     skillMatcher: SkillMatcher,
     config: RuntimeConfig,
     contextSkills: Skill[],
@@ -634,6 +754,7 @@ export class Runtime {
     currentWorkspaceId: () => string | null,
   ) {
     this.resolveModelFn = resolveModelFn;
+    this.agentRuntimes = agentRuntimes;
     this.skillMatcher = skillMatcher;
     this.config = config;
     this.contextSkills = contextSkills;
@@ -702,15 +823,20 @@ export class Runtime {
     // sealing file backend this re-wraps everything under the current key; for
     // a backend with nothing to reconcile it is a no-op. It must finish before
     // the instance credential references below resolve, or the first read of a
-    // legacy plaintext file would race the rewrite of that same file.
+    // unsealed plaintext file would race the rewrite of that same file.
     await credentialStore.reconcile?.();
     let config = await resolveInstanceCredentialRefs(declaredConfig);
+    assertQualifiedModelConfig(config);
+    const runKey = await loadRunKey(credentialStore, config);
+    // `loadConfig` already did this for a file-backed boot; a config built in
+    // code reaches here without it, and the brand is process state every
+    // reader below shares, so the composition root installs it too.
+    loadBrand(config);
 
     // Register built-in transport credential providers (e.g. `minted`) at the
-    // ONE composition root every entry point shares — serve, the no-subcommand
-    // TUI/headless boot, and the task runner all reach here before
-    // startWorkspaceConnectors. Idempotent (last-writer-wins); doing it here instead
-    // of per-entry-point avoids a provider-auth source failing to boot under any
+    // ONE composition root every entry point (`serve`, tests, embedders) reaches
+    // before startWorkspaceConnectors. Idempotent (last-writer-wins); doing it
+    // here instead of per-entry-point avoids a provider-auth source failing to boot under any
     // path that forgot to register.
     registerBuiltinCredentialProviders();
     // Composio's transport credential, registered here for the same reason: a
@@ -732,6 +858,16 @@ export class Runtime {
     // is the reserved-name list in the gateway module, not this ordering.
     registerGatewayCredentialProviders();
 
+    // Instance OAuth clients, bound to the URL the catalog publishes for each id
+    // before any connector starts: every connect resolves its client through this
+    // bind, and it is what keeps the operator's secret on the catalog's server.
+    // Throws on a declared client with no client id or secret.
+    await bindInstanceOAuthClients(() => new ConnectorCatalog(catalogPath()).catalogByIdMap());
+    // Each remote connection reads its entry's in-band auth errors from the
+    // catalog when its source is built: a fresh read, so an edit reaches the
+    // next connection without a copy on the ref going stale.
+    setInBandAuthErrorsCatalog(() => new ConnectorCatalog(catalogPath()).catalogEntries());
+
     // Derive the override-file path when the caller supplied a configPath
     // but not an explicit override path. The CLI's loadConfig already
     // populates both; this fallback covers embedded callers (tests,
@@ -740,7 +876,9 @@ export class Runtime {
       config = { ...config, configOverridePath: deriveOverridePath(config.configPath) };
     }
 
-    const resolveModelFn = resolveModel(config);
+    const gateway = modelGatewayAccess(config, runKey);
+    const resolveModelFn = resolveModel(config, gateway);
+    const gatewayProviders = gateway ? watchGatewayProviders(gateway) : null;
 
     // Install the durable half of the spend chokepoint. Module-level in
     // `usage/record.ts` rather than threaded to each call site, because the four
@@ -809,12 +947,39 @@ export class Runtime {
       return store;
     });
     const hostResourcesRateLimit = new TokenBucketRateLimit();
+    // `ai.nimblebrain/resource-arguments`: a tool's declared URIs are read,
+    // under the calling connector's record-arguments grant, from the
+    // connectors of the calling connection's own workspace, and nowhere
+    // else, and only from those the caller could read itself: an unattended
+    // run whose tool limit (stamped on the call's request context) excludes the
+    // agent's own read reads none. What is handed on is the agent's read too:
+    // text, within its character limit. Late-bound to `rt`, which is
+    // constructed below; the resolver runs only on a tool call, long after
+    // boot. It spends from the same per-(workspace, connector) budget as the
+    // host-resources methods.
+    const resourceArgumentsResolver = createResourceArgumentsResolver({
+      sourcesOf: (wsId) => {
+        if (!callMayUseTool(READ_RESOURCE_TOOL)) return [];
+        const registry = rt._workspaceRegistries.get(wsId);
+        if (!registry) return [];
+        return registry.getSources().filter((s): s is McpSource => s instanceof McpSource);
+      },
+      recordGrantOf: (wsId, connectorId) => rt.recordArgumentsGrantFor(wsId, connectorId),
+      maxChars: RECORD_READ_MAX_CHARS,
+      isHostScheme: isReservedResourceScheme,
+      rateLimit: hostResourcesRateLimit,
+    });
     const connectorMcpDepsFactory = (wsId: string) => ({
       workspaceId: wsId,
       hostResources: hostResourcesResolver,
       rateLimit: hostResourcesRateLimit,
+      resourceArguments: resourceArgumentsResolver,
     });
     lifecycle.setConnectorMcpDepsFactory(connectorMcpDepsFactory);
+    // A minted fleet connector's credential settings come from its catalog entry
+    // at every start, never from the copy its install stored. A fresh catalog per
+    // read, so an operator's catalog edit reaches the next start.
+    lifecycle.setCatalogReader(() => rt.getConnectorCatalog().catalogEntries());
 
     // Wire the connection-running notification path so URL connectors
     // whose interactive OAuth completes (after the user clicks Connect
@@ -889,8 +1054,16 @@ export class Runtime {
     const toolEligibilityCtx = { isToolEligible: isToolEligibleForCurrentRequest };
 
     // Create Runtime with empty workspace registries first — needed by system tools
+    // Built here, where the run key and the identity provider are known, so a
+    // runtime entry that cannot run as configured fails the boot.
+    const agentRuntimes = createAgentRuntimes(config.execution, config.agentRuntimes ?? [], {
+      resolveModel: resolveModelFn,
+      connectionCredential: runKey ? () => runKey.mintConnectionCredential() : null,
+      dev: identityProvider instanceof DevIdentityProvider,
+    });
     const rt = new Runtime(
       resolveModelFn,
+      agentRuntimes,
       skillMatcher,
       config,
       contextSkills,
@@ -927,6 +1100,8 @@ export class Runtime {
       // The runtime shares the store `start` opened above rather than building a
       // second one — same instance, same sink, same audit trail.
       rt._credentialStore = credentialStore;
+      rt._runKey = runKey;
+      rt._gatewayProviders = gatewayProviders;
       // The `credential` transport credential resolves a secret from the
       // connection's workspace, so it can only be registered once the store is
       // installed — which is why it is not in `registerBuiltinCredentialProviders`
@@ -1001,6 +1176,10 @@ export class Runtime {
           // a platform restart doesn't silently drop the capability for
           // already-installed connectors.
           getConnectorMcpDeps: connectorMcpDepsFactory,
+          // A minted fleet connector starts with its catalog entry's credential
+          // settings, or not at all. A fresh catalog per read: the source keeps
+          // this reader for its restarts, which must see the operator's edits.
+          readCatalog: () => rt.getConnectorCatalog().catalogEntries(),
           // A brokered connector's boot readiness is its provider's answer, not a
           // token file — the same predicate `seedUrlConnectionState` consumes.
           managedConnectors: rt.getManagedConnectorRegistry(),
@@ -1062,16 +1241,14 @@ export class Runtime {
 
       // Report Composio auth-config wiring across the whole catalog. Resolution is
       // lazy and per-connector, so it only ever runs for toolkits someone has
-      // installed, connected, or probed — the wrong set for deciding the legacy
-      // env fallback is unused (#789), or for catching an `authConfigs` key that
-      // matches no toolkit. Read-only and best-effort.
+      // installed, connected, or probed — the wrong set for catching an
+      // `authConfigs` key that matches no toolkit. Read-only and best-effort.
       await bootAuditComposioAuthConfigs({
         catalogEntries: () => rt.getConnectorCatalog().catalogEntries(),
       });
 
-      // Boot-time visibility: the locked curated registry is the platform's
-      // non-empty-Browse guarantee. Warn loudly if its resolved catalog
-      // path yields zero entries (missing/empty mount, mis-set
+      // Boot-time visibility: the connector catalog is what Browse lists.
+      // Warn loudly if its resolved catalog path yields zero entries (missing/empty mount, mis-set
       // NB_CURATED_CATALOG_DIR) so an empty Browse is diagnosable rather
       // than silent.
       await warnIfCatalogEmpty(rt.getConnectorCatalog());
@@ -1387,11 +1564,8 @@ export class Runtime {
     // configured slot: a conversation runs on one model for its life, so a
     // slot change retargets new conversations only. `makeCreateOpts` above
     // carries the pin, so a conversation created on this path is already bound
-    // and this reads back what it was born with. Absent only on legacy records
-    // predating the binding, which resolve from current config as before.
-    const resolvedModelString =
-      conversation.model ??
-      runWithRequestContext(turnCtx, () => this.resolveRequestModelString(request.model));
+    // and this reads back what it was born with.
+    const resolvedModelString = conversation.model;
 
     const handle = await this.startRun({
       trigger: "chat",
@@ -1442,6 +1616,7 @@ export class Runtime {
       toolCalls: handle.toolCalls,
       stopReason: handle.stopReason,
       usage: handle.usage,
+      costUsd: handle.costUsd,
     };
   }
 
@@ -1457,8 +1632,8 @@ export class Runtime {
    *    own run).
    *  - The prompt goes in as a plain user message — no content parts, no file
    *    refs, and no trigger matching: a task description is not a phrase a skill
-   *    should claim. Layer 3 (connector workflow guidance) still applies based on
-   *    the active tool set.
+   *    should claim. A skill bound to a tool reaches the model when the run
+   *    calls that tool, as in chat.
    *  - The system prompt is composed in task mode, prepending `TASK_IDENTITY`
    *    so the model produces a deliverable rather than a conversational reply.
    *    The runtime owns this framing — connectors cannot spoof it by wrapping the
@@ -1526,15 +1701,20 @@ export class Runtime {
         content: [{ type: "text", text: request.prompt }],
         userId: requestIdentity.id,
         ...(request.allowedTools ? { allowedTools: request.allowedTools } : {}),
+        ...(request.skills?.length ? { skills: request.skills } : {}),
       },
       budget: {
         ...(request.maxIterations !== undefined ? { maxIterations: request.maxIterations } : {}),
         ...(request.maxRunInputTokens !== undefined
           ? { maxRunInputTokens: request.maxRunInputTokens }
           : {}),
+        ...(request.maxRunDurationMs !== undefined
+          ? { maxRunDurationMs: request.maxRunDurationMs }
+          : {}),
         ...(request.spendAccounts ? { spendAccounts: request.spendAccounts } : {}),
       },
       model: this.resolveRequestModelString(request.model),
+      ...(request.thinkingEffort ? { thinkingEffort: request.thinkingEffort } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(request.runId ? { runId: request.runId } : {}),
       ...(requestSink ? { sink: requestSink } : {}),
@@ -1550,6 +1730,8 @@ export class Runtime {
       stopReason: handle.stopReason,
       ...stopDetail(handle),
       usage: handle.usage,
+      costUsd: handle.costUsd,
+      skillsDelivered: handle.skillsDelivered,
     };
   }
 
@@ -1621,6 +1803,9 @@ export class Runtime {
         : new WorkspaceMembershipRevokedError(ownerId, spec.workspaceId);
     }
 
+    // Refused here, before anything is written or bound, like the gate.
+    const agentRuntime = this.agentRuntimeFor(spec);
+
     // The run's correlation anchor, stamped on the request context for audit
     // and file correlation and returned to the caller. A caller that handed out
     // a handle for the run before it started names the id it minted.
@@ -1652,7 +1837,7 @@ export class Runtime {
     });
     const resolvedThinking = resolveThinking({
       configMode: this.config.thinking,
-      configEffort: this.config.thinkingEffort,
+      configEffort: spec.thinkingEffort ?? this.config.thinkingEffort,
       configBudgetTokens: this.config.thinkingBudgetTokens,
       model: spec.model,
     });
@@ -1693,12 +1878,11 @@ export class Runtime {
     // Build pre-emit run telemetry tied to the engine's runId. The engine fires
     // these immediately after `run.start` and before any LLM call so the log
     // records what the prompt looked like for this run — even if the LLM call
-    // fails or the process is killed. Reports every loading mechanism, not just
-    // tool-affinity: the trigger match and the always-on context skills
-    // (persona + org/workspace/user + connector always-on; vendored core excluded).
+    // fails or the process is killed. Reports the skills composed at turn start:
+    // the trigger match and the always-on context skills (persona +
+    // org/workspace/user + connector always-on; vendored core excluded).
     const skillsLoaded = buildSkillsLoadedPayload(
       collectLoadedSkills({
-        toolAffinity: composed.selectedLayer3,
         trigger: composed.skillMatch,
         alwaysOn: composed.alwaysOnSkills,
       }),
@@ -1711,13 +1895,20 @@ export class Runtime {
     });
 
     // Evict the volatile head onto the latest user message so a per-run change
-    // (date, app/focused-app state, matched skill) no longer rewrites the
+    // (date, app/focused-app state, matched skill) does not rewrite the
     // 1h-cached system prefix. Telemetry above counts every segment via
     // `systemPrompt`; the prepend runs after it, so history isn't double-counted.
     // Falls back to folding the head into the system string when there's no user
     // message to carry it (keeps the content, forgoes the cache win).
     const engineSystem = resolveEngineSystem(messages, stableSystem, volatileHead);
 
+    const deadline = runDeadline({
+      signal: spec.signal,
+      ownLimitMs: spec.budget.maxRunDurationMs,
+      credentialed: this.mintsModelCredential(agentRuntime),
+      ceilingMs: this.getTasksConfig().maxRunDurationMs,
+      runtimeId: agentRuntime.id,
+    });
     const engineConfig = this.buildTurnEngineConfig({
       model: spec.model,
       requestMaxIterations: spec.budget.maxIterations,
@@ -1732,14 +1923,19 @@ export class Runtime {
       // From the UN-rehydrated history — this is what makes surface-ONCE hold
       // across turns. A fresh one-shot run has a single user message and no
       // prior history, so its set is empty.
-      alreadyInjectedConnectorSkills: this.collectInjectedConnectorSkills(effectiveHistory),
-      signal: spec.signal,
+      // A declared skill is in the system prompt, so no channel delivers it again.
+      alreadyInjectedConnectorSkills: [
+        ...this.collectInjectedConnectorSkills(effectiveHistory),
+        ...composed.declaredSkills.map((s) => s.name),
+      ],
+      signal: deadline.signal,
     });
 
-    // The per-run usage accumulator is joined to the sink chain only where an
-    // abort must still report — see {@link createPartialRunAccumulator}.
+    // The per-run accumulator prices every run, and stands in for the engine's
+    // totals where an abort must still report — see {@link createPartialRunAccumulator}.
     const partial = createPartialRunAccumulator();
-    const sinks = this.buildRunSinks(spec, binding, partial.sink);
+    const deliveries = createSkillDeliveryLog(composed.declaredSkills);
+    const sinks = [...this.buildRunSinks(spec, binding, partial.sink), deliveries.sink];
 
     // ── The engine ──────────────────────────────────────────────────────────
     // The engine's tool router is identity-bound but WALLED to one workspace.
@@ -1767,7 +1963,6 @@ export class Runtime {
       allowedTools: spec.input.allowedTools,
       attended,
     });
-    const engine = new AgentEngine(this.resolveModelFn(spec.model), identityToolRouter, engineSink);
 
     // Tool handlers that need the per-call workspace must come through a
     // `WorkspaceContext` constructed by the orchestrator, NOT via
@@ -1775,7 +1970,7 @@ export class Runtime {
     // `workspaceId`, which is the right answer for session-scoped reads
     // (overlays, file store) and the wrong one for per-call data. Per-call
     // handlers should take a `WorkspaceContext` argument from the dispatch
-    // path instead. T008 (credential rebinding) tightens this further.
+    // path instead.
     engineConfig.toolPromotion = this.buildToolPromotionFactory();
 
     // ── The spend accounts ──────────────────────────────────────────────────
@@ -1797,11 +1992,44 @@ export class Runtime {
     // the llm.call and tool.dispatch spans nest under it.
     let result: EngineResult;
     try {
-      result = await runWithRequestContext(reqCtx, () =>
+      result = await runWithRequestContext(agentExecutionContext(reqCtx, agentRuntime), () =>
         withSpan(
           "agent.turn",
-          { "llm.model": spec.model, "run.trigger": spec.trigger, ...requestIdentityAttrs() },
-          () => engine.run(engineConfig, engineSystem, messages, tools),
+          {
+            "llm.model": spec.model,
+            "run.trigger": spec.trigger,
+            "run.runtime": agentRuntime.id,
+            ...requestIdentityAttrs(),
+          },
+          () =>
+            agentRuntime.execute(
+              {
+                runId,
+                conversationId,
+                system: engineSystem,
+                messages,
+                tools,
+                config: engineConfig,
+                ...(engineConfig.hooks?.rewriteHistory
+                  ? { compaction: { model: this.getModelSlot("fast") } }
+                  : {}),
+                ...this.runModelCredential(agentRuntime, runId, spec.workspaceId, deadline),
+              },
+              {
+                tools: identityToolRouter,
+                events: engineSink,
+                billSummary: (model, usage, llmMs) =>
+                  binding
+                    ? this.billCompactionUsage(
+                        binding.store,
+                        binding.conversation.id,
+                        model,
+                        usage,
+                        llmMs,
+                      )
+                    : recordLlmCall({ source: "compaction", model, usage, llmMs }),
+              },
+            ),
         ),
       );
     } catch (err) {
@@ -1820,8 +2048,11 @@ export class Runtime {
         toolCalls: partial.toolCalls,
         stopReason: "aborted",
         usage: partial.usage(spec.model),
+        costUsd: partial.costUsd(),
+        skillsDelivered: deliveries.list,
       };
     } finally {
+      deadline.clear();
       releaseSpend();
     }
 
@@ -1840,10 +2071,55 @@ export class Runtime {
         llmMs: result.llmMs,
         iterations: result.iterations,
       },
+      costUsd: partial.costUsd(),
+      skillsDelivered: deliveries.list,
     };
   }
 
   // ── run-start door helpers ───────────────────────────────────────
+
+  /** Whether a run on this runtime carries a per-run model credential the door mints. */
+  private mintsModelCredential(agentRuntime: AgentRuntime): boolean {
+    return agentRuntime.capabilities.modelCredential === "session" && this._runKey !== null;
+  }
+
+  /**
+   * The run's model credential, minted as the run starts and held in memory
+   * only (ADR-0057), lasting as long as the run may (`runDeadline`). Empty for a
+   * run on a runtime that takes none.
+   */
+  private runModelCredential(
+    agentRuntime: AgentRuntime,
+    runId: string,
+    workspaceId: string,
+    deadline: RunDeadline,
+  ): { modelCredential?: string } {
+    if (!this._runKey || !this.mintsModelCredential(agentRuntime)) return {};
+    return {
+      modelCredential: this._runKey.mintModelCredential({
+        runId,
+        workspaceId,
+        ...(deadline.limitMs !== undefined ? { maxRunDurationMs: deadline.limitMs } : {}),
+      }),
+    };
+  }
+
+  /**
+   * The agent runtime a run executes on (`execution.default`), if it can hold
+   * the run to its terms: a run that names spend accounts or caps its input
+   * tokens needs a runtime that checks every model call against them.
+   */
+  private agentRuntimeFor(spec: RunSpec): AgentRuntime {
+    const agentRuntime = this.agentRuntimes.select(this.config.execution?.default);
+    if (agentRuntime.capabilities.spendGate) return agentRuntime;
+    if (spec.budget.spendAccounts?.length) {
+      throw new RuntimeCannotHoldRunError(agentRuntime.id, "the run names spend accounts");
+    }
+    if (spec.budget.maxRunInputTokens !== undefined) {
+      throw new RuntimeCannotHoldRunError(agentRuntime.id, "the run caps its input tokens");
+    }
+    return agentRuntime;
+  }
 
   /**
    * Hold the run's spend accounts open and hand them to the engine as
@@ -1863,12 +2139,18 @@ export class Runtime {
   }
 
   /**
+   * The installed apps the prompt narrates. `wsId` is the conversation's own
+   * (chat) or focused (task) workspace; `undefined` (an unfocused task) has none.
+   */
+  private async briefingApps(wsId: string | undefined): Promise<PromptAppInfo[]> {
+    return wsId ? this.buildAppsList(wsId) : [];
+  }
+
+  /**
    * The prompt a run reasons with, and the tool surface it reasons over.
    *
-   * One phase, because the two are a cycle otherwise: the matched skill's
-   * `allowed-tools` feeds `surfaceTools`, and the surfaced set is what
-   * tool-affinity Layer 3 selection reads. Splitting discovery (registry only)
-   * from selection (needs the toolset) breaks it.
+   * One phase, because both follow from the trigger match: the matched skill
+   * composes into the prompt, and its `allowed-tools` feeds `surfaceTools`.
    *
    * Every pool it reads is read exactly once — the filesystem skill tiers, the
    * workspace's server-published connector skills, and the connector-overlay store
@@ -1887,7 +2169,7 @@ export class Runtime {
     const binding = spec.conversation;
 
     // Conversation-scoped skill suppression, applied to the POOLS rather than
-    // to the channel routers. `partitionSkillsByRole` and `selectLayer3Skills`
+    // to the channel routers. `partitionSkillsByRole` and the engine's hold
     // read the durable `manifest.status` and that logic is correct — a skill the
     // operator retired stays off everywhere. This is the other axis: "not for
     // this task", held in one conversation's own event log, so it steers that
@@ -1903,9 +2185,7 @@ export class Runtime {
       ? collectSuppressedSkillNames(await binding.store.readEvents(binding.conversation.id))
       : new Set<string>();
 
-    // The briefing (installed apps + the instruction overlays) describes the
-    // workspace the prompt narrates; empty for a run that narrates none.
-    const { apps, liveOverlays } = await this.buildWorkspaceBriefing(briefingWsId);
+    const apps = await this.briefingApps(briefingWsId);
 
     // App scoping (§7 app-aware chat), resolved in the SAME single workspace
     // the run's tools are bound to.
@@ -1944,9 +2224,9 @@ export class Runtime {
     //
     // Partitioned by ROLE once: `context` skills (every tier) compose into the
     // always-on Layer 0/1 channel; `capability` skills feed the conditional
-    // channels (keyword matcher + tool-affinity Layer 3). Disjoint by `type`,
+    // channels (keyword matcher + bound-skill delivery). Disjoint by `type`,
     // so nothing is injected twice — no downstream de-dup. Computed ONCE and
-    // threaded into `selectRequestLayer3` below, so the disk read happens a
+    // threaded into the catalog and bound-skill candidates below, so the disk read happens a
     // single time per run.
     const userId = identity.id;
     const { context: poolContext, capability: poolCapability } = partitionSkillsByRole(
@@ -1956,11 +2236,9 @@ export class Runtime {
     // Server-published skills, discovered and routed by declared strategy. This
     // runs HERE — after the workspace registry exists (`ensureWorkspaceRegistry`
     // above; discovery reads it and silently yields nothing without it), and
-    // before the matcher — because the run is a cycle otherwise: the matched
-    // skill feeds `surfaceTools`, whose output is the active toolset that
-    // tool-affinity selection needs. Splitting discovery (registry only) from
-    // selection (needs the toolset) breaks it. The partition is threaded into
-    // `selectRequestLayer3` below, so discovery still happens once per run.
+    // before the matcher, which takes its `capability` skills as candidates.
+    // The partition is threaded into the catalog and candidates below, so
+    // discovery happens once per run.
     const connectorPoolRaw = await this.discoverConnectorSkillsByRole(spec.workspaceId, {
       // Exclude only the ONE skill `<app-guide>` carries, resolved above — not
       // the entered server (its other skills must still route by strategy), and
@@ -2014,44 +2292,27 @@ export class Runtime {
     const prefs = buildPromptPrefs(identity);
     const workspaceContext = buildWorkspaceContext(briefingWsId, activeWorkspace);
 
-    // Skill selection over the pools gathered above. Server-published skills
-    // route by the strategy they DECLARE: `dynamic` ones join tool-affinity
-    // Layer 3 (loading when the connector's tools are surfaced, no `appContext`
-    // scoping required); `always` ones (`connectorContext`) compose into the
-    // always-on context channel below, the same reliable every-run path
-    // filesystem `always` skills use.
+    // Server-published skills route by the strategy they DECLARE: `dynamic`
+    // ones join the bound-skill candidates (delivered when the model calls a
+    // tool they are bound to); `always` ones (`connectorContext`) compose into
+    // the always-on context channel below, the same every-run path filesystem
+    // `always` skills use.
     //
     // Workspace-tier skills follow the run's own workspace, matching the
     // briefing / apps / overlay surfaces. Both precomputed pools are threaded
     // in — the skill disk read and the connector discovery each happen once per
     // run, not twice.
-    const {
-      context: connectorContextSelected,
-      capability: connectorCapability,
-      layer3: selectedLayer3Unloaded,
-    } = await this.selectRequestLayer3({
-      wsId: spec.workspaceId,
-      userId,
-      activeToolNames: tools.map((t) => t.name),
-      capabilityPool: poolCapability,
-      // No `excludeSkill` here: it only steers discovery, and discovery
-      // already ran with it above. The entered app's exclusion is inherited from
-      // `connectorPool` rather than restated as a second argument that has to agree
-      // with the first — the same reason `toConnectorSkillCandidates` takes a pool.
-      connectorPool,
-    });
+    const { context: connectorContextSelected, capability: connectorCapability } = connectorPool;
 
     // Server-published skills carry no body until one is needed (the MCP Skills
-    // Extension forbids fetching a skill's files ahead of need). Every skill
-    // selected above is about to reach the model, so this is where their
-    // bodies are fetched: `always` skills every turn, the matched and
-    // tool-affinity skills when selected. A body served from the digest cache
+    // Extension forbids fetching a skill's files ahead of need). The `always`
+    // skills and the trigger-matched skill are about to reach the model, so
+    // this is where their bodies are fetched. A body served from the digest cache
     // is byte-identical turn to turn, so the cached prefix holds. A skill whose
     // body cannot be fetched or verified drops out of this turn.
-    const [connectorContext, matchedSkill, selectedLayer3] = await Promise.all([
+    const [connectorContext, matchedSkill] = await Promise.all([
       hydrateSkills(connectorContextSelected),
       skill ? hydrateSkill(skill) : Promise.resolve(null),
-      hydrateSelected(selectedLayer3Unloaded),
     ]);
     const composedMatch =
       skillMatch && matchedSkill ? { ...skillMatch, skill: matchedSkill } : null;
@@ -2059,14 +2320,9 @@ export class Runtime {
     // Always-on context channel: the `always` skills across every tier
     // (core/builtin/org + workspace + user) plus the always-on connector skills.
     const requestContextSkills = [...poolContext, ...connectorContext];
-    const layer3Entries: Layer3SkillEntry[] = selectedLayer3.map((s) => ({
-      name: s.skill.manifest.name,
-      body: s.skill.body,
-      scope: s.skill.manifest.scope ?? "org",
-      ...(s.skill.sourcePath ? { sourcePath: s.skill.sourcePath } : {}),
-      loadedBy: s.loadedBy,
-      reason: s.reason,
-    }));
+    // The trigger-matched skill is already in the prompt this turn, so no
+    // other channel delivers it again.
+    const composedNames = skill ? [skill.manifest.name] : [];
 
     // Skill catalog + surface-once candidates share one read of the workspace's
     // connector-overlay store — the pools are all computed above on this path
@@ -2078,18 +2334,30 @@ export class Runtime {
       this.loadConnectorSkillCandidates(spec.workspaceId),
       suppressed,
     );
-    // The catalog is loaded through `nb__use_skill`, so a run whose list does
-    // not name that tool gets no catalog rather than one it cannot open.
-    const skillCatalog =
-      runAllowedTools && !isToolAllowedForRun("nb__use_skill", runAllowedTools)
-        ? []
-        : toCatalogEntries(
-            collectActivatableSkills({
-              fsCapability: poolCapability,
-              connectorCapability,
-              connectorCandidates: connectorOverlayCandidates,
-            }),
-          );
+    // Every run can open the catalog: `nb__use_skill` passes any `allowedTools`
+    // (`isToolAllowedForRun`), so the catalog is never offered unopenable.
+    const activatable = collectActivatableSkills({
+      fsCapability: poolCapability,
+      connectorCapability,
+      connectorCandidates: connectorOverlayCandidates,
+    });
+    const skillCatalog = toCatalogEntries(activatable);
+    const declaredSkills = await resolveDeclaredSkills(spec.input.skills, activatable, [
+      ...requestContextSkills.map((s) => s.manifest.name),
+      ...composedNames,
+    ]);
+
+    // Declared bodies join the stable Layer 3 section, not the opening message:
+    // they are the same on every run of the task, and only the system prefix
+    // is cached across runs (the opening message's breakpoint falls after the
+    // run's own input, which differs run to run).
+    const layer3Entries: Layer3SkillEntry[] = declaredSkills.map((s) => ({
+      name: s.name,
+      body: s.body,
+      scope: s.scope,
+      loadedBy: "declared" as const,
+      reason: "named by the run's task",
+    }));
 
     // Task mode prepends TASK_IDENTITY so an unattended run produces a
     // deliverable rather than a conversational reply. The runtime owns that
@@ -2103,7 +2371,6 @@ export class Runtime {
       prefs,
       proxied.length > 0,
       workspaceContext,
-      liveOverlays,
       layer3Entries,
       attended ? "chat" : "task",
       skillCatalog,
@@ -2118,12 +2385,14 @@ export class Runtime {
       hasProxiedTools: proxied.length > 0,
       skill: matchedSkill,
       skillMatch: composedMatch,
-      selectedLayer3,
       alwaysOnSkills: requestContextSkills,
-      connectorSkillCandidates: [
-        ...connectorOverlayCandidates,
-        ...this.toConnectorSkillCandidates(connectorCapability, selectedLayer3),
-      ],
+      connectorSkillCandidates: boundSkillCandidates({
+        fsCapability: poolCapability,
+        connectorCapability,
+        overlays: connectorOverlayCandidates,
+        alreadyComposed: composedNames,
+      }),
+      declaredSkills,
       stableSystem,
       volatileHead,
       systemPrompt,
@@ -2133,10 +2402,10 @@ export class Runtime {
   /**
    * The run's event-sink chain.
    *
-   * The engine returns cumulative usage and llmMs in its `EngineResult`, so the
-   * clean path needs no side-channel metrics collector; the partial accumulator
-   * joins only for a run whose caller must still be told what happened after an
-   * abort.
+   * The engine returns cumulative usage and llmMs in its `EngineResult`; the
+   * partial accumulator joins every run to price it call by call, and its
+   * totals replace the engine's only for a run whose caller must still be told
+   * what happened after an abort.
    */
   private buildRunSinks(
     spec: RunSpec,
@@ -2152,7 +2421,9 @@ export class Runtime {
       binding.store.setActiveConversation(binding.conversation.id);
       sinks.push(binding.store);
     }
-    if (spec.onAbort === "partial") sinks.push(partialSink);
+    // On every run: it prices the run. Its usage and tool calls stand in for
+    // the engine's only when a run with `onAbort: "partial"` aborts.
+    sinks.push(partialSink);
     return sinks;
   }
 
@@ -2326,16 +2597,15 @@ export class Runtime {
   // ── chat / task turn helpers (shared setup) ──────────────────────
 
   /**
-   * Resolve the request model string: resolve a slot name (bare or `alias:`-
-   * prefixed) to its configured model, then qualify the bare id.
+   * Resolve the request model string: a slot name (bare or `alias:`-prefixed)
+   * resolves to its configured model; anything else must already be
+   * `provider:model`, and a bare id is refused naming the qualified form.
    *
    * Slot reads go through `getModelSlot`, so a workspace's per-request model
-   * override (carried on the RequestContext) applies here too, and the value
-   * comes back already qualified. The `request.model` override bypasses that
-   * reader, so the qualify step covers both. Qualifying at the request-entry
-   * boundary lets the rest of the pipeline — cost aggregation, capability
-   * checks, the max-output and thinking resolvers, provider-options shape,
-   * log lines — read `engineConfig.model` and depend on it being qualified.
+   * override (carried on the RequestContext) applies here too. The rest of the
+   * pipeline — cost aggregation, capability checks, the max-output and
+   * thinking resolvers, provider-options shape, log lines — reads
+   * `engineConfig.model` and depends on it being qualified.
    *
    * Both request doors (chat and task) resolve through here; a second copy
    * is how the two drift.
@@ -2348,33 +2618,16 @@ export class Runtime {
     if (slot) return this.getModelSlot(slot);
 
     // A concrete model named by the caller is the one untrusted value here,
-    // and since #892 it is written to the conversation's immutable pin. An
-    // unchecked value would not overspend for a turn; it would seal the
-    // conversation to a disallowed model for life, past any later policy change.
-    // Checked before qualification, not after: `resolveModelString("")` is
-    // `"anthropic:"`, so a floor applied to the qualified form never sees an
-    // empty id at all.
+    // and it is written to the conversation's immutable pin. An unchecked value
+    // would not overspend for a turn; it would seal the conversation to a
+    // disallowed model for life, past any later policy change.
+    // An empty id is malformed rather than bare, and is refused as not
+    // permitted below.
+    if (requestModel.trim() !== "") requireQualifiedModelId(requestModel);
     if (!this.isModelPermitted(requestModel)) {
-      throw new ModelNotAllowedError(
-        resolveModelString(requestModel),
-        this.getConfiguredProviders(),
-      );
+      throw new ModelNotAllowedError(requestModel, this.getConfiguredProviders());
     }
-    return resolveModelString(requestModel);
-  }
-
-  /**
-   * The workspace briefing surfaces (apps + the workspace overlay) for a turn.
-   * `wsId` is the conversation's own (chat) or focused (task) workspace;
-   * `undefined` (an unfocused task) yields empty apps and an empty overlay.
-   */
-  private async buildWorkspaceBriefing(wsId: string | undefined): Promise<{
-    apps: PromptAppInfo[];
-    liveOverlays: { workspace: string };
-  }> {
-    const apps = wsId ? await this.buildAppsList(wsId) : [];
-    const liveOverlays = wsId ? await this.readPromptOverlays(wsId) : { workspace: "" };
-    return { apps, liveOverlays };
+    return requestModel;
   }
 
   /**
@@ -2537,13 +2790,10 @@ export class Runtime {
   private emitChatStart(
     requestSink: EventSink | undefined,
     conversationId: string,
-    model: string | undefined,
+    model: string,
   ): void {
     if (!requestSink) return;
-    requestSink.emit({
-      type: "chat.start",
-      data: { conversationId, ...(model ? { model } : {}) },
-    });
+    requestSink.emit({ type: "chat.start", data: { conversationId, model } });
   }
 
   /**
@@ -2652,7 +2902,7 @@ export class Runtime {
     };
   }
 
-  // ── Stage 2 (T006) — identity-bound chat helpers ─────────────────
+  // ── Identity-bound chat helpers ──────────────────────────────────
 
   /**
    * Construct the chat surface's identity-bound `ToolRouter`.
@@ -3110,8 +3360,8 @@ export class Runtime {
    * `null` when it cannot be used this turn.
    *
    * Called only where the body is about to reach the model: an `always` skill
-   * every turn, a `dynamic` skill when tool-affinity or a trigger selects it or
-   * a surface-once candidate fires, a catalog skill on `nb__use_skill`, and an
+   * every turn, a `dynamic` skill when a trigger matches it or a call to a
+   * tool it is bound to delivers it, a catalog skill on `nb__use_skill`, and an
    * entered app's primary skill. The `SKILL.md` is read with `resources/read`
    * from the workspace's own instance of the server and verified against the
    * listing entry (digest, size, frontmatter); content that fails is never used.
@@ -3232,10 +3482,10 @@ export class Runtime {
    * honoring the loading strategy the skill declares in its frontmatter. A
    * `dynamic` skill (the default when none is declared) tool-affines to the
    * server's tools it declares, or to `<serverName>__*` when it declares none
-   * (`connectorToolAffinity`), and loads via `selectLayer3Skills` when a
-   * matching tool is in the active toolset; an `always` skill routes to the context
-   * channel. Callers partition the returned pool by role (see
-   * `selectRequestLayer3`) — no `appContext` required.
+   * (`connectorToolAffinity`), and reaches the model before the first call to a
+   * matching tool (ADR-0053); an `always` skill routes to the context channel.
+   * Callers partition the returned pool by role (`partitionSkillsByRole`); no
+   * `appContext` required.
    *
    * Use case: a workspace-level chat where the model needs the server's
    * workflow guidance but isn't "entered" into the app. Without this, the
@@ -3337,7 +3587,7 @@ export class Runtime {
               ...(s.loadingStrategy ? { loadingStrategy: s.loadingStrategy } : {}),
               ...(s.priority !== undefined ? { priority: s.priority } : {}),
               ...(s.triggers?.length ? { triggers: s.triggers } : {}),
-              ...(s.toolAffinity?.length ? { toolAffinity: s.toolAffinity } : {}),
+              ...(s.toolAffinity !== undefined ? { toolAffinity: s.toolAffinity } : {}),
             }),
           );
         } catch {
@@ -3352,14 +3602,6 @@ export class Runtime {
   /**
    * Build apps list from in-memory lifecycle instances for system-prompt
    * injection (§7.3).
-   *
-   * Each app's `customInstructions` overlay comes from the connector itself —
-   * the platform reads `app://instructions` from the connector's MCP
-   * server on every assembly. Connectors that don't publish that resource get
-   * no overlay (no UI surfaces, no behavior change). The platform's job is
-   * the convention: read the URI, wrap the body in `<app-custom-instructions>`
-   * containment in `formatAppsSection`. Connectors own storage, the agent tool
-   * to write, validation, and the editor UI.
    */
   /** Public so the compose-effective-context debug tool can re-gather the same
    *  inputs `runtime.chat()` uses, without duplicating the connector-instructions
@@ -3397,8 +3639,9 @@ export class Runtime {
 
   /**
    * Assemble one app's system-prompt entry: UI descriptor, the MCP server's
-   * `initialize.instructions`, and the optional `app://instructions`
-   * custom-instructions overlay.
+   * `initialize.instructions`, and the record shapes it serves. Guidance a
+   * user sets for one app is a workspace skill bound to its tools, not a
+   * resource read from the connector.
    */
   private async buildAppInfo(
     instance: ConnectorInstance,
@@ -3412,69 +3655,26 @@ export class Runtime {
     // resources that explain correct tool usage. Without this hint the
     // agent cannot discover that such resources exist.
     let instructions: string | undefined;
-    let customInstructions: string | undefined;
+    let resourceTemplates: PromptAppInfo["resourceTemplates"] = [];
     const source = registry?.getSource(instance.serverName);
     if (source instanceof McpSource) {
       instructions = source.getInstructions();
-      customInstructions = await this.readAppCustomInstructions(source, instance.serverName);
+      const templates = await source.resourceTemplates();
+      // The record shapes this connector serves, so the model knows
+      // `nb__read_resource` reads them (ADR-0049).
+      resourceTemplates = readableRecordTemplates(templates).map((t) => ({
+        uriTemplate: t.uriTemplate,
+        name: t.title ?? t.name,
+      }));
     }
 
     return {
       name: instance.serverName,
       description: instance.description,
       instructions,
-      ...(customInstructions !== undefined ? { customInstructions } : {}),
+      ...(resourceTemplates.length > 0 ? { resourceTemplates } : {}),
       ui,
     };
-  }
-
-  /**
-   * Read a connector's `app://instructions` custom-instructions overlay. Returns
-   * the trimmed non-empty body, or `undefined` when the connector doesn't publish
-   * the resource (or the read errors) — the normal not-supported case.
-   */
-  private async readAppCustomInstructions(
-    source: McpSource,
-    serverName: string,
-  ): Promise<string | undefined> {
-    // A connector that supports user-set custom instructions publishes its current
-    // overlay body at this URI; the platform reads it on every assembly and
-    // renders it inside `<app-custom-instructions>` containment in
-    // `formatAppsSection`.
-    //
-    // Why a fixed `app://` over `<serverName>://instructions`: the serverName is
-    // platform-derived (e.g. `@nimblebraininc/synapse-collateral` →
-    // `synapse-collateral`), not something a connector author intuitively knows.
-    // A fixed scheme means connector authors just remember `app://instructions`
-    // and the platform's name-derivation rules are not part of the contract.
-    // That makes the scheme the host's rather than the connector's, which is why
-    // `tools/resource-schemes.ts` owns the URI and reserves it against an
-    // outbox declaring the same address.
-    //
-    // Resource-not-found returns `null` from `readResource` (the SDK's normal
-    // not-found path); we treat any read error or empty body as "connector does
-    // not support / has none". Plain MCP servers (no opt-in) end up here.
-    try {
-      const data = await source.readResource(APP_INSTRUCTIONS_URI);
-      const body = data?.text;
-      const trimmedLen = typeof body === "string" ? body.trim().length : 0;
-      // Visible under NB_DEBUG=mcp — confirms the platform fetched
-      // app://instructions per active connector and shows the resulting body
-      // length. "len=0" + "set=false" for connectors that don't publish;
-      // "set=true" + len=N for connectors that do.
-      log.debug(
-        "mcp",
-        `app-instructions source=${serverName} fetched=${data !== null} len=${trimmedLen} set=${trimmedLen > 0}`,
-      );
-      if (typeof body === "string" && body.trim().length > 0) return body;
-      return undefined;
-    } catch (err) {
-      log.debug(
-        "mcp",
-        `app-instructions source=${serverName} error=${err instanceof Error ? err.message : String(err)}`,
-      );
-      return undefined;
-    }
   }
 
   /** Get the default event sink. */
@@ -3494,31 +3694,6 @@ export class Runtime {
    */
   getConnectorMcpDeps(wsId: string): ConnectorMcpDeps | undefined {
     return this._connectorMcpDepsFactory?.(wsId);
-  }
-
-  /**
-   * Get a per-workdir `InstructionsStore` for the workspace overlay.
-   * Per-connector instructions are NOT stored here — connectors own their storage
-   * and publish a `app://instructions` resource if and only if they
-   * support the convention. The store is stateless aside from the rooted
-   * workdir, so a fresh instance per call is fine.
-   */
-  getInstructionsStore(): InstructionsStore {
-    return new InstructionsStore(this.getWorkDir());
-  }
-
-  /**
-   * Read the workspace instruction overlay for a system-prompt
-   * assembly. Per-connector overlays are NOT read here — they're populated on
-   * `PromptAppInfo.customInstructions` directly in `buildAppsList`.
-   *
-   * Reads happen on every call (no caching) per the locked decision: edits
-   * must apply mid-conversation.
-   */
-  /** Public so the compose-effective-context debug tool can re-read the overlay
-   *  in live mode. Workspace-scoped; no caller-controlled escalation. */
-  async readPromptOverlays(wsId: string): Promise<{ workspace: string }> {
-    return { workspace: await this.getInstructionsStore().read({ wsId }) };
   }
 
   /** Get the ToolRegistry for a specific workspace. Throws if workspace registry not found. */
@@ -3554,6 +3729,21 @@ export class Runtime {
     if (this._systemSource?.name === name) return this._systemSource;
     if (isIdentitySource(name)) return undefined;
     return this._platformSources.find((s) => s.name === name);
+  }
+
+  /**
+   * The platform apps' `initialize.instructions`: how to use their tools, for a
+   * remote MCP client, which reaches them through `/mcp`. The door serves them
+   * ahead of the workspace's connectors' own (`doorInstructions`). Undefined
+   * when no app declares any.
+   */
+  platformInstructions(): string | undefined {
+    const parts: string[] = [];
+    for (const source of this._platformSources) {
+      const text = source instanceof McpSource ? source.getInstructions()?.trim() : undefined;
+      if (text) parts.push(text);
+    }
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
   }
 
   /**
@@ -4090,7 +4280,7 @@ export class Runtime {
    * this seam exists to avoid.
    *
    * **Order is not a preference.** Teardown runs BEFORE the rename.
-   * `on_removing` needs the bundle still reachable, and the credential cleanup
+   * `on_removing` needs the connector still reachable, and the credential cleanup
    * inside `lifecycle.uninstall` needs the credential directory at its live
    * path; after the rename both address a tree that has moved.
    *
@@ -4184,6 +4374,16 @@ export class Runtime {
    */
   getCredentialStore(): CredentialStore {
     return this._credentialStore ?? requireCredentialStore();
+  }
+
+  /**
+   * The installation's run key, or `null` when none is configured: the key
+   * the door mints a turn's credentials with, and whose public halves the
+   * runtime serves for a gateway to verify them (ADR-0057). Absent, the runtime
+   * runs every turn in process and mints nothing.
+   */
+  getRunKey(): RunKey | null {
+    return this._runKey;
   }
 
   /**
@@ -4603,6 +4803,34 @@ export class Runtime {
     return out;
   }
 
+  /**
+   * The record-arguments grant `serverName` holds in `wsId` (ADR-0058), or null
+   * when it holds none: its operator-trusted catalog entry must declare
+   * `record_arguments`, and the workspace's `recordSources` narrows it to the
+   * named connectors, or revokes it when empty. A `recordSources` that is not a
+   * list of names grants nothing.
+   */
+  async recordArgumentsGrantFor(
+    wsId: string,
+    serverName: string,
+  ): Promise<RecordArgumentsGrant | null> {
+    if (!(await this.catalogGrantsRecordArguments(wsId, serverName))) return null;
+    const ws = await this._workspaceStore.get(wsId);
+    const ref = ws?.connectors.find((r) => serverNameFromRef(r) === serverName);
+    if (!ref) return null;
+    // `recordSources` is read from workspace.json, so its declared type is a
+    // claim about the bytes, not a guarantee.
+    const sources: unknown = ref.recordSources;
+    if (sources === undefined) return { sources: "all" };
+    if (!Array.isArray(sources) || !sources.every((s) => typeof s === "string")) return null;
+    return sources.length > 0 ? { sources: new Set(sources) } : null;
+  }
+
+  /** Whether the operator's catalog grants `serverName`, as installed in `wsId`, record arguments. */
+  async catalogGrantsRecordArguments(wsId: string, serverName: string): Promise<boolean> {
+    return (await this.trustedCatalogEntryFor(wsId, serverName))?.recordArguments === true;
+  }
+
   /** The operator-trusted catalog entry a connector installed in `wsId` is. */
   private async trustedCatalogEntryFor(
     wsId: string,
@@ -4872,18 +5100,6 @@ export class Runtime {
     return this._instanceConfig;
   }
 
-  /** Get the resolved model slots (all three, with fallback logic).
-   *  When a workspace model override is active (set per-request in chat()),
-   *  workspace slots are merged over instance defaults.
-   *
-   *  All slot values are returned in fully-qualified `provider:id` form.
-   *  Stored config can contain bare ids (legacy state from older settings
-   *  UI saves); qualifying at the slot reader means every consumer of
-   *  this method — engine config, get_config tool (which feeds the
-   *  dropdown), telemetry, briefing — sees the same qualified shape
-   *  without each having to remember to call `resolveModelString`. The
-   *  per-request `request.model` override path (in `chat()`) qualifies
-   *  separately because it bypasses this reader. */
   /**
    * The slots as *configured* — no request-scoped overlay.
    *
@@ -4908,19 +5124,32 @@ export class Runtime {
       else if (value !== undefined) models[slot] = value;
     }
     return {
-      default: resolveModelString(models.default ?? DEFAULT_MODEL),
-      fast: resolveModelString(models.fast ?? DEFAULT_MODEL),
+      default: models.default ?? DEFAULT_MODEL,
+      fast: models.fast ?? DEFAULT_MODEL,
     };
   }
 
+  /**
+   * The slots in effect for the current request: the configured slots, then
+   * the workspace's overrides, then the person's own `default` choice.
+   *
+   * Every value is `provider:model`. Config and preferences are refused bare
+   * where they are written; `workspace.json` is hand-edited and has no writer
+   * to refuse at, so its overrides are checked here and a bare one fails the
+   * turn naming the qualified form.
+   */
   getModelSlots(): ModelSlots {
     const base = this.configuredModelSlots();
     // Merge workspace model overrides from request context (partial — only overrides specified slots)
     const wsModels = getRequestContext()?.workspaceModelOverride ?? null;
     const withWorkspace: ModelSlots = wsModels
       ? {
-          default: wsModels.default ? resolveModelString(wsModels.default) : base.default,
-          fast: wsModels.fast ? resolveModelString(wsModels.fast) : base.fast,
+          default: wsModels.default
+            ? requireQualifiedModelId(wsModels.default, "workspace.json models.default")
+            : base.default,
+          fast: wsModels.fast
+            ? requireQualifiedModelId(wsModels.fast, "workspace.json models.fast")
+            : base.fast,
         }
       : base;
 
@@ -4935,7 +5164,7 @@ export class Runtime {
     const chosen = getRequestContext()?.identity?.preferences?.models?.default;
     if (!chosen) return withWorkspace;
     if (!this.isModelPermitted(chosen)) return withWorkspace;
-    return { ...withWorkspace, default: resolveModelString(chosen) };
+    return { ...withWorkspace, default: chosen };
   }
 
   /**
@@ -4951,20 +5180,18 @@ export class Runtime {
    * a configured slot value is governed where it is written.
    */
   isModelPermitted(modelString: string): boolean {
-    // An empty id is not a model. `resolveModelString("")` returns
-    // `"anthropic:"` — the bare-id fallback applied to nothing — which a
-    // provider-less deployment would otherwise accept and, on the preference
-    // path, pin every future conversation to.
-    if (modelString.trim() === "") return false;
-    const qualified = resolveModelString(modelString);
+    // Only a `provider:model` id is a model. An empty or bare string would
+    // otherwise pass a provider-less deployment and, on the preference path,
+    // pin every future conversation to a model that names no provider.
+    if (!isQualifiedModelId(modelString)) return false;
     // Policy is checked before the provider guard and independently of it. The
     // guard below tolerates absent provider config because `getProviderConfigs`
     // reports a display default rather than a reachability claim — but an
     // allowlist is an explicit operator statement, so when one exists it binds
     // whether or not providers are configured.
-    if (!isModelInPolicy(qualified, this.config.modelPolicy?.allowed)) return false;
-    if (!this.config.providers) return true;
-    return isModelAllowed(qualified, this.getProviderConfigs());
+    if (!isModelInPolicy(modelString, this.config.modelPolicy?.allowed)) return false;
+    if (!this.config.providers && !this._gatewayProviders) return true;
+    return isModelAllowed(modelString, this.getProviderConfigs());
   }
 
   /** Which models this organization permits. Absent ⇒ permissive. */
@@ -5106,48 +5333,36 @@ export class Runtime {
     }
   }
 
-  /** Get the list of configured provider names (e.g., ["anthropic", "openai"]). */
+  /** The watch on which providers the model gateway serves, when there is a gateway. */
+  getGatewayProviders(): GatewayProviders | null {
+    return this._gatewayProviders;
+  }
+
+  /**
+   * The providers this runtime can reach (e.g. `["anthropic", "openai"]`). With a
+   * model gateway, the ones it serves, or every provider the runtime knows until
+   * it has answered; without one, the configured providers.
+   */
   getConfiguredProviders(): string[] {
+    if (this._gatewayProviders) {
+      return [...(this._gatewayProviders.served() ?? MODEL_PROVIDERS)];
+    }
     if (this.config.providers) {
       return Object.keys(this.config.providers);
     }
     return ["anthropic"];
   }
 
-  /** Get provider configs with optional model allowlists. */
-  getProviderConfigs(): Record<string, { models?: string[] }> {
-    if (this.config.providers) {
-      const result: Record<string, { models?: string[] }> = {};
-      for (const [id, cfg] of Object.entries(this.config.providers)) {
-        result[id] = { models: (cfg as { models?: string[] }).models };
-      }
-      return result;
-    }
-    return { anthropic: {} };
-  }
-
   /**
-   * Tenant-level default preferences from the deployed runtime config
-   * (`config.preferences` with `config.home` as a legacy fallback for
-   * displayName/timezone). These are the values an operator sets via Helm
-   * values; per-user identity preferences override them at request time.
+   * The reachable providers with their model allowlists. Behind a gateway no
+   * provider has one (the boot refuses `providers.<id>.models`; `modelPolicy`
+   * narrows instead).
    */
-  getTenantDefaultPreferences(): {
-    displayName?: string;
-    timezone?: string;
-    locale?: string;
-    theme?: "system" | "light" | "dark";
-  } {
-    const prefs = this.config.preferences ?? {};
-    const home = this.config.home ?? {};
-    return {
-      ...((prefs.displayName ?? home.userName)
-        ? { displayName: prefs.displayName ?? home.userName }
-        : {}),
-      ...((prefs.timezone ?? home.timezone) ? { timezone: prefs.timezone ?? home.timezone } : {}),
-      ...(prefs.locale ? { locale: prefs.locale } : {}),
-      ...(prefs.theme ? { theme: prefs.theme } : {}),
-    };
+  getProviderConfigs(): Record<string, { models?: string[] }> {
+    if (this._gatewayProviders) {
+      return Object.fromEntries(this.getConfiguredProviders().map((id) => [id, {}]));
+    }
+    return providerModelAllowlists(this.config);
   }
 
   /**
@@ -5257,7 +5472,7 @@ export class Runtime {
    * BOOT-TIME context skills (org/core/builtin) with any toggled Off
    * (`status: "disabled"`) removed. Audit/management helper only.
    *
-   * NOTE: the prompt composition path no longer reads this. Compose routes by
+   * NOTE: the prompt composition path does not read this. Compose routes by
    * ROLE via `partitionSkillsByRole(loadConversationSkills(...))`, whose
    * `context` set spans EVERY tier (boot + workspace + user) and applies the
    * same active-status filter. This method is the boot-only subset — use it for
@@ -5278,7 +5493,7 @@ export class Runtime {
   }
 
   /**
-   * Phase 2 — per-conversation Layer 3 skill overlay.
+   * Per-conversation Layer 3 skill overlay.
    *
    * Returns the merged platform-tier + workspace-tier + user-tier set,
    * deduplicated by `manifest.name` with later scopes overriding earlier
@@ -5355,55 +5570,10 @@ export class Runtime {
     return readConnectorSkillCandidates(dir);
   }
 
-  /** SEP-2640 connector skills as surface-once connector-skill candidates, so a server's
-   *  skill can be delivered mid-turn when its tools are progressively disclosed (not only
-   *  at turn-start via <layer3-skill>).
-   *
-   *  Takes the `capability` half of `selectRequestLayer3`'s partition rather than
-   *  discovering again: one discovery per turn, and the entered app's exclusion
-   *  (its PRIMARY skill rides <app-guide>, not this channel — the server's other
-   *  skills do ride it) is inherited from that call instead of being a second
-   *  `excludeSkill` argument that has to agree with the first.
-   *
-   *  Only skills this turn has NOT already composed ride this channel. Two
-   *  exclusions, one rule — a body already in the prompt must not be delivered
-   *  again:
-   *   - `always` connector skills, by taking the `capability` half: an `always`
-   *     skill is in the context channel every turn.
-   *   - `alreadyComposed`, the turn's Layer-3 selection: a `dynamic` skill whose
-   *     tools were active at turn start is already in `<layer3-skill>`.
-   *
-   *  The second is not a corner case. `selectLayer3Skills` matches the very
-   *  tool-affinity synthesis stamps on every published skill, so Layer 3 and
-   *  this candidate list select on identical criteria — leaving a selected
-   *  skill in the pool would re-deliver its body as a synthetic message on the
-   *  first call to a matching tool, where it would then ride the rest of the
-   *  conversation. A skill that declares no affinity is bound to its whole
-   *  server, so one such call would re-deliver every such skill that server
-   *  publishes.
-   *
-   *  What remains is what the channel is for: a skill whose tools were proxied
-   *  out of the active set at turn start, so Layer 3 could not select it, and
-   *  which becomes relevant when a tool is promoted mid-turn. */
-  private toConnectorSkillCandidates(
-    capability: Skill[],
-    alreadyComposed: SelectedSkill[],
-  ): ConnectorSkillCandidate[] {
-    const composed = new Set(alreadyComposed.map((s) => s.skill.manifest.name));
-    return capability
-      .filter((s) => !composed.has(s.manifest.name))
-      .map((s) => ({
-        name: s.manifest.name,
-        body: s.body,
-        ...(s.loadBody ? { loadBody: bodyOrNull(s.loadBody) } : {}),
-        scope: s.manifest.scope ?? PUBLISHED_SKILL_SCOPE,
-        toolAffinity: s.manifest.toolAffinity ?? [],
-      }));
-  }
-
   /**
    * Names of skills already DELIVERED into this conversation — connector
-   * overlays surfaced by the engine (synthetic-message marker) and catalog
+   * overlays surfaced by the engine (`connectorSkills` on the tool result that
+   * carries them, or the synthetic-message marker) and catalog
    * skills loaded via `nb__use_skill` (marker stamped on the activating tool
    * result). MUST be called on the UN-rehydrated history (`compactedHistory ??
    * history`): `rehydrateUserResources` strips message `metadata`, so the
@@ -5428,6 +5598,7 @@ export class Runtime {
       if (delivered && typeof meta?.skill === "string") {
         names.add(meta.skill);
       }
+      for (const skill of meta?.connectorSkills ?? []) names.add(skill);
     }
     return [...names];
   }
@@ -5504,22 +5675,65 @@ export class Runtime {
   }
 
   /**
+   * Every skill the workspace's connected servers publish, from the same pool
+   * prompt composition draws on ({@link loadConnectorSkills}), so the listing is
+   * what the runtime loads: a server whose curated overlay supersedes its
+   * published skills contributes none here, and its overlay is listed by
+   * {@link listConnectorOverlays}. Reads the servers' listings only; no body is
+   * fetched. Backs `manage_connectors list_bound_skills`.
+   */
+  async listPublishedSkills(wsId: string): Promise<PublishedSkillInfo[]> {
+    await this.ensureWorkspaceRegistry(wsId);
+    return (await this.loadConnectorSkills(wsId)).flatMap((skill) => {
+      const info = publishedSkillInfo(skill);
+      return info ? [info] : [];
+    });
+  }
+
+  /**
+   * The body of one skill a connector contributes to this workspace, as the
+   * model receives it: a curated overlay's materialized file, or a published
+   * skill's `SKILL.md` fetched, verified, and budget-capped by the same loader
+   * composition uses. `null` when the workspace has no such skill. Backs
+   * `manage_connectors read_bound_skill`.
+   */
+  async readConnectorSkill(
+    wsId: string,
+    serverName: string,
+    name: string,
+  ): Promise<({ kind: "overlay" | "published" } & SkillBodyLoad) | null> {
+    const overlay = this.listConnectorOverlays(wsId).find(
+      (o) => o.server === serverName && o.name === name,
+    );
+    if (overlay) {
+      const skill = parseSkillFile(overlay.path, { cap: false });
+      return skill ? { kind: "overlay", ok: true, body: skill.body } : null;
+    }
+    await this.ensureWorkspaceRegistry(wsId);
+    const published = (await this.loadConnectorSkills(wsId)).find((skill) => {
+      const id = parseConnectorSkillName(skill.manifest.name);
+      return id?.connector === serverName && id.name === name;
+    });
+    if (!published) return null;
+    const loaded = published.loadBody
+      ? await published.loadBody()
+      : { ok: true as const, body: published.body };
+    return { kind: "published", ...loaded };
+  }
+
+  /**
    * Discover the FOCUSED workspace's server-published skills and route them by
-   * the strategy each DECLARES — the discovery half of {@link selectRequestLayer3},
+   * the strategy each DECLARES — the discovery half of the request's composition,
    * split out because it is the half that has no dependency on the active
    * toolset.
    *
    * That split is what makes a server-published skill reachable by the phrase
-   * matcher. The chat path runs: match → `surfaceTools(allTools, matched, …)` →
-   * active tool names → tool-affinity selection. So a pool built by the
-   * selection step cannot also be an input to the matcher that runs before it.
-   * Discovery needs only the workspace registry, so it can run ahead of the
-   * matcher and feed both: the matcher gets `capability` as extra candidates,
-   * and the selection step gets the same partition back instead of re-walking
-   * the registry and re-synthesizing every skill a second time for one turn.
+   * matcher, which runs before `surfaceTools`. Discovery needs only the
+   * workspace registry, so it runs ahead of the matcher, and the rest of the
+   * turn reuses the same partition instead of re-walking the registry.
    *
    * `context` (`always` skills) composes into the always-on channel; `capability`
-   * (`dynamic` skills) is both the tool-affinity pool and the matchable pool.
+   * (`dynamic` skills) is both the matchable pool and the bound-skill pool.
    */
   private async discoverConnectorSkillsByRole(
     wsId: string,
@@ -5529,184 +5743,47 @@ export class Runtime {
   }
 
   /**
-   * Build the Layer-3 skill pool for a request and run the selection.
+   * The skills the CURRENT request composes every turn, plus the skills bound
+   * to tools, for `nb__status scope:skills`.
    *
-   * Single source of truth for both prompt composition (`chat`) and the
-   * `nb__status scope:skills` reporter (`describeRequestSkills`). Keeping the
-   * pool construction in one place is deliberate: the bug this method exists to
-   * prevent was status and composition reading skills through two divergent
-   * paths, so the status surface reported only boot-time skills while the
-   * prompt received the workspace/user-tier set.
-   *
-   * The pool merges per-conversation tier skills (org + workspace + user, via
-   * {@link loadConversationSkills}) with server-published skills from the
-   * focused workspace only — a connector installed there whose
-   * tools land in the workspace's tool list must also surface its workflow
-   * guidance, else the model gets the namespaced tool name with no
-   * instructions. A connector in another workspace never contributes here.
-   *
-   * Discovered connector skills are routed by the strategy they DECLARE, exactly
-   * like filesystem skills: `partitionSkillsByRole` splits them so a `dynamic`
-   * connector skill feeds `selectLayer3Skills` (tool-affinity, `layer3`) while an
-   * `always` connector skill is returned in `context` for the caller to compose
-   * into the always-on channel every turn. Conversation-tier context skills are
-   * NOT returned here — the caller already partitioned those; `context` and
-   * `capability` carry only the *connector* skills the caller couldn't see.
-   *
-   * Both halves of that partition are returned, not just the one Layer 3 keeps.
-   * A turn also needs the `dynamic` half as surface-once candidates, and
-   * discovery is the expensive part — re-deriving it would mean walking the
-   * registry and re-synthesizing every skill a second time for the same turn.
-   */
-  async selectRequestLayer3(params: {
-    /**
-     * Focused workspace (or session/personal in home mode) — the ONLY workspace
-     * whose workspace-tier AND connector skills are in scope. Skills never cross a
-     * workspace boundary.
-     */
-    wsId: string;
-    /** Identity for user-tier skills; null in non-identity-bound paths. */
-    userId: string | null;
-    /** Names of tools in the set tool-affinity is evaluated against. */
-    activeToolNames: string[];
-    /** Skip the ONE skill already injected via `<app-guide>`, by publisher + URI. */
-    excludeSkill?: { serverName: string; uri: string };
-    /**
-     * Precomputed CAPABILITY skills (`type: skill`) from the conversation pool —
-     * the output of `partitionSkillsByRole(...).capability`. When the caller
-     * already partitioned for the per-request matcher / context channel, thread
-     * it through so the disk read isn't repeated. Omitted callers (e.g.
-     * `describeRequestSkills`) load + partition internally. Context skills are
-     * NOT in this set — they compose into Layer 0/1 by role, never Layer 3.
-     */
-    capabilityPool?: Skill[];
-    /**
-     * Precomputed connector partition from {@link discoverConnectorSkillsByRole}. Pass
-     * it when the caller already ran discovery — the chat path must, because the
-     * `dynamic` half feeds the phrase matcher that runs before the active
-     * toolset exists. Omitted callers discover here. Either way discovery
-     * happens exactly once per turn.
-     */
-    connectorPool?: { context: Skill[]; capability: Skill[] };
-  }): Promise<{ context: Skill[]; capability: Skill[]; layer3: SelectedSkill[] }> {
-    const capabilityPool =
-      params.capabilityPool ??
-      partitionSkillsByRole(this.loadConversationSkills(params.wsId, params.userId)).capability;
-    // Connector skills come from the FOCUSED workspace only — a connector installed
-    // in another workspace must not inject its usage skill here (the wall).
-    // Routed by their DECLARED strategy: `always` skills go to the context
-    // channel (composed every turn), `dynamic` skills join the tool-affinity
-    // capability pool that `selectLayer3Skills` filters.
-    const { context: connectorContext, capability: connectorCapability } =
-      params.connectorPool ??
-      (await this.discoverConnectorSkillsByRole(params.wsId, {
-        ...(params.excludeSkill ? { excludeSkill: params.excludeSkill } : {}),
-      }));
-    const layer3 = selectLayer3Skills({
-      skills: [...capabilityPool, ...connectorCapability],
-      activeTools: params.activeToolNames,
-    });
-    return { context: connectorContext, capability: connectorCapability, layer3 };
-  }
-
-  /**
-   * The Layer-3 skills the CURRENT request would compose into the prompt, plus
-   * the boot-time context skills — for `nb__status scope:skills`.
-   *
-   * Reports through {@link selectRequestLayer3} (the same path `chat` composes
-   * with) so the status surface reflects the workspace- and user-tier skills
-   * actually loaded, not the boot-time cache. Identity and the focused
-   * workspace come from the active request context.
-   *
-   * Active-tool input is the focused workspace's *available* tools. Under
-   * progressive disclosure the live run's active subset may be smaller, but for
-   * a status view "loads when this installed tool is active" is the signal a
-   * reader wants — and it never under-reports an always-loaded skill.
+   * Reads through the same loaders and partition `chat` composes with, so the
+   * status surface reflects the workspace- and user-tier skills actually in
+   * scope, not the boot-time cache. Identity and the focused workspace come
+   * from the active request context. A bound skill is not in the prompt: it
+   * reaches the model before the first call to a tool it names (ADR-0053).
    */
   async describeRequestSkills(
     wsId: string,
-  ): Promise<{ context: readonly Skill[]; layer3: readonly SelectedSkill[] }> {
+  ): Promise<{ context: readonly Skill[]; bound: readonly Skill[] }> {
     const identity = getRequestContext()?.identity ?? undefined;
     const ownerId = this.resolveRequestUserId(identity);
     const userId = identity?.id ?? ownerId;
-    const registry = await this.ensureWorkspaceRegistry(wsId);
-    const activeToolNames = (await registry.availableTools()).map((t) => t.name);
-    // Partition the same way compose does, so the status surface matches the
-    // prompt exactly: `context` (every tier, active only) is the Layer 0/1 set;
-    // `capability` feeds Layer 3. Reading the raw boot-time `this.contextSkills`
-    // would both miss workspace/user-tier context skills and show toggled-Off
-    // rules as active — the divergence this reporter exists to kill.
+    await this.ensureWorkspaceRegistry(wsId);
     // The conversation's mutes apply here too. This reporter exists to stop the
     // status surface and the prompt diverging, and a muted skill still listed
-    // as loaded is that divergence — an operator asking "did my mute take?" is
-    // told it did not.
+    // is that divergence: an operator asking "did my mute take?" is told it
+    // did not.
     const suppressed = await this.suppressedSkillNamesFor(getRequestContext()?.conversationId);
     const { context, capability } = partitionSkillsByRole(
       withoutSuppressed(this.loadConversationSkills(wsId, userId), suppressed),
     );
-    const { context: connectorContext, layer3 } = await this.selectRequestLayer3({
-      wsId,
-      userId,
-      activeToolNames,
-      capabilityPool: capability,
-    });
-    // Include always-on connector skills in the reported context so the status
-    // surface matches what the prompt actually composes. They compose every
-    // turn, so their bodies (which the always-on cost reads) are needed anyway
-    // and come from the digest cache the turn fills.
+    const connector = await this.discoverConnectorSkillsByRole(wsId);
+    // Always-on connector skills compose every turn, so their bodies (which the
+    // always-on cost reads) are needed anyway and come from the digest cache.
     const loadedConnectorContext = await hydrateSkills(
-      withoutSuppressed(connectorContext, suppressed),
+      withoutSuppressed(connector.context, suppressed),
     );
-    // Layer 3 is returned unfetched: the overview lists names only, and the
-    // detail view fetches the one body it prints.
-    return {
-      context: [...context, ...loadedConnectorContext],
-      layer3: layer3.filter((sel) => !suppressed.has(sel.skill.manifest.name)),
-    };
+    // Bound skills are returned unfetched: the overview lists names only, and
+    // the detail view fetches the one body it prints.
+    const bound = withoutSuppressed([...capability, ...connector.capability], suppressed).filter(
+      (s) => s.manifest.status === "active" && (s.manifest.toolAffinity?.length ?? 0) > 0,
+    );
+    return { context: [...context, ...loadedConnectorContext], bound };
   }
 
   /** Get the path to the nimblebrain.json config file (Helm-managed seed). */
   getConfigPath(): string | undefined {
     return this.config.configPath;
-  }
-
-  /**
-   * Loose session-store config for the API host to resolve. The actual
-   * defaulting + validation lives in `api/session-store/factory.ts` so this
-   * returns whatever was put in `nimblebrain.json`, untouched.
-   */
-  getSessionStoreConfig(): RuntimeConfig["sessionStore"] {
-    return this.config.sessionStore;
-  }
-
-  /**
-   * Resolved idle TTL for sessions, in milliseconds. Two operator surfaces,
-   * one currency:
-   *
-   *   - `MCP_SESSION_TTL_SECONDS` env var (highest priority — env wins so
-   *     ops can flip TTL without redeploying the configmap)
-   *   - `sessionStore.ttlSeconds` in `nimblebrain.json`
-   *   - 8 h fallback
-   *
-   * Internal callers (registry constructors, sweep math) take ms; the
-   * conversion happens once here so the rest of the runtime never deals
-   * in mixed units. `parsePositiveIntEnv`-style validation lives in
-   * `mcp-server.ts`; this accessor only consumes the parsed env value.
-   */
-  getSessionStoreTtlMs(): number {
-    const envRaw = process.env.MCP_SESSION_TTL_SECONDS;
-    if (envRaw !== undefined && envRaw !== "") {
-      const parsed = Number(envRaw);
-      if (Number.isFinite(parsed) && parsed > 0 && Number.isInteger(parsed)) {
-        return parsed * 1000;
-      }
-      // Invalid env value — fall through to config / default. We don't
-      // log here because the chart-rendered config path is the typical
-      // source of truth; an unset/typo'd env should be a quiet fallback,
-      // not a noise generator on every cold start.
-    }
-    const seconds = this.config.sessionStore?.ttlSeconds ?? 8 * 60 * 60;
-    return seconds * 1000;
   }
 
   /**
@@ -5953,6 +6030,7 @@ export class Runtime {
     // Nothing drains the run queue once the sources are gone, so a run still
     // waiting for a slot is refused rather than left waiting forever.
     this._runAdmission?.stop();
+    this._gatewayProviders?.stop();
     // Release the ledger last: a turn aborted just above can still be inside a
     // `doStream()` that has already spent, and that call is recordable until it
     // returns. Ownership-checked, so a sibling runtime that installed its own
@@ -6067,11 +6145,35 @@ async function seedWorkspaceConnectorInstances(
   }
 }
 
-function resolveModel(config: RuntimeConfig): (modelString: string) => LanguageModelV4 {
+/**
+ * The installation's model gateway, when it has one: every provider is then
+ * reached through it with a credential minted per call, which needs the run key.
+ * A gateway without the run key refuses the boot, since building the providers
+ * without it would call them directly, around the gateway.
+ */
+function modelGatewayAccess(
+  config: RuntimeConfig,
+  runKey: RunKey | null,
+): ModelGatewayAccess | undefined {
+  if (config.languageModel) return undefined;
+  const gatewayUrl = config.execution?.modelGateway;
+  if (!gatewayUrl) return undefined;
+  if (!runKey) {
+    throw new Error(
+      "execution.modelGateway needs the installation's run key, which mints each model call's credential",
+    );
+  }
+  return { url: gatewayUrl, fetch: modelGatewayFetch(runKey) };
+}
+
+function resolveModel(
+  config: RuntimeConfig,
+  gateway: ModelGatewayAccess | undefined,
+): (modelString: string) => LanguageModelV4 {
   const adapter = config.languageModel;
   if (adapter) return () => adapter;
   // No providers configured means Anthropic, keyed from the environment.
-  return buildModelResolver({ providers: config.providers ?? { anthropic: {} } });
+  return buildModelResolver({ providers: config.providers ?? { anthropic: {} } }, gateway);
 }
 
 /** Initialize work directory env vars and sync core skills. */
@@ -6264,6 +6366,7 @@ function buildRunContext(
     // run id when it doesn't, so every reader asking for the current
     // conversation of a one-shot run correctly gets nothing.
     ...(spec.conversation ? { conversationId: spec.conversation.conversation.id } : { runId }),
+    credentialSubject: runId,
     // Unattended runs bar the task-authoring surface at tool-dispatch
     // depth. Rides the ALS context and is preserved across the per-call
     // restamp, so the wall is enforced at the tasks source rather than
@@ -6273,16 +6376,33 @@ function buildRunContext(
 }
 
 /**
+ * The context the runtime itself executes in: the run's, plus the runtime's id
+ * when its agent reports its own usage (`RuntimeCapabilities.usage`).
+ *
+ * Only usage the agent reports is recorded in here: its loop calls and its
+ * folds' summaries. The calls NimbleBrain makes on the run's behalf (the fold
+ * between turns, the conversation's title) run in the run's context
+ * ({@link buildRunContext}) and are measured, so their ledger lines name no
+ * agent runtime.
+ */
+function agentExecutionContext(reqCtx: RequestContext, agentRuntime: AgentRuntime): RequestContext {
+  return agentRuntime.capabilities.usage === "reported"
+    ? { ...reqCtx, agentRuntime: agentRuntime.id }
+    : reqCtx;
+}
+
+/**
  * Why a run stopped, beyond its stop reason: the fields an engine result, a run
  * handle, and a task result share, copied only when set.
  */
 function stopDetail(
-  r: Pick<RunHandle, "finishReason" | "finishReasonRaw" | "spendAccountId">,
-): Pick<RunHandle, "finishReason" | "finishReasonRaw" | "spendAccountId"> {
+  r: Pick<RunHandle, "finishReason" | "finishReasonRaw" | "spendAccountId" | "wrapUpLimit">,
+): Pick<RunHandle, "finishReason" | "finishReasonRaw" | "spendAccountId" | "wrapUpLimit"> {
   return {
     ...(r.finishReason !== undefined ? { finishReason: r.finishReason } : {}),
     ...(r.finishReasonRaw !== undefined ? { finishReasonRaw: r.finishReasonRaw } : {}),
     ...(r.spendAccountId !== undefined ? { spendAccountId: r.spendAccountId } : {}),
+    ...(r.wrapUpLimit !== undefined ? { wrapUpLimit: r.wrapUpLimit } : {}),
   };
 }
 
@@ -6293,6 +6413,38 @@ function stopDetail(
  */
 function isReportableAbort(spec: RunSpec, signal: AbortSignal | undefined): boolean {
   return spec.onAbort === "partial" && signal?.aborted === true;
+}
+
+/**
+ * Record every skill a run is given, and every bound skill that missed it, for
+ * a caller with no conversation log to read the events back from. A sink in
+ * the run's chain, so it holds what happened before an abort as well.
+ */
+function createSkillDeliveryLog(declared: DeclaredSkill[]): {
+  sink: EventSink;
+  list: SkillDelivery[];
+} {
+  const list: SkillDelivery[] = declared.map((s) => ({ name: s.name, loadedBy: "declared" }));
+  const sink: EventSink = {
+    emit(event) {
+      if (event.type === "connector.skill.injected") {
+        const { skillName, heldToolCallId } = event.data;
+        list.push({
+          name: skillName,
+          loadedBy: heldToolCallId !== undefined ? "before_call" : "tool_use",
+        });
+      } else if (event.type === "skill.activated") {
+        list.push({ name: event.data.skillName, loadedBy: "activation" });
+      } else if (event.type === "skill.not_delivered") {
+        list.push({
+          name: event.data.skillName,
+          loadedBy: "before_call",
+          status: event.data.reason,
+        });
+      }
+    },
+  };
+  return { sink, list };
 }
 
 /** The user message a run opens on, in stored form. */
@@ -6317,22 +6469,29 @@ function buildOpeningMessage(input: RunSpec["input"]): StoredMessage {
  * — and retain them across the throw, so a timed-out task reports the work
  * it actually did instead of 0/0/0/0. Drops with the process: a real SIGKILL
  * still reports zero, and the persisted run result is the post-mortem.
+ *
+ * It also prices every run, aborted or not: each call on its own rate card,
+ * summed. Pricing the cumulative usage instead would bill a run of short
+ * prompts on a model's long-prompt card once their sum crossed its threshold.
  */
 function createPartialRunAccumulator(): {
   sink: EventSink;
   toolCalls: RunHandle["toolCalls"];
   usage: (model: string) => TurnUsage;
+  costUsd: () => number;
 } {
-  const totals = { inputTokens: 0, outputTokens: 0, iterations: 0, llmMs: 0 };
+  const totals = { inputTokens: 0, outputTokens: 0, iterations: 0, llmMs: 0, costUsd: 0 };
   const toolCalls: RunHandle["toolCalls"] = [];
   const sink: EventSink = {
     emit(event: EngineEvent): void {
       if (event.type === "llm.done") {
         const { data } = event;
+        if (data.transcriptOnly) return;
         totals.iterations += 1;
         totals.llmMs += data.llmMs;
         totals.inputTokens += data.usage.inputTokens;
         totals.outputTokens += data.usage.outputTokens;
+        totals.costUsd += estimateCost(data.model, data.usage);
       } else if (event.type === "tool.done") {
         const { data } = event;
         // `errorReason` is intentionally absent here: this accumulator only
@@ -6340,7 +6499,9 @@ function createPartialRunAccumulator(): {
         // `stopReason: "aborted"` (never "complete"), so the tasks
         // de-masker's `status === "success"` guard never reads it. (The
         // `tool.done` event doesn't carry `errorReason` either — no point
-        // threading it through for a path that can't de-mask.)
+        // threading it through for a path that can't de-mask.) `held` is
+        // carried: the run's recorded unresolved failures read it on every
+        // path, this one included.
         toolCalls.push({
           id: data.id,
           name: data.name,
@@ -6348,6 +6509,7 @@ function createPartialRunAccumulator(): {
           output: data.output,
           ok: data.ok,
           ms: data.ms,
+          ...(data.held ? { held: data.held } : {}),
         });
       }
     },
@@ -6365,6 +6527,7 @@ function createPartialRunAccumulator(): {
       llmMs: totals.llmMs,
       iterations: totals.iterations,
     }),
+    costUsd: () => totals.costUsd,
   };
 }
 
@@ -6444,6 +6607,98 @@ function buildWorkspaceContext(
 }
 
 /** A skill body loader as the engine's surface-once channel takes it: the body, or `null`. */
+/**
+ * The skills an unattended run declared, resolved to the bodies its system
+ * prompt carries in the Layer 3 skills section. A name the turn already
+ * composes into its system prompt (`composedNames`: the `always` skills and
+ * the trigger match) needs no delivery. A name the workspace does not offer refuses the
+ * run before its first model call (`DeclaredSkillsUnavailableError`), as an
+ * unreachable declared tool does: the owner named it as the run's job. A body
+ * that cannot be fetched fails the run as an ordinary failure, and the task's
+ * next run tries again.
+ */
+async function resolveDeclaredSkills(
+  names: string[] | undefined,
+  activatable: ActivatableSkill[],
+  composedNames: string[],
+): Promise<DeclaredSkill[]> {
+  if (!names?.length) return [];
+  const composed = new Set(composedNames);
+  const byName = new Map(activatable.map((s) => [s.name, s]));
+  const wanted = [...new Set(names)].filter((n) => !composed.has(n));
+  const unavailable = wanted.filter((n) => !byName.has(n));
+  if (unavailable.length > 0) throw new DeclaredSkillsUnavailableError(unavailable);
+  return Promise.all(
+    wanted.map(async (name) => {
+      const skill = byName.get(name) as ActivatableSkill;
+      const loaded = skill.loadBody
+        ? await skill.loadBody()
+        : { ok: true as const, body: skill.body };
+      if (!loaded.ok)
+        throw new Error(`Declared skill "${name}" could not be fetched (${loaded.reason}).`);
+      return { name, scope: skill.scope, body: loaded.body };
+    }),
+  );
+}
+
+/**
+ * Every skill bound to a tool, from every source, as the engine's delivery
+ * candidates: the conversation tiers' `dynamic` skills (core, org, workspace,
+ * user), the workspace's server-published ones, and its curated overlays. One
+ * candidate set, so a tenant's skill bound to a connector's tool reaches the
+ * model on the same call as the connector's own.
+ *
+ * A skill with no `tool-affinity` is bound to nothing and is left to the
+ * catalog. A disabled skill is left out. So is any skill this turn already
+ * composed into the prompt (`alreadyComposed`: the trigger match), because
+ * its body is in context and delivering it again would put it there twice. The `<app-guide>` skill never
+ * reaches the connector pool, so it needs no exclusion here.
+ *
+ * Names are unique, the first pool winning in catalog order (filesystem, then
+ * server-published, then overlay), so one name is one skill and one delivery.
+ */
+function boundSkillCandidates(pools: {
+  fsCapability: Skill[];
+  connectorCapability: Skill[];
+  overlays: ConnectorSkillCandidate[];
+  alreadyComposed: string[];
+}): ConnectorSkillCandidate[] {
+  const seen = new Set(pools.alreadyComposed);
+  const out: ConnectorSkillCandidate[] = [];
+  const add = (c: ConnectorSkillCandidate) => {
+    if (seen.has(c.name) || c.toolAffinity.length === 0) return;
+    seen.add(c.name);
+    out.push(c);
+  };
+  for (const s of [...pools.fsCapability, ...pools.connectorCapability]) {
+    if (s.manifest.status !== "active") continue;
+    add(boundSkillCandidate(s));
+  }
+  for (const c of pools.overlays) add(c);
+  return out;
+}
+
+/**
+ * One skill as a delivery candidate. A server's own skill bound to its whole
+ * namespace (`<server>__*`, declared or by default) is marked `implicitBinding`:
+ * only such a skill skips the hold on a tool its server annotates read-only.
+ */
+function boundSkillCandidate(s: Skill): ConnectorSkillCandidate {
+  const toolAffinity = s.manifest.toolAffinity ?? [];
+  const publisher = parseConnectorSkillName(s.manifest.name)?.connector;
+  const wholeServer =
+    publisher !== undefined && toolAffinity.length === 1 && toolAffinity[0] === `${publisher}__*`;
+  return {
+    name: s.manifest.name,
+    body: s.body,
+    ...(s.loadBody ? { loadBody: bodyOrNull(s.loadBody) } : {}),
+    scope: s.manifest.scope ?? PUBLISHED_SKILL_SCOPE,
+    toolAffinity,
+    priority: s.manifest.priority,
+    ...(wholeServer ? { implicitBinding: true } : {}),
+  };
+}
+
 function bodyOrNull(load: () => Promise<SkillBodyLoad>): () => Promise<string | null> {
   return async () => {
     const loaded = await load();
@@ -6455,17 +6710,6 @@ function bodyOrNull(load: () => Promise<SkillBodyLoad>): () => Promise<string | 
 async function hydrateSkills(skills: Skill[]): Promise<Skill[]> {
   const loaded = await Promise.all(skills.map(hydrateSkill));
   return loaded.filter((sk): sk is Skill => sk !== null);
-}
-
-/** {@link hydrateSkills} over a selection, keeping each entry's selection facts. */
-async function hydrateSelected(selected: SelectedSkill[]): Promise<SelectedSkill[]> {
-  const loaded = await Promise.all(
-    selected.map(async (sel) => {
-      const sk = await hydrateSkill(sel.skill);
-      return sk ? { ...sel, skill: sk } : null;
-    }),
-  );
-  return loaded.filter((sel): sel is SelectedSkill => sel !== null);
 }
 
 /** Entries a bounded runtime map (skill body caches, overlay checks) holds before evicting its oldest. */
@@ -6625,8 +6869,8 @@ export function buildContextAssembledPayload(input: {
   const historyTokens = input.messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
   // NOTE: `skills` is an ANNOTATION of what the composed skills cost, NOT a
   // disjoint bucket — those skill bodies are already inside `system_prompt`, so
-  // `totalTokens` intentionally double-counts them (unchanged from Phase 1, now
-  // spanning always-on/trigger too since the payload widened). Don't "fix" the
+  // `totalTokens` intentionally double-counts them (always-on and trigger
+  // skills included). Don't "fix" the
   // total by subtracting; the disjoint budget is system_prompt + tools + history.
   const sources: ContextAssembledSource[] = [
     { kind: "system_prompt", tokens: promptTokens },

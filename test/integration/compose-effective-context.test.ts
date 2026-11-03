@@ -20,6 +20,7 @@ import type { LanguageModelV4 } from "@ai-sdk/provider";
 import { EventSourcedConversationStore } from "../../src/conversation/event-sourced-store.ts";
 import { extractText } from "../../src/engine/content-helpers.ts";
 import { DEV_IDENTITY } from "../../src/identity/providers/dev.ts";
+import type { ComposeAssembledContextOutput } from "../../src/platform/schemas/compose.ts";
 import { runWithRequestContext } from "../../src/runtime/request-context.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import { hashSkillBody } from "../../src/runtime/skills-loaded-payload.ts";
@@ -77,7 +78,7 @@ async function getLatestRunId(runtime: Runtime, convId: string): Promise<string 
       // no `request.identity` is passed and no identity provider is
       // configured. Without this, the in-context store reads in
       // `compose__effective_context` refuse the read as a foreign-
-      // owner access (Stage 1 single-owner gate).
+      // owner access (single-owner gate).
       identity: DEV_IDENTITY,
       workspaceId: TEST_WORKSPACE_ID,
     },
@@ -131,13 +132,7 @@ async function callAssembled(
   runtime: Runtime,
   args: Record<string, unknown>,
   ctxConvId?: string,
-): Promise<{
-  structured: {
-    sources: Array<{ kind: string; tokens: number }>;
-    totalTokens: number;
-    windowTokens: number;
-  } | null;
-}> {
+): Promise<{ structured: ComposeAssembledContextOutput | null }> {
   const registry = runtime.getRegistryForWorkspace(TEST_WORKSPACE_ID);
   const result = await runWithRequestContext(
     {
@@ -153,7 +148,7 @@ async function callAssembled(
       }),
   );
   const sc = (result as { structuredContent?: unknown }).structuredContent;
-  return { structured: sc ? (sc as never) : null };
+  return { structured: sc ? (sc as ComposeAssembledContextOutput) : null };
 }
 
 describe("compose_effective_context — live mode", () => {
@@ -270,13 +265,11 @@ describe("compose_effective_context — historical mode", () => {
     mkdirSync(join(workDir, "skills"), { recursive: true });
     const skillBody = "Use patch_source for all revisions.";
     const skillPath = join(workDir, "skills", "collateral-rules.md");
-    // dynamic + tool-affinity (capability role) so it lands in Layer 3, where
-    // this tool audits skill hashes — `loading-strategy: always` would route to
-    // the always-on Layer 0/1 channel instead. `nb__*` always matches a surfaced
-    // tool, so the skill is selected deterministically in the test.
+    // `always`, so every turn records it in `skills.loaded`, the event
+    // historical mode audits skill hashes from.
     writeFileSync(
       skillPath,
-      `---\nname: collateral-rules\ndescription: Routing\nmetadata:\n  nimblebrain:\n    loading-strategy: dynamic\n    priority: 30\n    tool-affinity: ['nb__*']\n---\n\n${skillBody}\n`,
+      `---\nname: collateral-rules\ndescription: Routing\nmetadata:\n  nimblebrain:\n    loading-strategy: always\n    priority: 30\n---\n\n${skillBody}\n`,
     );
     await runtime.reloadSkills();
 
@@ -337,7 +330,7 @@ describe("compose_effective_context — historical mode", () => {
     const skillPath = join(workDir, "skills", "breakout-rules.md");
     writeFileSync(
       skillPath,
-      `---\nname: breakout-rules\ndescription: Routing\nmetadata:\n  nimblebrain:\n    loading-strategy: dynamic\n    priority: 30\n    tool-affinity: ['nb__*']\n---\n\n${skillBody}\n`,
+      `---\nname: breakout-rules\ndescription: Routing\nmetadata:\n  nimblebrain:\n    loading-strategy: always\n    priority: 30\n---\n\n${skillBody}\n`,
     );
     await runtime.reloadSkills();
 
@@ -378,7 +371,7 @@ describe("compose_effective_context — historical mode", () => {
     const skillPath = join(workDir, "skills", "drift-rules.md");
     writeFileSync(
       skillPath,
-      `---\nname: drift-rules\ndescription: Test\nmetadata:\n  nimblebrain:\n    loading-strategy: dynamic\n    priority: 30\n    tool-affinity: ['nb__*']\n---\n\n${originalBody}\n`,
+      `---\nname: drift-rules\ndescription: Test\nmetadata:\n  nimblebrain:\n    loading-strategy: always\n    priority: 30\n---\n\n${originalBody}\n`,
     );
     await runtime.reloadSkills();
 
@@ -396,7 +389,7 @@ describe("compose_effective_context — historical mode", () => {
     const editedBody = "Edited rule: use set_source instead.";
     writeFileSync(
       skillPath,
-      `---\nname: drift-rules\ndescription: Test\nmetadata:\n  nimblebrain:\n    loading-strategy: dynamic\n    priority: 30\n    tool-affinity: ['nb__*']\n---\n\n${editedBody}\n`,
+      `---\nname: drift-rules\ndescription: Test\nmetadata:\n  nimblebrain:\n    loading-strategy: always\n    priority: 30\n---\n\n${editedBody}\n`,
     );
     await runtime.reloadSkills();
 
@@ -431,7 +424,7 @@ describe("compose_effective_context — historical mode", () => {
     const originalBody = "Recoverable rule: vintage instruction.";
     const skillPath = join(workDir, "skills", "recoverable.md");
     const frontmatter =
-      "---\nname: recoverable\ndescription: Test\nmetadata:\n  nimblebrain:\n    loading-strategy: dynamic\n    priority: 30\n    tool-affinity: ['nb__*']\n---\n";
+      "---\nname: recoverable\ndescription: Test\nmetadata:\n  nimblebrain:\n    loading-strategy: always\n    priority: 30\n---\n";
     writeFileSync(skillPath, `${frontmatter}\n${originalBody}\n`);
     await runtime.reloadSkills();
 

@@ -8,9 +8,15 @@ import { cn } from "../../lib/utils";
 //
 // Renders one scope's settings nav (a flat list of sections, optionally
 // with nested sub-items) plus an `<Outlet/>` for the active tab. The scope's
-// name is the top bar's title, not repeated here. Settings used to be one page grouped by scope (workspace vs org);
-// each scope now owns its own URL subtree (`/w/:slug/settings`, `/org`)
-// so the shell is single-scope and the cross-scope grouping is gone.
+// name is the top bar's title, not repeated here. Each scope owns its own URL
+// subtree (`/w/:slug/settings`, `/org`), so the shell is single-scope and
+// never groups across scopes.
+//
+// The nav sits beside the content when the main column (`@container main`) is
+// at least `@3xl` (48rem) wide, and stacks above it as one scrolling row of
+// tabs when narrower. It follows the column, not the viewport: the column
+// shrinks as the chat docks, and a side nav in a narrow column squeezes the
+// content (`web/DESIGN.md`, main-area views).
 //
 // Each item declares the minimum role to *see* it (defense in depth — the
 // backend tools enforce the real write boundary). A `footer` item pins to
@@ -56,16 +62,16 @@ export function SettingsShell({ title, items, footer }: SettingsShellProps) {
   const visible = items.filter((s) => roleAtLeast(role, s.minRole ?? "ws_member"));
 
   return (
-    <div className="flex flex-col md:flex-row h-full overflow-hidden">
+    <div className="flex flex-col @3xl/main:flex-row h-full overflow-hidden">
       <nav
-        className="shrink-0 md:w-56 md:border-r border-b md:border-b-0 border-border flex md:flex-col overflow-x-auto md:overflow-x-visible md:overflow-y-auto"
+        className="shrink-0 @3xl/main:w-56 @3xl/main:border-r border-b @3xl/main:border-b-0 border-border flex @3xl/main:flex-col overflow-x-auto @3xl/main:overflow-x-visible @3xl/main:overflow-y-auto"
         aria-label={`${title} sections`}
       >
         {/* The page's name is in the top bar; the column starts with its sections. */}
-        <div aria-hidden="true" className="hidden md:block h-4" />
+        <div aria-hidden="true" className="hidden @3xl/main:block h-4" />
 
-        {/* Mobile: single horizontal scroll row (no nesting) */}
-        <div className="flex md:hidden gap-0.5 px-2 py-1">
+        {/* Narrow column: single horizontal scroll row (no nesting) */}
+        <div className="flex @3xl/main:hidden gap-0.5 px-2 py-1">
           {visible.map((section) => (
             <NavLink
               key={section.id}
@@ -87,8 +93,8 @@ export function SettingsShell({ title, items, footer }: SettingsShellProps) {
           )}
         </div>
 
-        {/* Desktop: vertical nav with optional nested sub-items */}
-        <div className="hidden md:flex md:flex-col px-2 pb-3">
+        {/* Wide column: vertical nav with optional nested sub-items */}
+        <div className="hidden @3xl/main:flex @3xl/main:flex-col px-2 pb-3">
           <div className="mt-1 flex flex-col gap-0.5">
             {visible.map((section) => (
               <Fragment key={section.id}>
@@ -136,7 +142,11 @@ export function SettingsShell({ title, items, footer }: SettingsShellProps) {
         </div>
       </nav>
 
-      <div className="flex-1 overflow-y-auto p-4 md:p-6">
+      {/* Inset on every side by the page gutter, which narrows with the main
+          column (`@container main`), not the viewport. It is the `settings`
+          container: a settings page's layout steps (`@xl/settings:`) measure
+          this column, since the side nav takes part of `main`. */}
+      <div className="@container/settings flex-1 overflow-y-auto p-(--page-gutter)">
         {/* One width for every settings page, set here rather than per page so
             tabs never change width as you move between them. Left-aligned, so
             the content starts beside the nav on every tab instead of drifting

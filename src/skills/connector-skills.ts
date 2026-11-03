@@ -23,10 +23,10 @@
  *   extension forbids fetching a skill's files ahead of need — so the `Skill`
  *   carries a `loadBody` the composer resolves through `hydrateSkill`. The
  *   synthesized skill flows through `partitionSkillsByRole`: a `dynamic` skill
- *   routes to the `selectLayer3Skills` capability channel, tool-affined to the
- *   server's tools it declares, or to `<serverName>__*` when it declares none
- *   (`connectorToolAffinity`), and loads when a matching tool is in the active
- *   toolset; an `always` skill routes to the always-on context
+ *   is tool-affined to the server's tools it declares, or to `<serverName>__*`
+ *   when it declares none (`connectorToolAffinity`), and reaches the model
+ *   before the first call to a matching tool (ADR-0053); an `always` skill
+ *   routes to the always-on context
  *   channel (composed every turn, the same path filesystem `always` skills use).
  *
  *   Loading config is READ from the skill's frontmatter, not invented: a server
@@ -44,6 +44,7 @@ import matter from "gray-matter";
 
 import { log } from "../observability/log.ts";
 import { toolNameMatchesPattern } from "../tools/tool-pattern.ts";
+import { resolveLoadingMechanism, type SkillLoadingMechanism } from "./loading.ts";
 import type { SkillEntry } from "./skills-extension.ts";
 import type { Skill, SkillBodyLoad, SkillLoadingStrategy, SkillScope } from "./types.ts";
 
@@ -173,11 +174,15 @@ function skillPath(uri: string): string {
  * are dropped.
  *
  * With nothing declared, the skill is bound to the whole server (`<serverName>__*`).
+ * An explicit empty list binds it to no tool: the skill is catalog-only, loaded
+ * when the model asks for it. A list whose every entry is blank is malformed and
+ * reads as nothing declared.
  */
 export function connectorToolAffinity(
   serverName: string,
   declared: readonly string[] | undefined,
 ): string[] {
+  if (declared?.length === 0) return [];
   const patterns = (declared ?? [])
     .map((p) => p.trim())
     .filter((p) => p.length > 0)
@@ -256,13 +261,26 @@ function readDeclaredLoading(data: Record<string, unknown>): {
   const strategy = block["loading-strategy"];
   const priority = block.priority;
   const triggers = nonBlankStrings(block.triggers);
-  const toolAffinity = nonBlankStrings(block["tool-affinity"]);
+  const toolAffinity = declaredToolAffinity(block["tool-affinity"]);
   return {
     ...(strategy === "always" || strategy === "dynamic" ? { loadingStrategy: strategy } : {}),
     ...(typeof priority === "number" && priority >= 0 && priority <= 100 ? { priority } : {}),
     ...(triggers.length > 0 ? { triggers } : {}),
-    ...(toolAffinity.length > 0 ? { toolAffinity } : {}),
+    ...(toolAffinity ? { toolAffinity } : {}),
   };
+}
+
+/**
+ * A declared `tool-affinity`: its non-blank entries, an empty list when the
+ * server declared `[]` (bound to no tool), or `undefined` when it declared
+ * nothing usable (absent, not a list, or only blank entries), so the
+ * whole-server default applies.
+ */
+function declaredToolAffinity(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length === 0) return [];
+  const entries = nonBlankStrings(value);
+  return entries.length > 0 ? entries : undefined;
 }
 
 /** The non-blank strings of `value` when it is an array, else none. */
@@ -359,9 +377,8 @@ export interface ConnectorSkillInput {
  * skill DECLARES:
  *  - `dynamic` (the default when none is declared): tool-affined to the tools
  *    it declares, prefixed `<serverName>__` ({@link connectorToolAffinity}), or
- *    to `<serverName>__*` when it declares none. It loads via
- *    `selectLayer3Skills` when a matching tool is in the active toolset, and is
- *    delivered mid-turn when a matching tool is promoted or called.
+ *    to `<serverName>__*` when it declares none. It is delivered when a
+ *    matching tool is promoted, or before the first call to one (ADR-0053).
  *  - `always`: composed into the always-on context channel every turn (routed
  *    there by `partitionSkillsByRole`). `toolAffinity` is still stamped but
  *    unused on this path — the context channel is unconditional.
@@ -377,13 +394,9 @@ export interface ConnectorSkillInput {
  * fetch, parse, and cache. Keeping the synthesis pure means it's trivial to
  * unit-test the manifest shape without spinning up a registry.
  *
- * Observability contract: when a `dynamic` skill is selected by
- * `selectLayer3Skills`, `buildSkillsLoadedPayload` emits it on the
- * `skills.loaded` event with `id = <uri>`, `scope = "provided"`,
- * `loadedBy = "tool_affinity"` — byte-identical in payload structure to any
- * filesystem-sourced Layer 3 skill with the same scope / strategy, plus
- * `name` / `connector` split out of the manifest name so a reader gets the
- * skill's own name and who published it.
+ * Observability contract: a delivered `dynamic` skill is recorded by
+ * `connector.skill.injected` under its manifest name, from which a reader
+ * splits the publishing connector and the skill's own name.
  */
 export function synthesizeConnectorSkill(input: ConnectorSkillInput): Skill {
   const { serverName, skillName, description, uri, loadingStrategy, priority, triggers } = input;
@@ -416,4 +429,47 @@ export async function hydrateSkill(skill: Skill): Promise<Skill | null> {
   if (!loaded.ok) return null;
   const { loadBody: _loaded, ...rest } = skill;
   return { ...rest, body: loaded.body };
+}
+
+/**
+ * One skill a connected server publishes, as the runtime loads it. Backs
+ * `manage_connectors list_bound_skills`, so a workspace admin can audit what a
+ * server puts into the model's context without the body being fetched.
+ */
+export interface PublishedSkillInfo {
+  /** The publishing server (the install's tool-namespace prefix). */
+  server: string;
+  /** The skill's own name on that server. */
+  name: string;
+  description: string;
+  /** The skill's `SKILL.md` URI on the server. */
+  uri: string;
+  loadingStrategy: SkillLoadingStrategy;
+  priority: number;
+  /** The tool patterns the skill is bound to, under the server's namespace. */
+  toolAffinity: string[];
+  triggers?: string[];
+  /** How the skill reaches the model ({@link resolveLoadingMechanism}). */
+  mechanism: SkillLoadingMechanism;
+}
+
+/**
+ * Project a synthesized server skill to its {@link PublishedSkillInfo}, or
+ * `null` for a skill this module did not synthesize.
+ */
+export function publishedSkillInfo(skill: Skill): PublishedSkillInfo | null {
+  const id = parseConnectorSkillName(skill.manifest.name);
+  if (!id) return null;
+  const { manifest } = skill;
+  return {
+    server: id.connector,
+    name: id.name,
+    description: manifest.description,
+    uri: skill.sourcePath,
+    loadingStrategy: manifest.loadingStrategy,
+    priority: manifest.priority,
+    toolAffinity: manifest.toolAffinity ?? [],
+    ...(manifest.triggers?.length ? { triggers: manifest.triggers } : {}),
+    mechanism: resolveLoadingMechanism(manifest),
+  };
 }

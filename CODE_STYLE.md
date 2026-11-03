@@ -1,11 +1,10 @@
 # Code Style
 
 Project-specific code-style and quality-control rules that go beyond what
-Biome and `tsc` enforce automatically. CI's `bun run verify` catches the
-tool-level rules; this file is the home for the human-level ones — patterns
-worth enforcing in review, ideally with a check script wired into
-`verify:static` so the enforcement becomes structural rather than
-aspirational.
+Biome's built-in rules and `tsc` enforce. Each is enforced in review and, where
+it can be automated, by a Grit plugin in `biome-plugins/` (run by `bun run
+lint`) or a `check:*` script under `verify:static`, so a regression fails CI,
+not review.
 
 Each rule documents:
 
@@ -15,9 +14,7 @@ Each rule documents:
 - The **detection** approach — grep query, lint config, or check script
 
 When you find yourself enforcing a convention in code review more than
-once, add it here. When you can express the rule as an automated check,
-wire it into `scripts/check-code-style.ts` (or a sibling script) and run
-it under `verify:static` so future regressions fail CI, not review.
+once, add it here.
 
 ---
 
@@ -50,7 +47,8 @@ the cycle-avoidance argument doesn't hold. What's left is a syntax that
 reads exactly like a runtime dynamic `import()` and trips every reader who
 hasn't seen it before. The readability tax isn't worth the shortcut.
 
-**Detection.** `bun run check:code-style` (wired into `verify:static`).
+**Detection.** The Biome plugin `biome-plugins/inline-type-import.grit`
+(run by `bun run lint`) on `src/` and `scripts/`.
 
 **Override.** None. The rule is absolute; refactor to top-level
 `import type` before merge.
@@ -80,8 +78,46 @@ the first ~8 KB). So the artifact ships a byte the diff never showed the
 reviewer, and code search over a core file goes dark. The escape yields the
 identical runtime string with none of that.
 
-**Detection.** `bun run check:code-style` (wired into `verify:static`) —
-flags any byte in 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, or 0x7F under `src/`.
+**Detection.** The Biome plugin `biome-plugins/control-byte.grit` (run by
+`bun run lint`) flags any byte in 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, or 0x7F
+inside a string, template, or regex literal, a quoted key, a string literal
+type, or a JSX attribute string under `src/` and `scripts/`. A Grit pattern
+cannot see comments, so a control byte in a comment is left to review.
+
+**Override.** None.
+
+---
+
+## Prompt composition
+
+### Containment tags open only through wrapContained
+
+Fence untrusted content in the system prompt with
+`wrapContained(tag, body)` from `src/prompt/containment.ts`. Never write a
+containment tag's open, close, or escape by hand.
+
+```ts
+// BAD — the escape and the close are written separately and can drift.
+const text = `<app-state>\n${body.replaceAll("</app-state>", "")}\n</app-state>`;
+```
+
+```ts
+// GOOD — the open, the escaped close, and the close all derive from one tag.
+const text = wrapContained("app-state", body);
+```
+
+**Rationale.** A body that contains its own fence's close tag ends the fence
+early, and what follows reads as trusted prompt. `wrapContained` builds the
+open, the escape of every close variant in the body, and the close from the
+single `tag` argument, so they cannot diverge.
+
+**Detection.** The Biome plugin `biome-plugins/containment-tag.grit` (run by
+`bun run lint`) flags any string, template, or regex literal, quoted key,
+string literal type, or JSX attribute string under `src/` and `scripts/`
+that opens, closes, or escapes a containment tag outside
+`wrapContained`. The plugin carries its own copy of the `ContainmentTag`
+union, and `test/unit/containment-tag-plugin.test.ts` fails when the two
+differ.
 
 **Override.** None.
 
@@ -162,9 +198,10 @@ a route mounted after the router authenticates once per such router, and
 depend on mount order in `app.ts`. Per-route middleware scopes it to the route
 by construction.
 
-**Detection.** `bun run check:route-middleware` (wired into `verify:static`)
-flags any `.use(...)` call in a file under `src/` that imports from `hono`,
-except `src/api/app.ts`.
+**Detection.** The Biome plugin `biome-plugins/router-use.grit` (run by
+`bun run lint`) flags any `.use(...)` call in a `.ts` file under `src/` except
+`src/api/app.ts`. `test/integration/route-middleware-scope.test.ts` walks the
+mounted route table.
 
 **Override.** None. The global middleware in `src/api/app.ts` (tracing,
 metrics, CORS, security headers, the cross-site guard) is app-wide by design
@@ -214,44 +251,196 @@ its source.
 
 ### Platform tool handlers return a named output type
 
-A tool handler under `src/platform/` declares a named output type from
-`src/platform/schemas/<app>.ts` as its return type, never `object`. The full
-rule, including the construction-site form for handlers that build their own
-`ToolResult`, is `src/platform/AGENTS.md` §2.1.
+A tool under `src/platform/` is registered with `typedTool`, passing a TypeBox
+`outputSchema` from `src/platform/schemas/<app>.ts`, and its handler returns
+that schema's static type, never `object`. The full rule is
+`src/platform/AGENTS.md` §2.1.
 
 ```ts
 // BAD — every caller gets an untyped result and re-declares its shape.
-async function handleTag(store: FileStore, args: TagInput): Promise<object> {
+async function handleTag(store: FileStore, args: FilesTagInput): Promise<object> {
   return { id: args.id, tags: newTags };
 }
 ```
 
 ```ts
-// GOOD — the named type is the contract every caller imports.
-import type { FilesTagOutput } from "../schemas/files.ts";
+// GOOD — the schema is the contract; the handler returns its static type.
+import { FilesTagInput, FilesTagOutput } from "../schemas/files.ts";
 
-async function handleTag(store: FileStore, args: TagInput): Promise<FilesTagOutput> {
+async function handleTag(store: FileStore, args: FilesTagInput): Promise<FilesTagOutput> {
   return { id: args.id, tags: newTags };
 }
+
+typedTool({
+  name: "tag",
+  description: "Add or remove tags on a file.",
+  inputSchema: FilesTagInput,
+  outputSchema: FilesTagOutput,
+  handler: async (input) => ok(await handleTag(getStore(), input)),
+});
 ```
 
 **Rationale.** A handler's return type is its tool's contract. Declared as
 `object`, it checks nothing: callers and tests cast the result to a shape they
 write themselves, and those casts drift from the handler the first time it
-changes. A named type in `schemas/` is compiled against the handler and, through
-codegen, shared with the web client, so a changed shape fails the build at each
-consumer.
+changes. A named schema in `schemas/` is compiled against the handler,
+published on `tools/list`, and through codegen shared with the web client, so a
+changed shape fails the build at each consumer.
 
-**Detection.** `bun run check:platform-output-types` (wired into
-`verify:static`) flags any function implementation in a `.ts` file under
-`src/platform/`, outside the app UI packages, whose declared return type is
-`object`, `Promise<object>`, or a union with either as a member. A function type
-is not flagged, so a registration signature that accepts a handler
-(`fn: (input) => Promise<object>`) passes.
+**Detection.** `typedTool` fails the typecheck when a success result's
+`structuredContent` is not the output schema's static type, so a helper typed
+`object` cannot feed it while the schema has a required field. (`object` is
+assignable to an all-optional object type, so there the SDK client's runtime
+check is the guard.) `test/unit/platform/schema-shape.test.ts` fails when a
+platform tool publishes no output schema, and the SDK client fails any call
+whose result does not match the published one.
 
-**Override.** None. Declare the output type in `schemas/`; when it mirrors a
+**Override.** None. Declare the output schema in `schemas/`; when it mirrors a
 domain type the schemas tree cannot import, hold the two together with a
 drift guard (`src/platform/files/output-types-drift-guard.ts`).
+
+---
+
+## Lint suppressions
+
+### A biome-ignore states why the rule does not apply here
+
+A suppression's reason names the specific fact that makes the rule wrong at
+this line. It never just says the suppression is wanted, and never points at
+another comment.
+
+```ts
+// BAD — says the suppression is wanted, not why the dependency can be left out.
+// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally runs only on mount
+useEffect(() => {
+  if (chatId) openPanel(chatId);
+}, []);
+
+// BAD — true only while the comment it points at stays put.
+// biome-ignore lint/suspicious/noArrayIndexKey: same as above
+```
+
+```ts
+// GOOD — no suppression: `useEffectEvent` reads the latest `openPanel`
+// without making it a dependency.
+const openFromUrl = useEffectEvent(() => {
+  if (chatId) openPanel(chatId);
+});
+useEffect(() => {
+  openFromUrl();
+}, []);
+
+// GOOD — the reason is the fact that makes the extra dependency right.
+// biome-ignore lint/correctness/useExhaustiveDependencies: `refreshKey` moves when the panel's data changes, which is when the stats are re-read
+```
+
+Before writing a reason, try removing the need for one. For
+`useExhaustiveDependencies`: list a dependency that is stable (a `useCallback`
+or memoized result, a state setter); read a value without re-running through
+`useEffectEvent`; reset state when a key changes while rendering rather than
+in an effect; key a list by something other than its position.
+
+**Rationale.** A suppression switches a check off for one line, so its reason
+is the only record of why the check is wrong there. A reason that only
+asserts intent cannot be checked against the code, so a stale closure or a
+list that started reordering hides behind it until someone re-derives the
+reason from scratch.
+
+**Detection.** Review: whether a reason holds takes a reader. Biome refuses a
+suppression with no reason at all.
+
+**Override.** None.
+
+---
+
+## Types
+
+### A double cast names its mismatch
+
+Reach a type through a typed path: a type guard, a schema parse, a typed
+helper, or the SDK's own input or output type. When none exists, an
+`as unknown as T` carries a suppression whose reason names what the value is and
+what the code claims it is.
+
+```ts
+// BAD — nothing says why the compiler is wrong, or when it stops being wrong.
+const { taskId } = args as unknown as { taskId: string };
+const stub = { postMessage() {} } as unknown as Window;
+```
+
+```ts
+// GOOD — a typed path: `typedTool` gives the handler its schema's static type.
+typedTool({
+  name: "delete",
+  inputSchema: TasksDeleteInput,
+  handler: async ({ taskId }) => ok(await deleteTask(taskId)),
+});
+
+// GOOD — a test double through `stub<T>` (test/helpers/stub.ts): the members
+// it shares with `T` are checked against `T`, and the ones left out are absent.
+const runtime = stub<Runtime>({ requireWorkspaceId: () => WS });
+
+// GOOD — no typed path, so the reason names the mismatch.
+// biome-ignore lint/plugin/double-cast: the app's window, reduced to the `postMessage` the bridge calls
+const stub = { postMessage() {} } as unknown as Window;
+```
+
+**Rationale.** A cast through `unknown` switches the compiler off for one
+value, and nothing records why. A typed path removes the hole: the type comes
+from where the value is made or checked (the validator, the schema, the SDK), so
+a change on that side fails the build at the use. Where no typed path exists,
+the reason is the only record of the mismatch, and it says when the cast can
+go: when the SDK types the result, when the stub grows the missing member.
+
+**Detection.** The Biome plugin `biome-plugins/double-cast.grit` (run by
+`bun run lint`) flags `x as unknown as T`, `(x as unknown) as T`, and `(x as unknown)! as T`. Biome
+refuses a suppression with an empty reason and reports one that no longer
+suppresses anything. Whether a reason is true is review's call. The repo has no
+`<T>x` assertions, and the plugin does not look for them.
+
+**Override.** The suppression above, on the line directly above the line where
+the cast expression starts; a longer explanation may sit above it. The plugin
+runs on the paths in its `biome.json` override: `scripts/`, `src/` (the platform
+app UIs included), `web/src/`, `test/`, and `web/test/`.
+
+---
+
+### A cast to `never` names its mismatch
+
+`never` is assignable to every type, so `x as never` passes `x` into any slot
+unchecked: a double cast in one step. Give the value its slot's type instead;
+where the value is deliberately outside that type, suppress with a reason.
+
+```ts
+// BAD — the fixture can drift from the type it stands in for, and nothing fails.
+runWithRequestContext({ identity: { id: USER } as never }, run);
+```
+
+```ts
+// GOOD — `makeIdentity` (test/helpers/identity.ts) returns a whole `UserIdentity`,
+// so a change to the type fails in one place.
+runWithRequestContext({ identity: makeIdentity({ id: USER }) }, run);
+
+// GOOD — the value is outside the type on purpose, and the reason says so.
+// biome-ignore lint/plugin/never-cast: a stored tier outside `SkillScope`, which is the input under test
+skillProvenanceLabel({ scope: "retired-tier" as never });
+```
+
+**Rationale.** The same as for a double cast: the compiler stops checking the
+value, and nothing records why. A test fixture cast this way keeps compiling
+after the type it imitates changes, so the test goes on exercising a shape the
+code no longer receives.
+
+**Detection.** The Biome plugin `biome-plugins/never-cast.grit` (run by
+`bun run lint`) flags `x as never` and `x as never[]`. A `never` annotation
+(`const xs: never[] = []`, an exhaustiveness check) is not a cast and passes. It
+does not look for `x as Array<never>` or a `<never>x` assertion; the repo has
+neither.
+
+**Override.** `// biome-ignore lint/plugin/never-cast: <reason>` on the line
+directly above the line where the cast expression starts. The plugin runs on
+the paths in its `biome.json` override: `scripts/`, `src/` (the platform app
+UIs included), `web/src/`, `web/test/`, and `test/`.
 
 ---
 
@@ -261,10 +450,10 @@ drift guard (`src/platform/files/output-types-drift-guard.ts`).
    rationale. Multi-clause rules turn into multi-clause exceptions.
 2. **Add a section above** describing the rule with the same shape
    (anti-example, good example, rationale, detection, override).
-3. **Wire enforcement.** Extend `scripts/check-code-style.ts` with a
-   detection pass. The script aggregates findings across all rules and
-   fails the run on any match. CI runs it as part of `verify:static` via
-   the `check:code-style` script in `package.json`.
+3. **Wire enforcement.** Add a Grit plugin to `biome-plugins/` and list
+   it in a `biome.json` override with the paths it covers; `bun run lint`
+   runs it in CI. A rule no syntax pattern can express gets its own
+   `check:*` script under `verify:static`.
 4. **Land all three artifacts in one PR** — the rule doc, the check, and
    the cleanup of any existing violations. Otherwise the rule lands
    without teeth and the next reviewer has to do the cleanup.

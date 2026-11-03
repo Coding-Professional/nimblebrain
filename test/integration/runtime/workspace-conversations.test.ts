@@ -5,11 +5,10 @@
  * `{workDir}/workspaces/<wsId>/conversations/<ownerId>/<convId>.jsonl`. An
  * identity-bound dev-mode chat with no `workspaceId` is born in the caller's
  * default workspace (provisioned for them if they have none), with the owner as
- * the privacy sub-partition. The old flat `{workDir}/conversations/` layout is gone.
+ * the privacy sub-partition. There is no flat `{workDir}/conversations/` layout.
  *
- * Stage 2 (T006) made the chat surface identity-bound:
- * `ChatRequest.workspaceId` is removed and `ChatResult.workspaceId` with
- * it. The `workspaceId` on conversation metadata is the session's
+ * The chat surface is identity-bound: neither `ChatRequest` nor
+ * `ChatResult` carries a `workspaceId`. The `workspaceId` on conversation metadata is the session's
  * workspace — the workspace binding and a breadcrumb for legacy single-workspace
  * reads (overlays, file store) — not a per-call attribution. Per-call
  * workspace lives on each `tool.done` event's `workspaceId`, stamped by the
@@ -138,7 +137,7 @@ describe("conversation persistence — workspace layout", () => {
     await runtime.shutdown();
   });
 
-  it("conversation metadata includes ownerId and a workspace breadcrumb", async () => {
+  it("conversation metadata includes ownerId, and the workspace is the directory", async () => {
     const workDir = join(testDir, "ws-meta");
     mkdirSync(workDir, { recursive: true });
 
@@ -172,11 +171,11 @@ describe("conversation persistence — workspace layout", () => {
     const metadataLine = JSON.parse(content.split("\n")[0]!);
 
     expect(metadataLine.ownerId).toBe("user_alice");
-    // The metadata `workspaceId` is the session's workspace — here the owner's
-    // default one, provisioned with an opaque id. Per-call workspaceId lives
-    // on tool.done events.
-    expect(metadataLine.workspaceId).toBe(await defaultWorkspaceId(runtime, identity.id));
-    expect(metadataLine.workspaceId).toMatch(/^ws_[0-9a-f]{16}$/);
+    // The workspace is the directory the file is stored under; line 1 names none.
+    expect(metadataLine.workspaceId).toBeUndefined();
+    const wsId = await defaultWorkspaceId(runtime, identity.id);
+    expect(wsId).toMatch(/^ws_[0-9a-f]{16}$/);
+    expect(convFile).toContain(`/workspaces/${wsId}/conversations/`);
 
     await runtime.shutdown();
   });

@@ -12,7 +12,7 @@
  * future HTTP-backed source reads the same shape natively. Consumers always
  * see one type. The `_meta` extension
  * `ai.nimblebrain/connector` carries our platform-specific fields
- * (auth, operatorSetup, etc.) without polluting upstream-defined slots.
+ * (auth, oauthClientSetup, etc.) without polluting upstream-defined slots.
  *
  * Validated at every system boundary so an invalid entry is dropped
  * at the source it came from, never reaching the UI / agent. Each
@@ -119,7 +119,7 @@ export interface ComposioConnectField {
 /**
  * Composio connector config. Single source of truth for the shape carried in
  * the connector `_meta` and threaded verbatim through the install action and
- * directory entry (previously duplicated inline across three files).
+ * directory entry.
  *
  * - `toolkit`: Composio's slug for the upstream (`gmail`, `posthog`, …).
  *   Passed as the `authConfigs` key to `composio.create(...)` at install and
@@ -179,7 +179,7 @@ export interface SecretHeaderRef extends CredentialRef {
 /**
  * NimbleBrain-specific extension carried inside `ServerDetail._meta`
  * under the key `ai.nimblebrain/connector`. Holds the platform-specific
- * fields that don't fit upstream slots: OAuth flow type, operator-setup
+ * fields that don't fit upstream slots: OAuth flow type, OAuth client setup
  * pointers, recommended scope, search tags, and UI hints.
  *
  * Authored on entries we curate (loaded by the catalog read from the
@@ -194,12 +194,13 @@ export interface NimbleBrainConnectorMeta {
      *
      * Runtime-native ({@link RUNTIME_NATIVE_AUTH_KINDS}):
      * - `dcr`: dynamic client registration (RFC 7591). Provider issues
-     *   a client at first use; no operator setup.
-     * - `static`: pre-registered OAuth client. Operator provides
-     *   `clientId` + `clientSecret` from the vendor's developer portal.
+     *   a client at first use; no OAuth client setup.
+     * - `static`: pre-registered OAuth client. A workspace admin provides
+     *   `clientId` + `clientSecret` from the vendor's developer portal, or the
+     *   instance declares them once (`connectors.oauthClients`).
      * - `provider`: a platform-managed connector whose credential is produced
-     *   server-side by a named credential provider (no user/operator OAuth, no
-     *   per-user secret). Required: the `providerAuth` block below.
+     *   server-side by a named credential provider (no user OAuth, no OAuth client,
+     *   no per-user secret). Required: the `providerAuth` block below.
      *
      * Anything else names a **brokered** provider (`composio`, `smithery`) — a
      * third party that holds the upstream credential and hosts the MCP session.
@@ -215,8 +216,11 @@ export interface NimbleBrainConnectorMeta {
      * we ship, not an enumeration the runtime enforces.
      */
     auth?: ConnectorAuthKind;
-    /** Required for `auth: "static"`: where the operator creates the OAuth app. */
-    operatorSetup?: {
+    /**
+     * Required for `auth: "static"`: where a workspace admin creates the OAuth
+     * client and which credential key holds its secret.
+     */
+    oauthClientSetup?: {
         portalUrl: string;
         hint: string;
         clientSecretKey: string;
@@ -271,6 +275,17 @@ export interface NimbleBrainConnectorMeta {
     requiredScopes?: string[];
     /** Optional extra authorize-URL params (e.g. Google's access_type=offline). */
     additionalAuthorizationParams?: Record<string, string>;
+    /**
+     * Text this server puts in an `isError` tool result when it rejects the
+     * access token, for a server that answers a rejected token in-band (HTTP 200)
+     * instead of with the 401 the MCP authorization spec requires. Matched as
+     * case-insensitive substrings of the result's text. A match is handled as a
+     * 401 would be: refresh once and retry, else `reauth_required`. Declared per
+     * entry because only the vendor's own wording is safe to read as "this
+     * credential was refused"; a pattern applied to every connector would read a
+     * tool reporting on some other credential the same way.
+     */
+    inBandAuthErrors?: string[];
     /** Search/filter tags surfaced on the Browse card. */
     tags?: string[];
     /** Marks the connector as exposing a UI surface — sets the "Interactive" badge. */
@@ -285,6 +300,13 @@ export interface NimbleBrainConnectorMeta {
      * flag is the operator's opt-in, the auth check is the hard gate.
      */
     personal?: boolean;
+    /**
+     * How to ask the connected service which account it is signed in as, for a
+     * service whose sign-in names none: `{ tool, arguments?, field }`. Read
+     * through `parseAccountLookup` (`account-lookup.ts`), which has the shape
+     * and why the catalog is where it is declared.
+     */
+    account?: unknown;
 }
 /** The canonical wire format. Upstream `ServerDetail`. */
 export interface ServerDetail {

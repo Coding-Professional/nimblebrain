@@ -9,7 +9,9 @@
 // about the panel's own layout.
 //
 // What stays here, because it needs the focused app:
-//   - `SlotRenderer` — renders the placement's iframe
+//   - `SlotRenderer` — renders the placement's iframe, with the tools of the
+//     app's connector the viewer may call (`allowedTools`, from the installed
+//     entry; none for an identity app, which belongs to no connector)
 //   - `handleChat` — the iframe→shell channel for "send this from inside the
 //     app". It is the one place a focused app is known, so it stamps the
 //     app's `AppContext` on outgoing messages.
@@ -23,13 +25,15 @@
 //     to the last in-flight conversation so the SSE viewer reconnects.
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef } from "react";
 import { useLocation } from "react-router-dom";
 import type { AppTrailEntry } from "../bridge/schemas";
 import { useAppLocation } from "../context/AppLocationContext";
 import { useChatContext } from "../context/ChatContext";
 import { useChatPanelContext } from "../context/ChatPanelContext";
 import { useFocusedApp } from "../context/FocusedAppContext";
+import { useWorkspaceAppIcons } from "../context/WorkspaceAppIconsContext";
+import { useWorkspaceContext } from "../context/WorkspaceContext";
 import { getSavedConversationId, setSavedConversationId } from "../lib/active-conversation-storage";
 import { useIsMobile } from "../lib/hooks/use-is-mobile";
 import { appTargetFrom } from "../lib/open-app";
@@ -68,16 +72,25 @@ export function AppWithChat({ placement }: AppWithChatProps) {
   const { setFocusedApp } = useFocusedApp();
   const { setAppLocation } = useAppLocation();
   const location = useLocation();
+  const { connectors } = useWorkspaceAppIcons();
+  const { activeWorkspace } = useWorkspaceContext();
+  // The app's connector, read for the workspace on screen only: after a switch
+  // the list names the previous workspace until the refetch lands. An identity
+  // app is no connector, so it finds none and is sent no `connector` key.
+  const allowedTools =
+    connectors && connectors.workspaceId === activeWorkspace?.id
+      ? connectors.installed.find((c) => c.serverName === placement.serverName)?.allowedTools
+      : undefined;
 
   // Collapse fullscreen when navigating to a different route
   const prevPathnameRef = useRef(location.pathname);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: only react to pathname changes, panelState/toggleFullscreen are intentionally excluded
+  const collapseFullscreen = useEffectEvent(() => {
+    if (panelState === "fullscreen") toggleFullscreen();
+  });
   useEffect(() => {
     if (location.pathname !== prevPathnameRef.current) {
       prevPathnameRef.current = location.pathname;
-      if (panelState === "fullscreen") {
-        toggleFullscreen();
-      }
+      collapseFullscreen();
     }
   }, [location.pathname]);
 
@@ -87,8 +100,7 @@ export function AppWithChat({ placement }: AppWithChatProps) {
   // loadConversation re-subscribes and the server's `isActive` drives the
   // bubble. Module-once so app-to-app navigation doesn't re-trigger it.
   const deepLinkHandled = useRef(false);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally runs only on mount
-  useEffect(() => {
+  const openFromUrl = useEffectEvent(() => {
     if (deepLinkHandled.current) return;
     deepLinkHandled.current = true;
     const chatId = new URLSearchParams(window.location.search).get("chat");
@@ -99,6 +111,9 @@ export function AppWithChat({ placement }: AppWithChatProps) {
     if (restoredLastConversation) return;
     restoredLastConversation = true;
     restoreSavedConversation(chat);
+  });
+  useEffect(() => {
+    openFromUrl();
   }, []);
 
   // Persist the active conversation id (per-tab) so a reload can reopen it.
@@ -124,7 +139,7 @@ export function AppWithChat({ placement }: AppWithChatProps) {
     return () => setFocusedApp(null);
   }, [appContext, setFocusedApp]);
 
-  // A view to open inside the app, carried by `openApp` in the router state.
+  // A view to open inside the app, carried in the router state by an open (ADR-0052).
   // Keyed by the navigation, so asking for the same view again re-sends it.
   const targetId = appTargetFrom(location.state);
   const target = useMemo(
@@ -140,7 +155,7 @@ export function AppWithChat({ placement }: AppWithChatProps) {
     (trail: AppTrailEntry[], navigate: (id: string) => void) => setAppLocation({ trail, navigate }),
     [setAppLocation],
   );
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the placement is the trigger, not a value read
+  // biome-ignore lint/correctness/useExhaustiveDependencies: sibling app routes reuse this instance, so a new `placement.resourceUri` is the app leaving and its trail must clear as on unmount
   useEffect(() => () => setAppLocation(null), [setAppLocation, placement.resourceUri]);
 
   const handleChat = useCallback(
@@ -190,6 +205,7 @@ export function AppWithChat({ placement }: AppWithChatProps) {
           onChat={handleChat}
           onLocation={handleLocation}
           target={target}
+          allowedTools={allowedTools}
         />
       </div>
     </div>

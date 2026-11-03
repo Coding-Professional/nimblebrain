@@ -1,3 +1,4 @@
+import { CONVERSATION_URI_SCHEME } from "../conversation/uri.ts";
 import { FILE_URI_SCHEME } from "../files/uri.ts";
 import { ARTIFACT_URI_SCHEME } from "../host-resources/artifacts/artifact-uri.ts";
 
@@ -8,14 +9,11 @@ import { ARTIFACT_URI_SCHEME } from "../host-resources/artifacts/artifact-uri.ts
  * turns the capability on:
  *
  *   - **Recognition** — the runtime resolves the URI on its own: by walking the
- *     workspace registry for a scheme its apps publish, by matching the scheme
- *     directly, or by reading a fixed URI off every source. Publishing a
- *     matching resource is enough, which is safe because none of these buys the
- *     publisher anything it could not already have: a skill is read when it is
- *     wanted, a UI renders when the agent asks, an overlay is composed on the
- *     next turn, an artifact or a file is fetched when a viewer opens it, and
- *     `app://instructions` only ever adds the publisher's own text to the
- *     publisher's own entry in the prompt.
+ *     workspace registry for a scheme its apps publish, or by matching the
+ *     scheme directly. Publishing a matching resource is enough, which is safe
+ *     because none of these buys the publisher anything it could not already
+ *     have: a skill is read when it is wanted, a UI renders when the agent
+ *     asks, and an artifact or a file is fetched when a viewer opens it.
  *   - **Declaration** — the runtime reads a URI out of a server's manifest and
  *     treats it as an opaque string. Nothing undeclared is reached. That is how
  *     an outbox is reached, because an outbox costs a poll per
@@ -32,9 +30,9 @@ import { ARTIFACT_URI_SCHEME } from "../host-resources/artifacts/artifact-uri.ts
  * Two sets, because they answer different questions and do not coincide:
  * a set that governs a refusal has to be complete or the refusal is decorative,
  * while a set that renders prose has to match what the reader can actually
- * reach. `artifact://`, `files://` and `app://` are host-resolved but are not
- * things to point `read_resource` at, so they belong in the first and not the
- * second.
+ * reach. `artifact://`, `files://` and `conversation://` are
+ * host-resolved but are not things to point `read_resource` at, so they belong
+ * in the first and not the second.
  *
  * Completeness is the property the refusal rests on, and a comment cannot hold
  * it: `scripts/check-resource-schemes.ts` fails the build on a scheme spelled
@@ -49,42 +47,25 @@ import { ARTIFACT_URI_SCHEME } from "../host-resources/artifacts/artifact-uri.ts
  * Their home is here because no single module owns one: each is published as
  * resources by whichever in-process app serves them.
  */
-const REGISTRY_RESOURCE_SCHEMES = ["skill", "ui", "instructions"] as const;
-
-/**
- * The `app://` scheme, and the single URI under it the runtime reads.
- *
- * `app://instructions` is a host convention rather than a connector's own
- * namespace, which is why it is named here and not by a subsystem: a connector
- * publishes its custom-instructions overlay at that exact URI and
- * `Runtime.buildAppInfo` reads it off every connector's source on every prompt
- * assembly. A fixed scheme is the point — a connector author cannot be expected to
- * know the platform's server-name derivation, so the convention carries the
- * name instead.
- *
- * It is the one recognized scheme that costs a read per connector per assembly, so
- * an outbox landing on it would be polled *and* rendered into the system
- * prompt.
- */
-const APP_URI_SCHEME = "app";
-export const APP_INSTRUCTIONS_URI = `${APP_URI_SCHEME}://instructions`;
+const REGISTRY_RESOURCE_SCHEMES = ["skill", "ui"] as const;
 
 /**
  * Every scheme the runtime resolves itself, and so the closed set a declared
  * outbox may not land on.
  *
- * Composed rather than restated: `artifact` and `files` are taken from the
- * modules that own them, each of which already validates its own scheme as the
- * single authority for it. Adding a seventh means extending
- * {@link REGISTRY_RESOURCE_SCHEMES}, importing the constant its owner exports, or —
- * when the scheme has no owner but this module — declaring it here as `app` is
- * declared. Never a second spelling of a scheme that already has a home.
+ * Composed rather than restated: `artifact`, `files` and `conversation` are
+ * taken from the modules that own them, each the single authority for its own
+ * scheme. `conversation://` is answered by opening, not reading: the host shows
+ * it in the chat panel (ADR-0052), which is still an answer a declared resource
+ * must not collide with. Adding another means extending
+ * {@link REGISTRY_RESOURCE_SCHEMES}, importing the constant its owner exports, or
+ * declaring it here when it has no owner but this module. Never a second spelling of a scheme that already has a home.
  */
 export const RESERVED_RESOURCE_SCHEMES = [
   ...REGISTRY_RESOURCE_SCHEMES,
   ARTIFACT_URI_SCHEME,
   FILE_URI_SCHEME,
-  APP_URI_SCHEME,
+  CONVERSATION_URI_SCHEME,
 ] as const;
 
 /**
@@ -93,10 +74,7 @@ export const RESERVED_RESOURCE_SCHEMES = [
  *
  * Deliberately not the reserved set. `artifact://` is intercepted before source
  * routing and `files://` belongs to an identity source composed into no
- * workspace registry, so `read_resource` reaches neither. `app://instructions`
- * it would reach — by asking each source in turn until one answers — but the
- * answer is whichever connector replies first, which is not an address worth
- * handing the model.
+ * workspace registry, so `read_resource` reaches neither.
  */
 export const READ_RESOURCE_SCHEMES_PROSE = REGISTRY_RESOURCE_SCHEMES.map(
   (scheme) => `\`${scheme}://\``,
@@ -118,4 +96,34 @@ export function isReservedResourceScheme(uri: string): boolean {
   if (colon < 0) return false;
   const scheme = uri.slice(0, colon).toLowerCase();
   return (RESERVED_RESOURCE_SCHEMES as readonly string[]).includes(scheme);
+}
+
+/** Most templates one app lists in the prompt. A server publishing more is cut, not refused. */
+export const MAX_PROMPT_RESOURCE_TEMPLATES = 10;
+
+/** Longest template kept. A URI shape longer than this is not one the model should type. */
+const MAX_RESOURCE_TEMPLATE_CHARS = 200;
+
+/**
+ * The connector templates worth naming to the model as readable records: each
+ * server's `resources/templates/list`, minus templates in a scheme the host
+ * resolves itself (a `skill://` or `ui://` template is reached through its own
+ * mechanism, not as a record), deduplicated by template, and bounded in count
+ * and length so a server cannot grow the prompt without limit. Order is the
+ * server's, so the prompt stays byte-stable while the server's list does.
+ */
+export function readableRecordTemplates<T extends { uriTemplate: string }>(
+  templates: readonly T[],
+): T[] {
+  const seen = new Set<string>();
+  const kept: T[] = [];
+  for (const t of templates) {
+    if (kept.length >= MAX_PROMPT_RESOURCE_TEMPLATES) break;
+    const shape = t.uriTemplate.trim();
+    if (!shape.includes("://") || shape.length > MAX_RESOURCE_TEMPLATE_CHARS) continue;
+    if (isReservedResourceScheme(shape) || seen.has(shape)) continue;
+    seen.add(shape);
+    kept.push({ ...t, uriTemplate: shape });
+  }
+  return kept;
 }

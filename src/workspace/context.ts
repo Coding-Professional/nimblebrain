@@ -148,10 +148,9 @@ export class WorkspaceContext {
   /**
    * The platform-wide working directory (e.g. `~/.nimblebrain`).
    *
-   * Exposed because some legacy call sites need the global root for
-   * non-workspace-scoped paths (the workspace tree itself, instance.json,
-   * the connector registry cache). New code should treat this as an
-   * implementation detail and prefer the scope-aware helpers below.
+   * Exposed for paths outside the workspace scope (the workspace tree itself,
+   * instance.json, the connector registry cache). A workspace-scoped path uses
+   * the scope-aware helpers below instead.
    */
   get workDir(): string {
     return this.#workDir;
@@ -271,7 +270,7 @@ function workspaceRootOf(dir: string): { wsId: string; root: string } | null {
  * without changing what it does for the others.
  *
  * Call this directly when the writer must keep its own `mkdir` — the
- * credential and instructions dirs pass `mode: 0o700`, and several are
+ * credential dirs pass `mode: 0o700`, and several are
  * `await mkdir`, so swapping in {@link ensureWorkspaceDir} would widen them to
  * the umask default or make them synchronous. Both entry points read one rule
  * from one place; there is no second definition of it.

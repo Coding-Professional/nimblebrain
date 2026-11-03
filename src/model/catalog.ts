@@ -24,6 +24,24 @@ export interface ModelCost {
   cacheWrite?: number;
   /** USD per 1M reasoning tokens */
   reasoning?: number;
+  /**
+   * Rate cards for longer prompts, ascending by `aboveInputTokens`. A call
+   * whose prompt (every input-side token, cached or not) exceeds a tier's
+   * threshold bills every bucket at that tier's rates instead of the base
+   * ones. Absent for a model with one rate card.
+   */
+  tiers?: ModelCostTier[];
+}
+
+/** One prompt-length rate card; the rates have the same units as `ModelCost`. */
+export interface ModelCostTier {
+  /** The tier applies to a call whose prompt is longer than this many tokens. */
+  aboveInputTokens: number;
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  reasoning?: number;
 }
 
 export interface ModelLimits {
@@ -117,8 +135,8 @@ export function getModel(provider: string, modelId: string): CatalogModel | unde
 }
 
 /**
- * Look up a model by its full "provider:model-id" string.
- * Bare strings (no colon) are treated as anthropic.
+ * Look up a model by its full "provider:model-id" string. A string with no
+ * colon names no provider, so it finds nothing.
  */
 export function getModelByString(modelString: string): CatalogModel | undefined {
   const { provider, modelId } = parseModelString(modelString);
@@ -126,9 +144,8 @@ export function getModelByString(modelString: string): CatalogModel | undefined 
 }
 
 /**
- * Find which provider in the catalog owns the given bare model id.
- * Used by the resolver to rescue bare ids written to disk before the
- * settings UI started encoding `provider:` into option values.
+ * Find which provider in the catalog owns the given bare model id. Used to
+ * suggest the qualified form when an input names a model without its provider.
  *
  * Returns null when the id isn't in any provider's catalog. O(1) via
  * the precomputed `idToProvider` map; duplicates surface as warnings
@@ -183,7 +200,7 @@ export function isModelAllowed(
  * Get the list of available models for configured providers, respecting
  * allowlists. Deprecated models are excluded — this feeds the settings
  * model picker, and a model the upstream provider has shut down (e.g.
- * `openai:gpt-5.3-chat-latest`, retired 2026-08-10) must not be
+ * `openai:gpt-4-turbo`) must not be
  * re-selectable. `listModels` stays honest as "all models for a provider";
  * the "available to pick" filter lives here. Note this does not retroactively
  * fix a slot already pointing at a deprecated model — that override must be
@@ -261,17 +278,17 @@ export function getAvailableModels(
 // Helpers
 // ============================================================================
 
+/**
+ * Split `provider:model`. A string with no colon has an empty provider, which
+ * no catalog entry or dialect matches.
+ */
 function parseModelString(modelString: string): { provider: string; modelId: string } {
   const idx = modelString.indexOf(":");
-  if (idx === -1) return { provider: "anthropic", modelId: modelString };
+  if (idx === -1) return { provider: "", modelId: modelString };
   return { provider: modelString.slice(0, idx), modelId: modelString.slice(idx + 1) };
 }
 
-/**
- * Extract the provider name from a model string. Bare strings (no `:`)
- * are treated as `"anthropic"` — same rule as `getModelByString`.
- * Single source of truth for that convention.
- */
+/** Extract the provider name from a model string: empty when it has no `:`. */
 export function getProviderFromModel(modelString: string): string {
   return parseModelString(modelString).provider;
 }
@@ -288,6 +305,7 @@ export function getProviderFromModel(modelString: string): string {
  * models.dev ever emits one.
  */
 const ADAPTIVE_ONLY_THINKING_MODELS: ReadonlySet<string> = new Set([
+  "claude-haiku-5-5",
   "claude-opus-4-7",
   "claude-opus-4-8",
   "claude-opus-5",
@@ -355,6 +373,8 @@ export type GoogleThinkingSupport =
  * the guesswork this table replaced.
  */
 const GOOGLE_THINKING: Record<string, GoogleThinkingSupport> = {
+  // Thinking cannot be turned off: no `minimal`, default `medium`.
+  "gemini-4-argon": { dialect: "level", levels: new Set(["low", "medium", "high"]) },
   "gemini-3.8-flash": { dialect: "level", levels: new Set(["low", "medium", "high"]) },
   "gemini-3.7-flash": { dialect: "level", levels: new Set(["low", "medium", "high"]) },
   "gemini-3.6-flash": { dialect: "level", levels: new Set(GOOGLE_THINKING_LEVELS) },
@@ -412,9 +432,9 @@ export type OpenAIWireEffort = OpenAIEffort | "minimal";
  * it — it forwards the string and the API rejects it. `gpt-5-pro` is the one
  * that bites with no configuration at all: it rejects `medium`, which is
  * `DEFAULT_THINKING_EFFORT`, so a slot pointed at it 400s on every call.
- * `gpt-5.2-chat-latest` is the one that breaks the shape the rest suggest —
- * bounded from above as well as below, and not a `-pro` model — so don't read
- * the restrictions as a `-pro` rule and skip measuring the rest.
+ * Restriction is a measured property of each model, not of its name: `o3-pro`
+ * is a `-pro` model and takes the full ladder. So don't read the restrictions
+ * as a `-pro` rule and skip measuring the rest.
  */
 const FULL_LADDER: ReadonlySet<OpenAIWireEffort> = new Set(OPENAI_EFFORTS);
 /** The three models that also take the sub-`low` `minimal` tier. */
@@ -426,12 +446,8 @@ const OPENAI_EFFORT_SUPPORT: Record<string, ReadonlySet<OpenAIWireEffort>> = {
   "gpt-5.2-pro": new Set(["medium", "high"]),
   "gpt-5.4-pro": new Set(["medium", "high"]),
   "gpt-5.5-pro": new Set(["medium", "high"]),
-  // Deprecated, and hidden from the picker — but a pinned `providers.openai.models`
-  // entry still resolves it, and it still rejects `low` and `high` on the wire.
-  // Drop this row once models.dev stops carrying the model (OpenAI shutdown 2026-08-10).
-  "gpt-5.2-chat-latest": new Set(["medium"]),
 
-  // Measured and unrestricted — 23 of the 28 reachable models.
+  // Measured and unrestricted.
   "gpt-5": FULL_PLUS_MINIMAL,
   "gpt-5-mini": FULL_PLUS_MINIMAL,
   "gpt-5-nano": FULL_PLUS_MINIMAL,
@@ -449,6 +465,8 @@ const OPENAI_EFFORT_SUPPORT: Record<string, ReadonlySet<OpenAIWireEffort>> = {
   "gpt-6-astra": FULL_LADDER,
   "gpt-6-luna": FULL_LADDER,
   "gpt-6-sol": FULL_LADDER,
+  "gpt-6.1-sol": FULL_LADDER,
+  "gpt-6.1-terra": FULL_LADDER,
   o1: FULL_LADDER,
   "o1-pro": FULL_LADDER,
   o3: FULL_LADDER,
@@ -544,9 +562,10 @@ export type XAIWireEffort = XAIEffort | "none";
  * capability flag; that would misreport reasoning cost to say nothing of being
  * false.
  *
- * Absent vs. empty behave identically at the engine (send nothing) but differ
- * to `xaiUnmeasuredReasoningModels` below, which is what keeps a newly-synced
- * Grok from silently inheriting a guessed ladder.
+ * Absent vs. empty both send nothing at the engine, but an operator-requested
+ * tier on an absent row logs a warning. They also differ to
+ * `xaiUnmeasuredReasoningModels` below, which keeps a newly-synced Grok from
+ * silently inheriting a guessed ladder.
  *
  * Only reasoning-capable models belong here. A non-reasoning one needs no row:
  * `resolveThinking` drops the override on `capabilities.reasoning` before the
@@ -593,4 +612,83 @@ export function xaiEffortModelIds(): string[] {
 export function xaiSupportedEfforts(modelString: string): ReadonlySet<XAIWireEffort> | undefined {
   const { modelId } = parseModelString(modelString);
   return XAI_EFFORT_SUPPORT[modelId];
+}
+
+/** GreenPT's effort ladder as the platform can express it, ascending. */
+export const GREENPT_EFFORTS = ["low", "medium", "high"] as const;
+export type GreenptEffort = (typeof GREENPT_EFFORTS)[number];
+
+/**
+ * Every tier GreenPT accepts on the wire. `none` and `minimal` sit below the
+ * ladder, the same split as xAI's `none` and OpenAI's `minimal`: reachable only
+ * by a caller naming them, never by stepping down from a requested depth.
+ * `none` suppresses reasoning (measured on `glm-5.2` and `kimi-k3`: no
+ * reasoning deltas), so it implements `thinking: "off"` where a model takes it.
+ */
+export type GreenptWireEffort = GreenptEffort | "none" | "minimal";
+
+const GREENPT_FULL: ReadonlySet<GreenptWireEffort> = new Set([
+  ...GREENPT_EFFORTS,
+  "none",
+  "minimal",
+]);
+
+/**
+ * Effort ladder per GreenPT model, measured against `POST /v1/chat/completions`.
+ * GreenPT answers an unaccepted `reasoning_effort` with a 400 that names the
+ * values the model takes, so each row is that list.
+ *
+ * Fail-closed, like xAI's table: an id absent here gets no reasoning options.
+ * The ladders differ per model, and no tier is accepted by all of them —
+ * `mistral-medium-3.5-128b` takes only `none` and `high` — so a provider-wide
+ * default would 400 on some model.
+ *
+ * Only reasoning-capable models belong here, for the reason given on
+ * `XAI_EFFORT_SUPPORT`.
+ */
+const GREENPT_EFFORT_SUPPORT: Record<string, ReadonlySet<GreenptWireEffort>> = {
+  "deepseek-v4-flash-0731": GREENPT_FULL,
+  "deepseek-v4.1-flash": GREENPT_FULL,
+  gemma4: GREENPT_FULL,
+  "glm-5.2": GREENPT_FULL,
+  "glm-5.3": GREENPT_FULL,
+  "glm-5.3-flash": GREENPT_FULL,
+  "gpt-oss-120b": new Set(GREENPT_EFFORTS),
+  "green-r": new Set(GREENPT_EFFORTS),
+  "green-r-raw": new Set(GREENPT_EFFORTS),
+  "kimi-k2.6": GREENPT_FULL,
+  "kimi-k2.7-code": GREENPT_FULL,
+  "kimi-k3": GREENPT_FULL,
+  "minimax-m2.5": new Set([...GREENPT_EFFORTS, "minimal"]),
+  "mistral-medium-3.5-128b": new Set(["none", "high"]),
+  "qwen3.5-397b-a17b": GREENPT_FULL,
+  "qwen3.6-35b-a3b": GREENPT_FULL,
+};
+
+/**
+ * Catalog GreenPT reasoning models nobody has measured. Non-empty means
+ * `sync-models` added one; it gets no reasoning options until measured.
+ */
+export function greenptUnmeasuredReasoningModels(): string[] {
+  const models = data.greenpt?.models ?? {};
+  return Object.entries(models)
+    .filter(([id, m]) => m.capabilities.reasoning && !(id in GREENPT_EFFORT_SUPPORT))
+    .map(([id]) => id)
+    .sort();
+}
+
+/** The model ids this table classifies. Exposed so tests can check each one is real. */
+export function greenptEffortModelIds(): string[] {
+  return Object.keys(GREENPT_EFFORT_SUPPORT);
+}
+
+/**
+ * Which effort tiers this GreenPT model accepts, or `undefined` when there is
+ * no measured answer — in which case the engine sends nothing.
+ */
+export function greenptSupportedEfforts(
+  modelString: string,
+): ReadonlySet<GreenptWireEffort> | undefined {
+  const { modelId } = parseModelString(modelString);
+  return GREENPT_EFFORT_SUPPORT[modelId];
 }

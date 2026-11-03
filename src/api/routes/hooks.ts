@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { serverNameFromRef } from "../../connectors/runtime/paths.ts";
+import { resolveRefTransport } from "../../connectors/runtime/startup.ts";
 import type { ConnectorRef } from "../../connectors/runtime/types.ts";
 import { HookRouteRefusedError } from "../../hooks/declaration.ts";
 import { forwardDelivery } from "../../hooks/forward.ts";
@@ -230,15 +231,11 @@ async function readBodyWithinCap(req: Request): Promise<Uint8Array | null> {
   return readCappedBody(req, HOOK_MAX_BODY_BYTES);
 }
 
-/** The `url:` variant of a `ConnectorRef` — the only shape a hook can forward to,
- *  because a forward needs a base URL and a transport to resolve against. */
-type RemoteConnectorRef = ConnectorRef;
-
 /** A delivery that passed every check, with everything the forward needs. */
 interface AdmittedDelivery {
   wsId: string;
   registration: HookRegistration;
-  ref: RemoteConnectorRef;
+  ref: ConnectorRef;
 }
 
 /**
@@ -260,8 +257,7 @@ async function admitDelivery(
   // A scan, not an index. A tenant holds tens of workspaces and each a handful
   // of registrations, so the walk is small and — unlike an index — has no second
   // copy to fall out of step with the records it describes. It sits behind the
-  // per-source bucket above, in the same place the MAC verification used to,
-  // which is what keeps an unauthenticated caller from choosing how much work
+  // per-source bucket above, which is what keeps an unauthenticated caller from choosing how much work
   // this does. Build an index when a measurement asks for one.
   for (const ws of await ctx.runtime.getWorkspaceStore().list()) {
     for (const registration of listRegistrations(ws)) {
@@ -307,9 +303,9 @@ async function forwardTarget(
   ctx: AppContext,
   ws: { id: string; connectors?: ConnectorRef[] },
   registration: HookRegistration,
-): Promise<RemoteConnectorRef | undefined> {
+): Promise<ConnectorRef | undefined> {
   const ref = findInstalledConnector(ws.connectors ?? [], registration.connector);
-  if (!ref || !("url" in ref)) return undefined;
+  if (!ref) return undefined;
   const declared = await ctx.runtime
     .getHookReconcileDeps()
     .declarationsFor(ws.id, registration.connector);
@@ -327,9 +323,14 @@ async function forwardAdmitted(
   const { wsId, registration, ref } = admitted;
   const startedAt = performance.now();
   try {
+    // A minted fleet connector forwards with its catalog entry's credential
+    // settings, the same transport its MCP connection runs with.
+    const { transportConfig } = await resolveRefTransport(ref, () =>
+      ctx.runtime.getConnectorCatalog().catalogEntries(),
+    );
     const upstream = await forwardDelivery({
       baseUrl: ref.url,
-      transport: ref.transport,
+      transport: transportConfig,
       route: registration.route,
       workspaceId: wsId,
       inboundHeaders: req.headers,

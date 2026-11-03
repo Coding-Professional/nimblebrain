@@ -8,7 +8,7 @@
  *   - `serverDetailToCatalogEntry` — the flat catalog record the
  *     Configure detail page renders for an *installed* connector
  *     matched back to its catalog entry, plus the lookup shape the
- *     setup_operator / remove_operator_setup tool actions consume.
+ *     set_oauth_client / remove_oauth_client tool actions consume.
  *
  * Both are pure functions over `ServerDetail` + its
  * `_meta["ai.nimblebrain/connector"]` extension. The directory facade
@@ -23,6 +23,7 @@ import { parseNotificationsDeclaration } from "../../notifications/declaration.t
 import { parseAdminToolsDeclaration } from "../../permissions/admin-tools.ts";
 import { validateAdditionalAuthorizationParams } from "../../util/oauth-params.ts";
 import { isHttpUrl } from "../../util/url.ts";
+import { parseAccountLookup } from "./account-lookup.ts";
 import {
   type ComposioConnectorConfig,
   getNimbleBrainConnectorMeta,
@@ -44,7 +45,7 @@ import type { CatalogListing, ConnectorCatalogEntry } from "./types.ts";
  * they diverged once (#462) and nothing structural stopped it. Spreading
  * this single result into both call sites makes drift impossible: there is
  * one derivation, so the directory and the catalog can never disagree on
- * `auth` / scopes / params / operatorSetup / the brokered block / providerAuth.
+ * `auth` / scopes / params / oauthClientSetup / the brokered block / providerAuth.
  *
  * The catalog-only fields (`tags`, `interactive`, `docsUrl`) are NOT here:
  * they don't belong on the directory entry's `install` action (the
@@ -52,14 +53,13 @@ import type { CatalogListing, ConnectorCatalogEntry } from "./types.ts";
  * so they stay inline at the catalog call site.
  *
  * `auth` always resolves (defaulting to `"dcr"`); the rest are present only
- * when the meta carries them, matching the `...(meta?.X ? { X } : {})`
- * shape both sites previously inlined.
+ * when the meta carries them (the `...(meta?.X ? { X } : {})` shape).
  */
 function connectorMetaAuthFields(meta: NimbleBrainConnectorMeta | undefined): {
   auth: ConnectorAuthKind;
   requiredScopes?: string[];
   additionalAuthorizationParams?: Record<string, string>;
-  operatorSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
+  oauthClientSetup?: { portalUrl: string; hint: string; clientSecretKey: string };
   composio?: ComposioConnectorConfig;
   smithery?: SmitheryConnectorConfig;
   providerAuth?: { provider: string; config: Record<string, unknown> };
@@ -77,7 +77,7 @@ function connectorMetaAuthFields(meta: NimbleBrainConnectorMeta | undefined): {
     ...(meta?.additionalAuthorizationParams
       ? { additionalAuthorizationParams: meta.additionalAuthorizationParams }
       : {}),
-    ...(meta?.operatorSetup ? { operatorSetup: meta.operatorSetup } : {}),
+    ...(meta?.oauthClientSetup ? { oauthClientSetup: meta.oauthClientSetup } : {}),
     ...(brokered ? { [auth]: brokered } : {}),
     ...(meta?.providerAuth ? { providerAuth: meta.providerAuth } : {}),
     ...(meta?.secretHeaders ? { secretHeaders: meta.secretHeaders } : {}),
@@ -153,6 +153,8 @@ export function serverDetailToCatalogEntry(s: ServerDetail): ConnectorCatalogEnt
   const hooks = parseHookDeclarations(getNimbleBrainHostMeta(s));
   const notifications = parseNotificationsDeclaration(getNimbleBrainHostMeta(s));
   const adminTools = parseAdminToolsDeclaration(getNimbleBrainHostMeta(s), s.name);
+  const recordArguments = getNimbleBrainHostMeta(s)?.record_arguments === true;
+  const account = parseAccountLookup(meta?.account);
   // The "interactive" chip is cosmetic catalog metadata (no runtime behavior). Derive
   // it from whether the connector renders a VALID UI: an explicit connector flag OR a
   // placement that survives `sanitizePlacements` (the same check registration uses).
@@ -168,23 +170,25 @@ export function serverDetailToCatalogEntry(s: ServerDetail): ConnectorCatalogEnt
     ...(iconUrl ? { iconUrl } : {}),
     url: remote.url,
     ...connectorMetaAuthFields(meta),
+    ...(meta?.inBandAuthErrors?.length ? { inBandAuthErrors: meta.inBandAuthErrors } : {}),
     ...(meta?.tags ? { tags: meta.tags } : {}),
     ...(interactive ? { interactive: true } : {}),
     ...(meta?.docsUrl ? { docsUrl: meta.docsUrl } : {}),
     ...(meta?.personal === true ? { personal: true } : {}),
+    ...(account ? { account } : {}),
     ...(ui ? { ui } : {}),
     ...(hooks.length > 0 ? { hooks } : {}),
     ...(notifications ? { notifications } : {}),
     ...(adminTools ? { adminTools } : {}),
+    ...(recordArguments ? { recordArguments: true as const } : {}),
   };
 }
 
 /**
  * Defense-in-depth safety check on a `ServerDetail` regardless of which
  * source emitted it. Runs at the directory boundary so registry-published
- * entries are scrubbed identically wherever they came from
- * static entries — pre-fix only static-source ran this check, so a
- * malicious publisher on a non-curated registry could ship
+ * and static entries are scrubbed identically: if it ran only on
+ * static-source entries, a malicious publisher on a non-curated registry could ship
  * `_meta.docsUrl: "javascript:..."` and the Configure page would render
  * it as a clickable `<a href>`. `target="_blank" rel="noopener noreferrer"`
  * does NOT block `javascript:` URI execution.
@@ -194,11 +198,15 @@ export function serverDetailToCatalogEntry(s: ServerDetail): ConnectorCatalogEnt
  *
  * Catches:
  *   - icons[].src non-http(s) (would XSS the Browse `<img src>`)
- *   - operatorSetup.portalUrl non-http(s) (clickable in Set-up modal)
+ *   - `auth: static` without a complete `oauthClientSetup` (nothing could set
+ *     up its OAuth client, so it would reach Browse and fail at install)
+ *   - oauthClientSetup.portalUrl non-http(s) (clickable in Set-up modal)
  *   - docsUrl non-http(s) (clickable in Configure page hero)
  *   - additionalAuthorizationParams reserved-key smuggling (RFC 6749
  *     params client_id, redirect_uri, state, etc. — would let a
  *     catalog override OAuth-flow-critical parameters)
+ *   - inBandAuthErrors that is not a list of specific-enough strings (a short
+ *     fragment would read unrelated failures as a refused credential)
  *   - a host block whose host_version is not major 1 (see
  *     {@link isSupportedHostVersion})
  */
@@ -209,11 +217,8 @@ export function validateServerDetailSafety(s: ServerDetail): string | null {
     }
   }
   const meta = getNimbleBrainConnectorMeta(s);
-  if (meta?.operatorSetup) {
-    if (!isHttpUrl(meta.operatorSetup.portalUrl)) {
-      return `operatorSetup.portalUrl must be http(s): "${meta.operatorSetup.portalUrl}"`;
-    }
-  }
+  const setupError = oauthClientSetupViolation(meta);
+  if (setupError) return setupError;
   if (meta?.additionalAuthorizationParams) {
     try {
       validateAdditionalAuthorizationParams(meta.additionalAuthorizationParams);
@@ -224,7 +229,45 @@ export function validateServerDetailSafety(s: ServerDetail): string | null {
   if (meta?.docsUrl !== undefined && !isHttpUrl(meta.docsUrl)) {
     return `docsUrl must be http(s): "${meta.docsUrl}"`;
   }
+  const inBandError = inBandAuthErrorsViolation(meta?.inBandAuthErrors);
+  if (inBandError) return inBandError;
   return hostVersionViolation(s);
+}
+
+/**
+ * Shortest in-band rejection text an entry may declare. A fragment such as
+ * "token" or "error" would match failures that have nothing to do with the
+ * connection's credential, and every match spends a refresh and can flip the
+ * connection to `reauth_required`.
+ */
+const MIN_IN_BAND_AUTH_ERROR_LENGTH = 12;
+
+/** `inBandAuthErrors`, when present, is a list of strings each long enough to name one failure. */
+function inBandAuthErrorsViolation(v: unknown): string | null {
+  if (v === undefined) return null;
+  if (!Array.isArray(v)) return "inBandAuthErrors must be an array of strings";
+  for (const text of v) {
+    if (typeof text !== "string" || text.trim().length < MIN_IN_BAND_AUTH_ERROR_LENGTH) {
+      return `inBandAuthErrors entries must be strings of at least ${MIN_IN_BAND_AUTH_ERROR_LENGTH} characters: ${JSON.stringify(text)}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * A static entry must say where its OAuth client is created and where the
+ * secret goes, or nothing could set it up; any entry's portal link must be
+ * http(s), because the Set up dialog renders it as a link.
+ */
+function oauthClientSetupViolation(meta: NimbleBrainConnectorMeta | undefined): string | null {
+  const setup = meta?.oauthClientSetup;
+  if (meta?.auth === "static" && !(setup?.portalUrl && setup.hint && setup.clientSecretKey)) {
+    return "auth='static' requires oauthClientSetup.{portalUrl,hint,clientSecretKey}";
+  }
+  if (setup && !isHttpUrl(setup.portalUrl)) {
+    return `oauthClientSetup.portalUrl must be http(s): "${setup.portalUrl}"`;
+  }
+  return null;
 }
 
 function hostVersionViolation(s: ServerDetail): string | null {

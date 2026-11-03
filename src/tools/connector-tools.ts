@@ -1,4 +1,5 @@
 import { mcpAuthCallbackUrl } from "../api/routes/mcp-auth.ts";
+import { brandName } from "../brand/index.ts";
 import { brokeredCatalogConfig, isBrokeredAuthKind } from "../connectors/auth-kind.ts";
 import { bindCatalogEntry } from "../connectors/catalog/binding.ts";
 import { catalogEntryForRef } from "../connectors/catalog/catalog.ts";
@@ -19,6 +20,7 @@ import type {
 import { brokeredRef } from "../connectors/runtime/brokered.ts";
 import { WORKSPACE_PRINCIPAL_ID } from "../connectors/runtime/connection.ts";
 import { sanitizePlacements } from "../connectors/runtime/defaults.ts";
+import { instanceOAuthClient } from "../connectors/runtime/instance-oauth-clients.ts";
 import {
   isReservedServerName,
   matchesServerName,
@@ -26,11 +28,14 @@ import {
   slugifyServerName,
 } from "../connectors/runtime/paths.ts";
 import { startConnectorSource } from "../connectors/runtime/startup.ts";
-import type {
-  BrokeredRef,
-  ConnectorInstance,
-  ConnectorRef,
-  RemoteTransportConfig,
+import {
+  type BrokeredRef,
+  type ConnectorInstance,
+  type ConnectorRef,
+  isInstanceOAuthClientRef,
+  type OAuthClientConfig,
+  oauthClientSecretRef,
+  type RemoteTransportConfig,
 } from "../connectors/runtime/types.ts";
 import { uninstallWorkspaceConnector } from "../connectors/runtime/uninstall.ts";
 import { textContent } from "../engine/content-helpers.ts";
@@ -41,10 +46,13 @@ import type { ConnectorOwner } from "../identity/connector-owner.ts";
 import { IdentityConnectorStore } from "../identity/connector-store.ts";
 import type { UserIdentity } from "../identity/provider.ts";
 import { notifyReady } from "../lifecycle/notify.ts";
+import { MINTED_PROVIDER } from "../oauth/minted-credential-provider.ts";
 import { log } from "../observability/log.ts";
+import { type ConnectorAdmission, filterAdmittedTools } from "../permissions/admin-tools.ts";
 import type { PermissionOwner, ToolPolicy } from "../permissions/permission-store.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import { validateAdditionalAuthorizationParams } from "../util/oauth-params.ts";
+import { splitInnerToolName } from "../util/tool-name.ts";
 import { isHttpUrl } from "../util/url.ts";
 import { canWriteWorkspaceScoped } from "../workspace/authz.ts";
 import { WorkspaceContext } from "../workspace/context.ts";
@@ -54,7 +62,7 @@ import type { CredentialStore } from "./credential-store.ts";
 import { CREDENTIAL_PROVIDER } from "./credential-transport-credential.ts";
 import type { InProcessTool } from "./in-process-app.ts";
 import { hasMcpOAuthTokens, McpOAuthRecords } from "./mcp-oauth-records.ts";
-import { McpSource } from "./mcp-source.ts";
+import { McpSource, REMOTE_TOOL_LIST_MAX_AGE_MS } from "./mcp-source.ts";
 import type { Tool, ToolSource } from "./types.ts";
 import { WORKSPACE_OPTIONAL_META } from "./workspace-optional.ts";
 
@@ -64,7 +72,7 @@ import { WORKSPACE_OPTIONAL_META } from "./workspace-optional.ts";
  * MCP-tool-call surface is the canonical first-party API for the web
  * shell, and keeping one tool minimizes route bloat.
  *
- * Stage 2: every install is workspace-scoped. The `install` action
+ * Every install is workspace-scoped. The `install` action
  * targets the request's active workspace (`ctx.getWorkspaceId()`, set
  * from the `/w/<slug>` route); an explicit `wsId` arg overrides it for
  * direct API callers. Any workspace is a valid target.
@@ -107,15 +115,22 @@ function providerFor(
 /**
  * Whether a connector with this auth kind can install on the identity plane.
  *
- * The rule is a capability, not a vendor list: DCR, or a brokered connector
- * whose provider brokers an interactive connect (`initiate`) and can therefore
- * complete auth for one user. `static` reads a workspace-scoped operator secret
- * and `provider` mints a platform credential; both are workspace/platform-bound,
- * and their identity variants are a separate slice.
+ * The rule is a capability, not a vendor list: the caller must be able to
+ * complete auth for one user without a workspace. That is DCR; a brokered
+ * connector whose provider brokers an interactive connect (`initiate`); or a
+ * `static` one whose OAuth client the instance operator declared, since that client
+ * belongs to no workspace. A `static` entry without one reads a
+ * workspace-scoped client secret, and `provider` mints a platform credential;
+ * both are workspace/platform-bound.
  *
  * The install gate and the picker's filter both call this, so they cannot drift.
  */
-function identityInstallableAuth(ctx: ManageConnectorsContext, auth: string): boolean {
+function identityInstallableAuth(
+  ctx: ManageConnectorsContext,
+  auth: string,
+  catalogId: string,
+): boolean {
+  if (auth === "static") return instanceOAuthClient(catalogId) !== undefined;
   return auth === "dcr" || providerFor(ctx, auth)?.initiate !== undefined;
 }
 
@@ -141,8 +156,8 @@ function brokerNotConfiguredMessage(entryName: string, auth: string): string {
 export interface StatusInputs {
   /** ConnectionState as exposed by the lifecycle. */
   state: string;
-  /** True when a static-auth catalog entry has no operator OAuth client configured. */
-  missingOperatorSetup?: boolean;
+  /** True when a static-auth catalog entry has no OAuth client configured. */
+  missingOAuthClient?: boolean;
   /** Last connection error from the principal Connection (crashed / dead / reauth_required). */
   lastError?: string;
 }
@@ -162,7 +177,7 @@ export type ConnectorStatus =
  * status for the UI:
  *
  *   ready          — works
- *   needs_setup    — admin must configure the operator OAuth client before
+ *   needs_setup    — admin must configure the OAuth client before
  *                     this is usable
  *   not_connected  — installed with no connection: never connected, or
  *                     disconnected on purpose. A resting state, not an error
@@ -174,7 +189,7 @@ export type ConnectorStatus =
  *   starting       — connection being established
  *
  * Priority — setup blocks auth blocks usage. A static-auth connector whose
- * OAuth never succeeded because the operator clientSecret is missing surfaces
+ * OAuth never succeeded because the client secret is missing surfaces
  * as `needs_setup` (the actionable cause), never as `failed`.
  *
  * The connector-type detail — *which* credentials missing, *what* button
@@ -186,9 +201,12 @@ export function deriveConnectorStatus(input: StatusInputs): {
   status: ConnectorStatus;
   statusReason?: string;
 } {
-  // 1. Setup gates everything. Operator OAuth missing → admin acts first.
-  if (input.missingOperatorSetup) {
-    return { status: "needs_setup", statusReason: "OAuth app not configured for this workspace." };
+  // 1. Setup gates everything. OAuth client missing → admin acts first.
+  if (input.missingOAuthClient) {
+    return {
+      status: "needs_setup",
+      statusReason: "OAuth client not configured for this workspace.",
+    };
   }
   // 2. Auth lifecycle. A broken connection needs someone to act; one that
   //    was never connected, or was disconnected, is at rest.
@@ -246,10 +264,12 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
             "uninstall",
             "get_permissions",
             "set_permissions",
-            "setup_operator",
-            "remove_operator_setup",
+            "set_record_sources",
+            "set_oauth_client",
+            "remove_oauth_client",
             "get_redirect_uri",
             "list_bound_skills",
+            "read_bound_skill",
             "list_personal_connectors",
             "list_personal_catalog",
             "grant_connector",
@@ -263,7 +283,7 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
         catalogId: {
           type: "string",
           description:
-            "Catalog entry id (required for setup_operator, remove_operator_setup, connect_api_key).",
+            "Catalog entry id (required for set_oauth_client, remove_oauth_client, connect_api_key).",
         },
         entry: {
           type: "object",
@@ -277,16 +297,21 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
         },
         clientId: {
           type: "string",
-          description: "OAuth client_id (setup_operator only).",
+          description: "OAuth client_id (set_oauth_client only).",
         },
         clientSecret: {
           type: "string",
-          description: "OAuth client_secret (setup_operator only).",
+          description: "OAuth client_secret (set_oauth_client only).",
         },
         serverName: {
           type: "string",
           description:
-            "Connector server name (required for disconnect, list_tools, get_permissions, set_permissions, grant_connector, revoke_connector).",
+            "Connector server name (required for disconnect, list_tools, get_permissions, set_permissions, set_record_sources, grant_connector, revoke_connector, read_bound_skill).",
+        },
+        skillName: {
+          type: "string",
+          description:
+            "For read_bound_skill: the skill's name as list_bound_skills reports it for that server.",
         },
         scope: {
           type: "string",
@@ -299,6 +324,12 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
           description:
             'For set_permissions: map of tool name → "allow" | "disallow". Tools omitted are unchanged.',
           additionalProperties: { type: "string", enum: ["allow", "disallow"] },
+        },
+        sources: {
+          type: ["array", "null"],
+          items: { type: "string" },
+          description:
+            "For set_record_sources (workspace admin): the server names of the connectors in this workspace that `serverName` may receive records from through record arguments. An empty list revokes the grant; null clears the narrowing, so every connector in the workspace may be a source. Grants nothing unless the connector's catalog entry declares record_arguments.",
         },
         fields: {
           type: "object",
@@ -371,8 +402,10 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
             args.tools,
             args.scope,
           );
-        case "setup_operator":
-          return handleSetupOperator(
+        case "set_record_sources":
+          return handleSetRecordSources(ctx, args.wsId, args.serverName, args.sources);
+        case "set_oauth_client":
+          return handleSetOAuthClient(
             ctx,
             args.wsId,
             args.identity,
@@ -380,12 +413,14 @@ export function createManageConnectorsTool(ctx: ManageConnectorsContext): InProc
             args.clientId,
             args.clientSecret,
           );
-        case "remove_operator_setup":
-          return handleRemoveOperatorSetup(ctx, args.wsId, args.identity, args.catalogId);
+        case "remove_oauth_client":
+          return handleRemoveOAuthClient(ctx, args.wsId, args.identity, args.catalogId);
         case "get_redirect_uri":
           return handleGetRedirectUri(args.identity);
         case "list_bound_skills":
           return handleListBoundSkills(ctx, args.wsId);
+        case "read_bound_skill":
+          return handleReadBoundSkill(ctx, args.wsId, args.serverName, args.skillName);
         case "list_personal_connectors":
           return handleListPersonalConnectors(ctx, args.callerId);
         case "list_personal_catalog":
@@ -452,6 +487,8 @@ interface DispatchArgs {
   identity: UserIdentity | null;
   callerId: string | null;
   serverName: string;
+  /** For `read_bound_skill`: the skill's name on `serverName`. */
+  skillName: string;
   scope: string | undefined;
   listInstalledScope: string;
   catalogId: string;
@@ -459,6 +496,8 @@ interface DispatchArgs {
   clientSecret: string;
   fields: Record<string, unknown>;
   tools: Record<string, unknown>;
+  /** For `set_record_sources`: the raw `sources` input (validated by the handler). */
+  sources: unknown;
   entry: unknown;
   installWsId: string | undefined;
   /** Explicit grant/revoke target workspace (input `wsId`, no header fallback). */
@@ -487,6 +526,7 @@ function resolveDispatchArgs(
     identity,
     callerId: identity?.id ?? null,
     serverName: str(input.serverName),
+    skillName: str(input.skillName),
     scope: input.scope ? String(input.scope) : undefined,
     listInstalledScope: String(input.scope ?? "all"),
     catalogId: str(input.catalogId),
@@ -494,11 +534,12 @@ function resolveDispatchArgs(
     clientSecret: str(input.clientSecret),
     fields: (input.fields as Record<string, unknown>) ?? {},
     tools: (input.tools as Record<string, unknown>) ?? {},
+    sources: input.sources,
     entry: input.entry as unknown,
     // Default the install target to the request's workspace — the same
     // `ctx.getWorkspaceId()` (the workspace in the request URL) every other
     // action on this tool uses. The web shell installs into the
-    // workspace the user is viewing; it no longer carries a separately-picked
+    // workspace the user is viewing; it does not carry a separately-picked
     // target. An explicit `wsId` arg still wins for direct API callers. Keeping
     // install on the same workspace selector as connect / list / status is what
     // closes the "Connector not installed" scope mismatch (an install seeded under
@@ -580,13 +621,14 @@ async function handleListDirectory(
   // catalog.
   const ws = wsId ? await ctx.runtime.getWorkspaceStore().get(wsId) : null;
   const credStore = wsId ? ctx.runtime.getCredentialStore() : null;
-  const isOperatorConfigured =
+  const isOAuthClientConfigured =
     wsId && ws && credStore
       ? async (catalogId: string, clientSecretKey: string): Promise<boolean> => {
-          if (!ws.oauthOperatorApps?.[catalogId]?.clientId) return false;
+          if (instanceOAuthClient(catalogId)) return true;
+          if (!ws.oauthClients?.[catalogId]?.clientId) return false;
           const secret = await credStore.get({ kind: "workspace", wsId }, clientSecretKey, {
             caller: "connector-tools:list_directory",
-            purpose: "report whether operator OAuth setup is complete",
+            purpose: "report whether OAuth client setup is complete",
           });
           return secret !== null;
         }
@@ -594,7 +636,7 @@ async function handleListDirectory(
 
   const result = await directory.list({
     ...(wsId ? { wsId } : {}),
-    ...(isOperatorConfigured ? { isOperatorConfigured } : {}),
+    ...(isOAuthClientConfigured ? { isOAuthClientConfigured } : {}),
   });
   return {
     content: textContent(
@@ -606,22 +648,67 @@ async function handleListDirectory(
 }
 
 /**
- * `list_bound_skills` — the curated connector-skill overlays materialized
- * in this workspace, with their bound server + provenance source. These are
- * surface-once-into-history candidates, not authored skills, so they don't
- * appear in `skills__list`; this is how an operator sees what's bound.
+ * `list_bound_skills` — every skill the workspace's connectors contribute to
+ * the model's context, without their bodies: the curated overlays materialized
+ * here (`overlays`, with provenance) and the skills connected servers publish
+ * through the Skills extension (`published`, with how each loads). A server
+ * with an overlay publishes none here, because the overlay supersedes them.
+ * Neither kind is an authored skill, so neither appears in `skills__list`.
  */
-function handleListBoundSkills(ctx: ManageConnectorsContext, wsId: string | null): ToolResult {
+async function handleListBoundSkills(
+  ctx: ManageConnectorsContext,
+  wsId: string | null,
+): Promise<ToolResult> {
   if (!wsId) {
     return errResult("No workspace in scope — pass `wsId` or call from a workspace.");
   }
   const overlays = ctx.runtime.listConnectorOverlays(wsId);
-  const summary = overlays.length
-    ? overlays.map((o) => `- ${o.server}: ${o.name}${o.source ? ` (${o.source})` : ""}`).join("\n")
-    : "No connector-skill overlays bound in this workspace.";
+  const published = await ctx.runtime.listPublishedSkills(wsId);
+  const lines = [
+    ...overlays.map((o) => `- ${o.server}: ${o.name} (overlay${o.source ? `, ${o.source}` : ""})`),
+    ...published.map((p) => `- ${p.server}: ${p.name} (published, ${p.loadingStrategy})`),
+  ];
   return {
-    content: textContent(summary),
-    structuredContent: { wsId, overlays },
+    content: textContent(
+      lines.length ? lines.join("\n") : "No connector skills bound in this workspace.",
+    ),
+    structuredContent: { wsId, overlays, published },
+    isError: false,
+  };
+}
+
+/**
+ * `read_bound_skill` — one connector skill's body as the model receives it,
+ * by the server and name `list_bound_skills` reports.
+ */
+async function handleReadBoundSkill(
+  ctx: ManageConnectorsContext,
+  wsId: string | null,
+  serverName: string,
+  skillName: string,
+): Promise<ToolResult> {
+  if (!wsId) {
+    return errResult("No workspace in scope — pass `wsId` or call from a workspace.");
+  }
+  if (!serverName || !skillName) {
+    return errResult("`serverName` and `skillName` are required for read_bound_skill.");
+  }
+  const read = await ctx.runtime.readConnectorSkill(wsId, serverName, skillName);
+  if (!read) {
+    return errResult(
+      `No skill "${skillName}" from "${serverName}" in this workspace. Call list_bound_skills for the current set.`,
+    );
+  }
+  if (!read.ok) {
+    return errResult(
+      read.reason === "unverified"
+        ? `"${serverName}" served content for "${skillName}" that does not match its skills listing, so the runtime does not use it.`
+        : `"${serverName}" did not return "${skillName}". The server may be unreachable.`,
+    );
+  }
+  return {
+    content: textContent(read.body),
+    structuredContent: { serverName, skillName, kind: read.kind, body: read.body },
     isError: false,
   };
 }
@@ -663,6 +750,16 @@ type InstalledEntry = {
   interactive: boolean;
   toolCount: number;
   /**
+   * The bare names of this connector's tools the caller may call, decided by
+   * the gate every dispatch door refuses with (`Runtime.connectorAdmission`:
+   * the catalog's `admin_tools` against the caller's workspace role, and the
+   * host-only lifecycle handlers no one calls). A UI offers a control only
+   * when the tool behind it is listed. It describes tools, never a role, so a
+   * change to who may call what changes this list and nothing that reads it.
+   * Empty when the connector is not running.
+   */
+  allowedTools: string[];
+  /**
    * Brand icon URL, from the catalog entry this connector matched. Falls
    * through to the deterministic letter avatar when unset (the connector
    * isn't in any enabled registry, or the fetch failed).
@@ -677,7 +774,7 @@ type InstalledEntry = {
    * request (`get_installed`), since each read writes a credential audit line.
    */
   identity?: ConnectedAccountIdentity;
-  missingOperatorSetup?: boolean;
+  missingOAuthClient?: boolean;
   /**
    * Last connection error for crashed / dead / reauth_required states.
    * Pulled from the principal Connection — only present when the
@@ -687,13 +784,13 @@ type InstalledEntry = {
    */
   lastError?: string;
   /**
-   * Per-workspace operator OAuth client config — present only for
+   * Per-workspace OAuth client config — present only for
    * static-auth catalog entries the workspace has configured. Carries
    * the public clientId, audit metadata, and a best-effort display
    * label so the Configure page can render "Configured by Sarah" without
    * a second API round-trip. Secret is never echoed.
    */
-  operatorOAuth?: {
+  workspaceOAuthClient?: {
     clientId: string;
     configuredAt: string;
     configuredBy: string;
@@ -716,7 +813,7 @@ type InstalledEntry = {
 interface InstalledEntryDeps {
   ctx: ManageConnectorsContext;
   wsId: string;
-  /** One workspace fetch covers oauthOperatorApps lookups for every static-auth
+  /** One workspace fetch covers oauthClients lookups for every static-auth
    *  catalog match, rather than one disk read per installed connector. */
   ws: Workspace | null;
   registry: ReturnType<Runtime["getRegistryForWorkspace"]>;
@@ -724,6 +821,8 @@ interface InstalledEntryDeps {
   catalogByUrl: Map<string, ConnectorCatalogEntry>;
   catalogById: Map<string, ConnectorCatalogEntry>;
   resolveUserLabel: (userId: string) => Promise<string | undefined>;
+  /** The caller's admission to this workspace's connector tools, read once. */
+  admission: ConnectorAdmission;
   /** When set, `buildInstalledEntry` skips every instance except this one
    *  before any per-instance IO. */
   onlyServerName?: string;
@@ -741,24 +840,12 @@ function resolveInstanceCatalog(
 }
 
 /**
- * How long a remote connector's memoized `tools/list` is trusted before the
- * connector read surfaces (Configure page, installed list) force a re-fetch.
- * A remote server redeployed at the same URL changes its advertised tools with
- * no lifecycle signal to an already-connected source — no `stop`, no restart,
- * no native `tools/list_changed` — so without this the surface the UI shows
- * (and the agent's callable set) stays pinned to the first-connect snapshot.
- * Short enough that a redeploy surfaces within a page reload or two; long
- * enough that a burst of reads coalesces onto one round-trip.
- */
-const REMOTE_TOOL_LIST_MAX_AGE_MS = 30_000;
-
-/**
- * Tools for a connector's read surface, kept fresh for remote sources. Local /
- * stdio sources change their tool set only via respawn (which already drops
- * the memo), so they read the memo directly; only remote sources need the
- * age-gated re-fetch. A refresh that finds a changed surface fans out through
- * the source's `toolsChanged` seam, so the agent's tool union and the LLM tool
- * list converge with what the UI now shows (never one without the other).
+ * Tools for a connector's read surface, kept fresh for remote sources. An
+ * in-process source changes its tool set only on restart (which already drops
+ * the memo), so it reads the memo directly; only remote sources need the
+ * age-gated re-fetch. Here it waits for the answer, where the agent's run
+ * listing serves the memo past a short wait; both use one max age
+ * (`REMOTE_TOOL_LIST_MAX_AGE_MS`).
  */
 async function readConnectorTools(source: ToolSource): Promise<Tool[]> {
   if (source instanceof McpSource && source.isRemote()) {
@@ -768,32 +855,37 @@ async function readConnectorTools(source: ToolSource): Promise<Tool[]> {
 }
 
 /**
- * Tool count + reported version from the live source — best-effort (a stopped
+ * Tools + reported version from the live source — best-effort (a stopped
  * source returns [] and has no version). `getReportedVersion` is McpSource-
  * specific (not on the ToolSource interface), reached by the same `instanceof`
  * narrowing the system-prompt composer uses for instructions.
  */
-async function probeToolCountAndVersion(
+async function probeToolsAndVersion(
   registry: ReturnType<Runtime["getRegistryForWorkspace"]>,
   serverName: string,
-): Promise<{ toolCount: number; handshakeVersion: string | undefined }> {
-  let toolCount = 0;
+): Promise<{ tools: Tool[]; handshakeVersion: string | undefined }> {
+  let tools: Tool[] = [];
   let handshakeVersion: string | undefined;
   try {
     const src = registry.getSource(serverName);
     if (src) {
-      toolCount = (await readConnectorTools(src)).length;
+      tools = await readConnectorTools(src);
       if (src instanceof McpSource) handshakeVersion = src.getReportedVersion();
     }
   } catch {
     // ignore
   }
-  return { toolCount, handshakeVersion };
+  return { tools, handshakeVersion };
+}
+
+/** The bare names of `tools` that `admission` lets the caller call. */
+function allowedToolNames(tools: readonly Tool[], admission: ConnectorAdmission): string[] {
+  return filterAdmittedTools(tools, admission).map((t) => splitInnerToolName(t.name).bareToolName);
 }
 
 /**
  * Enrich a remote entry with its live OAuth connection state (authorizationUrl,
- * lastError) and the static-auth missing-operator-setup probe.
+ * lastError) and the static-auth missing-OAuth-client probe.
  */
 async function applyRemoteConnectionState(
   entry: InstalledEntry,
@@ -810,32 +902,38 @@ async function applyRemoteConnectionState(
   const conn = instance.connections?.get("_workspace") ?? null;
   if (conn?.authorizationUrl) entry.authorizationUrl = conn.authorizationUrl;
   if (conn?.lastError) entry.lastError = conn.lastError;
-  const oauthClient = (ref as { oauthClient?: { clientSecret?: { key: string } } }).oauthClient;
-  if (oauthClient?.clientSecret) {
+  if (isInstanceOAuthClientRef(ref.oauthClient)) {
+    if (!instanceOAuthClient(ref.oauthClient.instanceClient)) entry.missingOAuthClient = true;
+    return;
+  }
+  const clientSecret = oauthClientSecretRef(ref.oauthClient);
+  if (clientSecret) {
     // A presence probe, not a use: `get` without a `reveal` writes no audit line.
-    const wrapped = await credStore.get({ kind: "workspace", wsId }, oauthClient.clientSecret.key, {
+    const wrapped = await credStore.get({ kind: "workspace", wsId }, clientSecret.key, {
       caller: "connector-tools:list_installed",
-      purpose: "report whether operator OAuth setup is complete",
+      purpose: "report whether OAuth client setup is complete",
     });
-    if (!wrapped) entry.missingOperatorSetup = true;
+    if (!wrapped) entry.missingOAuthClient = true;
   }
 }
 
 /**
- * Attach the workspace's operator OAuth client config (static-auth only). The
+ * Attach the workspace's OAuth client config (static-auth only). The
  * Configure page reads this to render the "Configured by ... on ..." audit line
  * + Edit affordance. clientId is public; the secret never leaves the store.
  */
-async function applyOperatorOAuth(
+async function applyWorkspaceOAuthClient(
   entry: InstalledEntry,
   cat: ConnectorCatalogEntry | undefined,
   ws: Workspace | null,
   resolveUserLabel: (userId: string) => Promise<string | undefined>,
 ): Promise<void> {
-  const op = cat?.auth === "static" ? ws?.oauthOperatorApps?.[cat.id] : undefined;
+  // An instance OAuth client is the operator's: there is no workspace record to show or edit.
+  const op =
+    cat?.auth === "static" && !instanceOAuthClient(cat.id) ? ws?.oauthClients?.[cat.id] : undefined;
   if (!op) return;
   const label = await resolveUserLabel(op.configuredBy);
-  entry.operatorOAuth = {
+  entry.workspaceOAuthClient = {
     clientId: op.clientId,
     configuredAt: op.configuredAt,
     configuredBy: op.configuredBy,
@@ -844,43 +942,113 @@ async function applyOperatorOAuth(
 }
 
 /**
- * The account an owner's connection is signed in as, or null. A brokered
- * connector asks its provider, which reads what it recorded at connect time; a
- * runtime-native OAuth connector reads the OIDC claims captured from the token
- * response. Display-only, so any failure reads as no identity.
+ * The account an owner's connection is signed in as, or null. Read from what
+ * the connection's sign-in recorded; a connection with nothing recorded is
+ * asked, once, through the tool its catalog entry declares
+ * (`lookUpConnectorIdentity`). Display-only, so any failure reads as no
+ * identity.
+ *
+ * `catalog` is the operator's entries the ref is bound against; a caller that
+ * already resolved the ref's entry passes just that one.
  */
 async function readConnectorIdentity(
   ctx: ManageConnectorsContext,
   owner: ConnectorOwner,
   ref: ConnectorRef,
   serverName: string,
+  catalog: readonly ConnectorCatalogEntry[],
 ): Promise<ConnectedAccountIdentity | null> {
-  const workDir = ctx.runtime.getWorkDir();
   try {
-    const brokered = brokeredRef(ref);
-    if (brokered) {
-      const provider = ctx.runtime.getManagedConnectorRegistry().get(brokered.provider);
-      return (await provider?.identity?.({ owner, brokered, workDir })) ?? null;
-    }
-    const claims = await new McpOAuthRecords({ owner, serverName }).read<{
-      email?: unknown;
-      name?: unknown;
-    }>("identity", {
-      caller: "connector-tools:identity",
-      purpose: `display the connected account for ${serverName}`,
-    });
-    if (!claims) return null;
-    const out: ConnectedAccountIdentity = {};
-    if (typeof claims.email === "string") out.email = claims.email;
-    if (typeof claims.name === "string") out.name = claims.name;
-    return out.email || out.name ? out : null;
+    return (
+      (await storedConnectorIdentity(ctx, owner, ref, serverName)) ??
+      (await lookUpConnectorIdentity(ctx, owner, ref, serverName, catalog))
+    );
   } catch {
     return null;
   }
 }
 
 /**
- * Enrich an entry with its live OAuth connection state + operator OAuth audit
+ * What the sign-in recorded. A brokered connector asks its provider, which
+ * reads what it stored when the connection landed; a runtime-native OAuth
+ * connector reads the OIDC claims captured from the token response.
+ */
+async function storedConnectorIdentity(
+  ctx: ManageConnectorsContext,
+  owner: ConnectorOwner,
+  ref: ConnectorRef,
+  serverName: string,
+): Promise<ConnectedAccountIdentity | null> {
+  const brokered = brokeredRef(ref);
+  if (brokered) {
+    const provider = ctx.runtime.getManagedConnectorRegistry().get(brokered.provider);
+    const workDir = ctx.runtime.getWorkDir();
+    return (await provider?.identity?.({ owner, brokered, workDir })) ?? null;
+  }
+  const claims = await new McpOAuthRecords({ owner, serverName }).read<{
+    email?: unknown;
+    name?: unknown;
+  }>("identity", {
+    caller: "connector-tools:identity",
+    purpose: `display the connected account for ${serverName}`,
+  });
+  if (!claims) return null;
+  const out: ConnectedAccountIdentity = {};
+  if (typeof claims.email === "string") out.email = claims.email;
+  if (typeof claims.name === "string") out.name = claims.name;
+  return out.email || out.name ? out : null;
+}
+
+/**
+ * Ask the connected service which account it is signed in as, for a
+ * connection whose sign-in named none: an authorization server that is not
+ * OIDC, a broker that recorded no name. Only the service knows, and the tool
+ * that says so is declared on its catalog entry (`account`), so this applies
+ * to a ref bound to that entry and to nothing else.
+ *
+ * The answer is stored where the sign-in would have put it, so it is asked
+ * once per sign-in: the next read finds it stored, and a new sign-in replaces
+ * the record and with it the answer. That is also why only a connection that
+ * has signed in is asked: a source can be warm before its connection exists,
+ * and nothing would ever replace an answer stored for no sign-in.
+ */
+async function lookUpConnectorIdentity(
+  ctx: ManageConnectorsContext,
+  owner: ConnectorOwner,
+  ref: ConnectorRef,
+  serverName: string,
+  catalog: readonly ConnectorCatalogEntry[],
+): Promise<ConnectedAccountIdentity | null> {
+  const binding = bindCatalogEntry(ref, catalog);
+  if (binding.kind !== "bound" || !binding.entry.account) return null;
+  const brokered = brokeredRef(ref);
+  const provider = brokered
+    ? ctx.runtime.getManagedConnectorRegistry().get(brokered.provider)
+    : undefined;
+  if (brokered && !provider?.recordIdentity) return null;
+  if (!(await hasPersistedConnection(ctx, owner, ref, serverName))) return null;
+
+  const label = await ctx.runtime
+    .getLifecycle()
+    .lookUpAccount(owner, serverName, binding.entry.account);
+  if (label === null) return null;
+  // The sign-in may have gone while the service was answering (a disconnect,
+  // an uninstall); an answer stored then would outlive it.
+  if (!(await hasPersistedConnection(ctx, owner, ref, serverName))) return null;
+  const identity: ConnectedAccountIdentity = { name: label };
+  if (brokered) {
+    await provider?.recordIdentity?.(
+      { owner, brokered, workDir: ctx.runtime.getWorkDir() },
+      identity,
+    );
+  } else {
+    await new McpOAuthRecords({ owner, serverName }).write("identity", identity);
+  }
+  return identity;
+}
+
+/**
+ * Enrich an entry with its live OAuth connection state + OAuth client audit
  * config. Skipped when the instance carries no ref (an instance seeded before
  * its ref was persisted), which leaves the entry with the state the lifecycle
  * already reported.
@@ -902,7 +1070,7 @@ async function applyConnectionProbes(
     deps.credStore,
     deps.wsId,
   );
-  await applyOperatorOAuth(entry, cat, deps.ws, deps.resolveUserLabel);
+  await applyWorkspaceOAuthClient(entry, cat, deps.ws, deps.resolveUserLabel);
 }
 
 /**
@@ -919,7 +1087,7 @@ async function buildInstalledEntry(
   if (deps.onlyServerName && instance.serverName !== deps.onlyServerName) return null;
 
   const { url, cat } = resolveInstanceCatalog(instance, deps.catalogByUrl, deps.catalogById);
-  const { toolCount, handshakeVersion } = await probeToolCountAndVersion(
+  const { tools, handshakeVersion } = await probeToolsAndVersion(
     deps.registry,
     instance.serverName,
   );
@@ -940,13 +1108,14 @@ async function buildInstalledEntry(
     ...(handshakeVersion ? { handshakeVersion } : {}),
     state: instance.state,
     // Provisional — overwritten by deriveConnectorStatus below once every probe
-    // (operatorOAuth, lastError) has been resolved on the entry. Initial value
+    // (workspaceOAuthClient, lastError) has been resolved on the entry. Initial value
     // satisfies the public InstalledConnector contract that `status` is
     // required.
     status: "ready",
     scope: "workspace",
     interactive,
-    toolCount,
+    toolCount: tools.length,
+    allowedTools: allowedToolNames(tools, deps.admission),
     ...(iconUrl ? { iconUrl } : {}),
   };
 
@@ -960,12 +1129,13 @@ async function buildInstalledEntry(
       { type: "workspace", wsId: deps.wsId },
       instance.ref,
       instance.serverName,
+      cat ? [cat] : [],
     );
     if (identity) entry.identity = identity;
   }
 
   // Derive the generic UI status last so it sees every populated probe
-  // (operatorOAuth gate, lastError).
+  // (workspaceOAuthClient gate, lastError).
   const derived = deriveConnectorStatus(entry);
   entry.status = derived.status;
   if (derived.statusReason) entry.statusReason = derived.statusReason;
@@ -976,10 +1146,9 @@ async function buildInstalledEntry(
 async function handleListInstalled(
   ctx: ManageConnectorsContext,
   wsId: string | null,
-  // Stage 2: callerId no longer disambiguates between workspace-scope
-  // and user-scope views (the latter was removed). Kept for signature
-  // stability across `handleGetInstalled`; ignored.
-  _callerId: string | null,
+  // The principal `allowedTools` is decided for. Every view is
+  // workspace-scoped, so the caller does not select one.
+  callerId: string | null,
   scope: string,
   /**
    * When set, only build the entry for this specific serverName.
@@ -1005,7 +1174,7 @@ async function handleListInstalled(
   const catalogById = await directory.catalogByIdMap();
   const installed: InstalledEntry[] = [];
 
-  // Resolve operator OAuth audit labels lazily so the most common
+  // Resolve OAuth client audit labels lazily so the most common
   // installed-list shape (no static-auth connectors) does no extra IO.
   const userStore = ctx.runtime.getUserStore();
   const userLabelCache = new Map<string, string | undefined>();
@@ -1042,6 +1211,7 @@ async function handleListInstalled(
       catalogByUrl,
       catalogById,
       resolveUserLabel,
+      admission: await ctx.runtime.connectorAdmission(wsId, callerId ? { id: callerId } : null),
       ...(onlyServerName ? { onlyServerName } : {}),
     };
     for (const instance of lifecycle.getInstances()) {
@@ -1132,7 +1302,7 @@ async function handleInstall(
   // `wsId` is REQUIRED for every install, but it resolves to the request's
   // workspace by default (the workspace in the request URL) — the dispatcher
   // passes `ctx.getWorkspaceId()` when no explicit arg is given. There is still no default-to-personal fallback
-  // (Stage 1 precedent: `startConnectorSource` hard-errors on missing wsId;
+  // (`startConnectorSource` hard-errors on missing wsId too;
   // pooling credentials across tenants via a silent default is the failure
   // mode this guard forecloses). A call bound to no workspace and carrying
   // no `wsId` arg hits the guard below.
@@ -1195,16 +1365,19 @@ function workspaceInstallAdmission(
  * PERSONAL connector on the caller's own identity (`users/<id>/connectors.json`),
  * not into any workspace. The identity-plane sibling of `handleInstallRemoteOAuth`.
  *
- * DCR and interactive-connect brokered connectors install here. `dcr` (standard
- * dynamic-client-registration OAuth) authenticates via the interactive Connect
- * flow (`POST /v1/mcp-auth/initiate-identity` → `startIdentityAuth`). A brokered
+ * DCR, instance-client static, and interactive-connect brokered connectors
+ * install here. `dcr` (standard dynamic-client-registration OAuth) authenticates
+ * via the interactive Connect flow (`POST /v1/mcp-auth/initiate-identity` →
+ * `startIdentityAuth`). `static` installs only when the instance declares an
+ * OAuth client for the entry (`connectors.oauthClients`): the ref names that
+ * client and authenticates through the same Connect flow. A brokered
  * connector binds the broker-side identity to the caller (`{type:"user"}`, not a
  * workspace); its only owner-scoped state is the provider's namespaced user id
  * plus an opaque connection pointer (the broker credential is platform-global),
  * and the connect round-trip runs through the provider's own callback routes.
- * `static` reads an operator client secret from the workspace credential store
- * and `provider` carries a platform/fleet auth class — both workspace/platform-
- * bound and rejected here (their identity variants are a separate slice).
+ * `static` without an instance client reads a workspace's own client secret
+ * from that workspace's credential store, and `provider` carries a
+ * platform/fleet auth class — both workspace/platform-bound and rejected here.
  */
 async function handleInstallIdentity(
   ctx: ManageConnectorsContext,
@@ -1227,29 +1400,29 @@ async function handleInstallIdentity(
   // interactive connect (`initiate`) — the capability, not a vendor name, so a
   // third provider that brokers OAuth qualifies without editing this line and
   // one that does not (Smithery, whose setup lives on its own hosted page) is
-  // refused. `static` reads a workspace-scoped operator secret and `provider`
-  // mints a platform credential; both are workspace/platform-bound. Fail fast,
-  // before any wiring.
+  // refused. `static` qualifies only with an instance OAuth client, since a
+  // workspace's own client is that workspace's; `provider` mints a platform
+  // credential. Fail fast, before any wiring.
   // An unconfigured broker is a deploy problem, not an unsupported plane —
   // say which before the capability gate turns it into "not supported here".
   const brokerProvider = providerFor(ctx, entry.install.auth);
   if (isBrokeredAuthKind(entry.install.auth) && !brokerProvider) {
     return errResult(brokerNotConfiguredMessage(entry.name, entry.install.auth));
   }
-  if (!identityInstallableAuth(ctx, entry.install.auth)) {
+  if (!identityInstallableAuth(ctx, entry.install.auth, entry.id)) {
     return errResult(
       `"${entry.name}" uses "${entry.install.auth}" auth, which isn't supported for personal ` +
-        `connectors yet — only standard OAuth (DCR) and brokered connectors that support an ` +
-        `interactive connect can install on your identity today. Install it into a shared ` +
-        `workspace instead.`,
+        `connectors here — only standard OAuth (DCR), brokered connectors that support an ` +
+        `interactive connect, and connectors whose OAuth client this instance's operator ` +
+        `configured can install on your identity. Install it into a shared workspace instead.`,
     );
   }
 
   // `validateRemoteOAuthInstall` re-resolves a brokered entry's block from the
   // trusted catalog — the same bound the workspace path applies, and the reason
-  // the caller's own block never reaches `createSession`. static/provider are
-  // already rejected above. The action shape is validated upstream by
-  // `parseCatalogListing`.
+  // the caller's own block never reaches `createSession`. `provider`, and
+  // `static` without an instance OAuth client, are already rejected above. The action
+  // shape is validated upstream by `parseCatalogListing`.
   const validated = await validateRemoteOAuthInstall(ctx, entry, entry.install);
   if ("error" in validated) return errResult(validated.error);
   const action = validated.action;
@@ -1267,7 +1440,7 @@ async function handleInstallIdentity(
   // connectors.json.
   if (isReservedServerName(serverName)) {
     return errResult(
-      `"${entry.id}" resolves to "${serverName}", a name reserved for NimbleBrain system ` +
+      `"${entry.id}" resolves to "${serverName}", a name reserved for ${brandName()} system ` +
         `tools. Pick a connector with a different id.`,
     );
   }
@@ -1319,7 +1492,16 @@ async function handleInstallIdentity(
   // location in `connectors.json`, and carries no scope field (see
   // `IdentityConnectorStore`). The brokered marker, when present, rides the ref
   // so the Connect route and list handler key on it.
-  const ref = buildRemoteConnectorRef(action, serverName, trustedUi, brokeredWiring, undefined);
+  // A static entry signs in with the instance OAuth client, bound to the
+  // catalog's URL for it. The gate above guarantees one is declared.
+  let oauthClient: OAuthClientConfig | undefined;
+  if (action.auth === "static") {
+    const instanceClient = instanceOAuthClientFor(entry, action);
+    if (!instanceClient) return errResult(`"${entry.name}" has no instance OAuth client.`);
+    if ("__err" in instanceClient) return errResult(instanceClient.__err);
+    oauthClient = instanceClient;
+  }
+  const ref = buildRemoteConnectorRef(action, serverName, trustedUi, brokeredWiring, oauthClient);
   delete (ref as { oauthScope?: "workspace" }).oauthScope;
 
   // The connector-skill overlay (`syncBoundSkills`) is workspace-keyed; the
@@ -1330,8 +1512,9 @@ async function handleInstallIdentity(
   await new IdentityConnectorStore({ workDir: ctx.runtime.getWorkDir() }).add(callerId, ref);
 
   // No eager-start: a connector has no live credentials until the user completes
-  // the interactive Connect flow — DCR via `POST /v1/mcp-auth/initiate-identity`
-  // (`startIdentityAuth`), a brokered one via that provider's own initiate route.
+  // the interactive Connect flow — DCR and instance-client static via
+  // `POST /v1/mcp-auth/initiate-identity` (`startIdentityAuth`), a brokered one
+  // via that provider's own initiate route.
   // Both callbacks start the source into the user registry
   // (`getIdentityConnectorSource`) when the browser returns. Install only persists
   // the record.
@@ -1614,8 +1797,8 @@ function areAdditionalAuthParamsValid(additionalParams: unknown): boolean {
  * target: install, boot-state derivation, and disconnect cleanup are all
  * keyed purely on `wsId`, so the credential layout under
  * `credentials/<provider>/<connectorId>/` is the same in every workspace. Static-auth entries
- * require operator OAuth client config persisted under
- * `workspace.json#oauthOperatorApps[entry.id]` + the matching
+ * require OAuth client config persisted under
+ * `workspace.json#oauthClients[entry.id]` + the matching
  * client_secret in the credential store before this can proceed.
  */
 async function handleInstallRemoteOAuth(
@@ -1631,7 +1814,7 @@ async function handleInstallRemoteOAuth(
   // Cheap entry-shape validation up front (fail fast, no IO beyond the catalog
   // lookup a `provider` or brokered install needs), which also re-resolves those
   // entries' security-critical fields from the server-trusted catalog. The
-  // expensive remote work — the brokered session create, the operator credential
+  // expensive remote work — the brokered session create, the client secret
   // read — is deferred until after the dedup check so a duplicate-install click
   // doesn't burn an upstream session.
   const validated = await validateRemoteOAuthInstall(ctx, entry, entry.install);
@@ -1766,7 +1949,7 @@ async function handleInstallRemoteOAuth(
       wsId,
       ...(warning ? { warning } : {}),
       // Kept in its own field beside `warning`. A warning says something is
-      // wrong; a notice is the bundle telling the user what is now happening.
+      // wrong; a notice is the connector telling the user what is now happening.
       ...(ready.notice ? { notice: ready.notice } : {}),
     },
     isError: false,
@@ -1812,7 +1995,7 @@ async function provisionDeclaredHooks(
 /**
  * Tell a freshly-installed connector it is ready, and carry back what it said.
  *
- * The `notice` is the bundle's own words about what is now happening — the one
+ * The `notice` is the connector's own words about what is now happening — the one
  * place a user waiting on install-time setup is told to wait. The `warning`
  * lists the marked tools the extension binding rejected.
  *
@@ -1842,7 +2025,7 @@ async function notifyConnectorReady(
     return { ...(notice ? { notice } : {}), ...withRejected() };
   } catch (err) {
     // A failure here (the source went away mid-install, a transient catalog
-    // read) leaves the connector installed and the bundle un-notified — the
+    // read) leaves the connector installed and the connector un-notified — the
     // next transition to `running` tells it, with `resume`.
     log.warn("[lifecycle] install-time notification failed", {
       connector: serverName,
@@ -1976,8 +2159,8 @@ async function validateRemoteOAuthInstall(
   entry: CatalogListing,
   action: RemoteOAuthInstall,
 ): Promise<{ action: RemoteOAuthInstall } | { error: string }> {
-  if (action.auth === "static" && !action.operatorSetup) {
-    return { error: `"${entry.name}" is static-auth but missing operatorSetup config.` };
+  if (action.auth === "static" && !action.oauthClientSetup) {
+    return { error: `"${entry.name}" is static-auth but missing oauthClientSetup config.` };
   }
   if (action.auth === "provider") {
     const trusted = await ctx.runtime.getConnectorCatalog().catalogById(entry.id);
@@ -2106,9 +2289,10 @@ async function buildBrokeredWiring(
 }
 
 /**
- * Static-auth wiring: the workspace's configured operator OAuth clientId + the
+ * Static-auth wiring: the instance OAuth client when the operator declared one
+ * for this entry, else the workspace's configured OAuth client's clientId + the
  * credential-store key holding its client_secret. Gated post-dedup so a
- * duplicate-install click doesn't read the operator credential from disk.
+ * duplicate-install click doesn't read the client secret from disk.
  * Returns `__err` when setup is incomplete.
  */
 async function loadStaticOAuthClient(
@@ -2117,28 +2301,90 @@ async function loadStaticOAuthClient(
   ws: Workspace,
   entry: CatalogListing,
   action: RemoteOAuthInstall,
-): Promise<{ clientId: string; clientSecretKey: string } | { __err: string }> {
-  if (action.auth !== "static" || !action.operatorSetup) {
+): Promise<OAuthClientConfig | { __err: string }> {
+  if (action.auth !== "static" || !action.oauthClientSetup) {
     return { __err: "static-auth wiring requested for non-static install" };
   }
-  const setup = action.operatorSetup;
-  const operatorApp = ws.oauthOperatorApps?.[entry.id];
-  if (!operatorApp?.clientId) {
+  // A client the operator declared for the instance wins over this workspace's own.
+  const instanceClient = instanceOAuthClientFor(entry, action);
+  if (instanceClient) return instanceClient;
+  const setup = action.oauthClientSetup;
+  const workspaceClient = ws.oauthClients?.[entry.id];
+  if (!workspaceClient?.clientId) {
     return {
-      __err: `"${entry.name}" needs operator setup before install. Configure the OAuth app at ${setup.portalUrl} and use Set up.`,
+      __err: `"${entry.name}" needs OAuth client setup before install. Configure the OAuth client at ${setup.portalUrl} and use Set up.`,
     };
   }
   const credStore = ctx.runtime.getCredentialStore();
   const secret = await credStore.get({ kind: "workspace", wsId }, setup.clientSecretKey, {
     caller: "connector-tools:install",
-    purpose: `verify operator client_secret is seeded for ${entry.name}`,
+    purpose: `verify OAuth client_secret is seeded for ${entry.name}`,
   });
   if (!secret) {
     return {
-      __err: `Operator client_secret for "${entry.name}" is missing — re-run Set up to seed it.`,
+      __err: `OAuth client_secret for "${entry.name}" is missing — re-run Set up to seed it.`,
     };
   }
-  return { clientId: operatorApp.clientId, clientSecretKey: setup.clientSecretKey };
+  return {
+    clientId: workspaceClient.clientId,
+    clientSecret: { ref: "credential", key: setup.clientSecretKey },
+  };
+}
+
+/**
+ * The OAuth client naming the instance OAuth client for a static-auth entry, or
+ * `undefined` when the operator declared none for its id.
+ *
+ * The client is bound, at boot, to the URL the catalog published for the id then.
+ * `validateRemoteOAuthInstall` has already replaced the caller's URL with the
+ * catalog's current one, so the two differ only when the catalog moved the
+ * entry since boot; the install is refused until a restart rebinds the client.
+ * The resolver checks the same binding on every connect
+ * (`resolveStaticOAuthClient`), which is what keeps the operator's secret on the
+ * server the catalog named.
+ */
+function instanceOAuthClientFor(
+  entry: CatalogListing,
+  action: RemoteOAuthInstall,
+): OAuthClientConfig | { __err: string } | undefined {
+  const client = instanceOAuthClient(entry.id);
+  if (!client) return undefined;
+  if (action.url !== client.url) {
+    return {
+      __err: `"${entry.name}" moved to ${action.url} in the catalog; the instance OAuth client serves ${client.url} until a restart.`,
+    };
+  }
+  return { instanceClient: entry.id };
+}
+
+/** Why a workspace cannot set up its own client for an entry the operator declared one for. */
+function instanceClientOwnsSetupMessage(name: string): string {
+  return (
+    `"${name}" uses the OAuth client this instance's operator configured, so there is ` +
+    "nothing to set up here. Install it and sign in."
+  );
+}
+
+/**
+ * The `auth` block an install stores for a `provider`-auth catalog entry.
+ *
+ * A minted fleet connector stores only its provider: the credential settings it
+ * mints with (audience, scope) come from its catalog entry at every connection
+ * build (`resolveMintedTransport`), so a stored copy would never be read, and
+ * would read as the connector's settings long after the catalog changed. Every
+ * other provider stores its config as the entry gives it, because its
+ * transport credential reads it from the ref (a gateway's account key, a
+ * workspace credential's key).
+ */
+export function installedProviderAuth(providerAuth: {
+  provider: string;
+  config: Record<string, unknown>;
+}): { type: "provider"; provider: string; config: Record<string, unknown> } {
+  return {
+    type: "provider",
+    provider: providerAuth.provider,
+    config: providerAuth.provider === MINTED_PROVIDER ? {} : providerAuth.config,
+  };
 }
 
 /**
@@ -2151,7 +2397,7 @@ function buildRemoteConnectorRef(
   serverName: string,
   trustedUi: ConnectorCatalogEntry["ui"],
   brokeredWiring: BrokeredWiring | undefined,
-  staticOAuthClient: { clientId: string; clientSecretKey: string } | undefined,
+  oauthClient: OAuthClientConfig | undefined,
 ): ConnectorRef {
   return {
     url: brokeredWiring?.url ?? action.url,
@@ -2160,9 +2406,9 @@ function buildRemoteConnectorRef(
     // streamable-http (createRemoteTransport's fallback), which is wrong for
     // vendors whose remote `type` is `sse` — PayPal / Cloudflare / Webflow / Wix
     // in the bundled catalog today. A `provider`-auth entry also carries its
-    // credential class here: provider + config are copied VERBATIM from the
-    // (operator-authored) catalog entry — never tenant input — which is what
-    // makes a self-installable platform connector safe. That provenance is
+    // credential class here, from the (operator-authored) catalog entry — never
+    // tenant input — which is what makes a self-installable platform connector
+    // safe (`installedProviderAuth` says which part of it is stored). That provenance is
     // specific to THIS branch: a brokered session also yields provider auth,
     // but from a broker's session response, so `provider` auth alone is not a
     // catalog-provenance signal (see `isMintedFleetSource`).
@@ -2171,11 +2417,7 @@ function buildRemoteConnectorRef(
       (action.auth === "provider" && action.providerAuth
         ? {
             type: action.transportType,
-            auth: {
-              type: "provider",
-              provider: action.providerAuth.provider,
-              config: action.providerAuth.config,
-            },
+            auth: installedProviderAuth(action.providerAuth),
             // The workspace's own secrets, as references. They ride alongside the
             // provider credential rather than replacing it: `auth` is how the
             // connection proves who is calling, these are what that caller may
@@ -2192,14 +2434,7 @@ function buildRemoteConnectorRef(
     ...(action.additionalAuthorizationParams
       ? { additionalAuthorizationParams: action.additionalAuthorizationParams }
       : {}),
-    ...(staticOAuthClient
-      ? {
-          oauthClient: {
-            clientId: staticOAuthClient.clientId,
-            clientSecret: { ref: "credential", key: staticOAuthClient.clientSecretKey },
-          },
-        }
-      : {}),
+    ...(oauthClient ? { oauthClient } : {}),
     // Brokered marker: who brokered this install, which catalog entry it came
     // from (the persisted url is a per-install session URL, so a url→catalog
     // lookup misses), and the provider's own opaque coordinates for its probe
@@ -2280,7 +2515,7 @@ async function handleDuplicateInstall(
 
 /**
  * Resolve the fresh-install wiring for a remote-OAuth entry: the brokered
- * session, or the operator OAuth client (static-auth). Deferred until after
+ * session, or the OAuth client (static-auth). Deferred until after
  * dedup so a duplicate-install click never mints a brokered session or reads
  * the credential. Returns `{}` for auth kinds needing neither.
  */
@@ -2293,7 +2528,7 @@ async function resolveInstallWiring(
 ): Promise<
   | {
       brokeredWiring?: BrokeredWiring;
-      staticOAuthClient?: { clientId: string; clientSecretKey: string };
+      staticOAuthClient?: OAuthClientConfig;
     }
   | { error: string }
 > {
@@ -2338,6 +2573,7 @@ async function eagerStartRemoteSource(
       allowInsecureRemotes: ctx.runtime.getAllowInsecureRemotes(),
       workspaceContext: new WorkspaceContext({ wsId, workDir: ctx.runtime.getWorkDir() }),
       connectorMcp: ctx.runtime.getConnectorMcpDeps(wsId),
+      readCatalog: () => ctx.runtime.getConnectorCatalog().catalogEntries(),
     });
     return undefined;
   } catch (err) {
@@ -2360,7 +2596,7 @@ interface RemoteInstallMessageParts {
    * because the connector is installed AND connected; only a declaration is wrong.
    */
   contractWarning?: string;
-  /** The bundle's own sentence about what it has started doing. */
+  /** The connector's own sentence about what it has started doing. */
   notice?: string;
 }
 
@@ -2368,13 +2604,12 @@ interface RemoteInstallMessageParts {
  * Success `content` string for a remote-OAuth install.
  *
  * **All three parts belong in this sentence, and they are separate because they
- * mean different things.** A contract violation used to be folded into the
- * eager-start clause and rendered as "Source eager-start failed" for a connector
- * whose source was up, sending the operator to click Connect on a live
- * connection. Splitting them fixed the label — and then dropping the contract
- * warning from here made it invisible, which is worse: the engine feeds the
- * model a tool result's `content` and never its `structuredContent`, and the web
- * client's install call types its return without `warning`. So `content` is the
+ * mean different things.** A contract violation folded into the eager-start
+ * clause would render as "Source eager-start failed" for a connector whose source
+ * is up, sending the operator to click Connect on a live connection. Dropping the
+ * contract warning from here would make it invisible, which is worse: the engine
+ * feeds the model a tool result's `content` and never its `structuredContent`,
+ * and the web client's install call types its return without `warning`. So `content` is the
  * only surface either audience reads, and a check nobody can see is not a check.
  *
  * `structuredContent.warning` still carries the combined string for anything
@@ -2469,13 +2704,17 @@ async function handleDisconnect(
  *     `docs/config/secrets.mdx`), so reading only the headers would miss its
  *     one credential entirely.
  *
- * A THIRD site names a workspace key and is deliberately not here:
+ * A THIRD site names a workspace key and is not here:
  * `oauthClient.clientSecret`, which `resolveStaticOAuthClient` dereferences
- * against this same store. That key is the workspace's OAuth app setup for a
- * whole vendor rather than this connector's own credential — `setup_operator`
- * writes it and `remove_operator_setup` takes it away — so an uninstall must
- * not delete it. It is still a reason not to delete SOMEONE ELSE's key, which
- * is why `deletableSecretKeys` reads it on the referrer side only.
+ * against this same store. That key is half of the workspace's OAuth client
+ * app for a static-auth catalog entry, and the other half is
+ * `workspace.json#oauthClients[catalogId]`. The two go together or not at
+ * all, so an uninstall decides on them as a pair in `workspaceOAuthClientOf` and removes
+ * both when it takes out the app's last user. Here it would delete the secret
+ * and strand the record, which reads as configured and installs a connector
+ * that cannot complete a token exchange. It is still a reason not to delete
+ * SOMEONE ELSE's key, which is why `deletableSecretKeys` reads it on the
+ * referrer side.
  *
  * Read from the PERSISTED REF rather than the catalog entry, deliberately. The
  * ref is what the transport resolves on the next request, so it is the honest
@@ -2532,15 +2771,56 @@ function deletableSecretKeys(ws: Workspace, serverName: string, ownRef: Connecto
   for (const other of ws.connectors) {
     if (matchesServerName(other, serverName)) continue;
     for (const key of workspaceKeysNamedBy(other)) stillNamed.add(key);
-    // The third site. Owned by `setup_operator` rather than by this connector,
-    // so it is a referrer and never a deletion — see `workspaceKeysNamedBy`.
-    const clientSecretKey = other.oauthClient?.clientSecret?.key;
+    // The third site. The OAuth client's secret, which goes only with its
+    // record (`workspaceOAuthClientOf`), so here it is a referrer and never a deletion.
+    const clientSecretKey = oauthClientSecretRef(other.oauthClient)?.key;
     if (clientSecretKey) stillNamed.add(clientSecretKey);
   }
   return {
     deletable: own.filter((k) => !stillNamed.has(k)),
     retained: own.filter((k) => stillNamed.has(k)),
   };
+}
+
+/**
+ * The OAuth client the uninstalled connector is built on, and whether
+ * another installed connector still uses it.
+ *
+ * A ref carries no catalog id, so the app is found the way install made it:
+ * the catalog entry at the ref's `url` (the relation `rotateInstalledOAuthClients`
+ * and `remove_oauth_client` use) that is static-auth, has a recorded app in
+ * this workspace, and declares the very key the ref's `oauthClient.clientSecret`
+ * names. A ref that names no client secret, or whose entry has left the
+ * catalog, has no app to release.
+ *
+ * In use means another ref at the same `url`, or one that resolves the same
+ * key through any of the three sites. Either keeps BOTH halves: the record and
+ * the secret go together, so a key a sibling resolves keeps the record too.
+ */
+async function workspaceOAuthClientOf(
+  ctx: ManageConnectorsContext,
+  ws: Workspace,
+  serverName: string,
+  ref: ConnectorRef | undefined,
+): Promise<{ catalogId: string; clientSecretKey: string; inUse: boolean } | undefined> {
+  const secret = oauthClientSecretRef(ref?.oauthClient);
+  if (!ref?.url || !isCredentialRef(secret)) return undefined;
+  const entry = (await ctx.runtime.getConnectorCatalog().catalogByUrl()).get(ref.url);
+  if (
+    entry?.auth !== "static" ||
+    entry.oauthClientSetup?.clientSecretKey !== secret.key ||
+    !ws.oauthClients?.[entry.id]
+  ) {
+    return undefined;
+  }
+  const inUse = ws.connectors.some(
+    (other) =>
+      !matchesServerName(other, serverName) &&
+      (other.url === ref.url ||
+        oauthClientSecretRef(other.oauthClient)?.key === secret.key ||
+        workspaceKeysNamedBy(other).includes(secret.key)),
+  );
+  return { catalogId: entry.id, clientSecretKey: secret.key, inUse };
 }
 
 /**
@@ -2566,6 +2846,15 @@ function deletableSecretKeys(ws: Workspace, serverName: string, ownRef: Connecto
  * The keys come from the connector's own declaration, read here rather than
  * from the call: a caller-named key would be a delete primitive pointed at any
  * secret in the workspace.
+ *
+ * A static-auth connector's OAuth client goes with its last user. Set up
+ * and uninstall are both workspace-admin actions and nothing outside this file
+ * reads the app, so keeping it past the last install buys nothing: a reinstall
+ * would silently reuse a client id and secret the admin meant to remove, with
+ * no surface to clear them. Removing it puts the entry back to Set up, and the
+ * secret is reported with the connector's own deleted keys. While another
+ * installed connector still uses the app (see `workspaceOAuthClientOf`), both halves
+ * stay and the key is reported as retained.
  *
  * Workspace connectors only — a personal (identity-owned) connector is removed
  * via `handleDisconnectIdentity` (the dispatcher routes `scope:"identity"` there).
@@ -2607,18 +2896,20 @@ async function handleUninstall(
   // Resolved BEFORE the uninstall, off the workspace record as it stands now:
   // `lifecycle.uninstall` drops the instance and `stripUninstalledConnectorEntry`
   // drops the row, and both are inputs here.
-  const { deletable: secretKeys, retained: retainedKeys } = deletableSecretKeys(
-    ws,
-    serverName,
-    instance.ref,
-  );
+  const { deletable: secretKeys, retained } = deletableSecretKeys(ws, serverName, instance.ref);
+  const workspaceClient = await workspaceOAuthClientOf(ctx, ws, serverName, instance.ref);
+  const retainedKeys = workspaceClient?.inUse
+    ? [...retained, workspaceClient.clientSecretKey]
+    : retained;
 
   const outcome = await uninstallWorkspaceConnector(ctx.runtime, wsId, serverName, {
     secretKeys,
   });
   if (!outcome.ok) return errResult(outcome.error ?? "Uninstall failed.");
 
-  const { secrets } = outcome;
+  // After the teardown, like the connector's own keys: a connector that is
+  // still installed still has the app it signs in with.
+  const secrets = await releaseWorkspaceOAuthClient(ctx, wsId, workspaceClient, outcome.secrets);
   return {
     content: textContent(
       `Uninstalled "${serverName}" from workspace.${describeSecretOutcome(secrets, retainedKeys)}`,
@@ -2640,6 +2931,33 @@ async function handleUninstall(
     },
     isError: false,
   };
+}
+
+/**
+ * Remove the uninstalled connector's OAuth client when nothing else uses it,
+ * folding its secret into the uninstall's secret outcome: deleted when it went,
+ * failed when it is still stored (including when the record write threw before
+ * the secret was tried). An app still in use, or none, leaves the outcome as is.
+ */
+async function releaseWorkspaceOAuthClient(
+  ctx: ManageConnectorsContext,
+  wsId: string,
+  app: { catalogId: string; clientSecretKey: string; inUse: boolean } | undefined,
+  secrets: { deleted: string[]; failed: string[]; error?: string },
+): Promise<{ deleted: string[]; failed: string[]; error?: string }> {
+  if (!app || app.inUse) return secrets;
+  const key = app.clientSecretKey;
+  try {
+    const { deleteError } = await removeWorkspaceOAuthClient(ctx, wsId, app.catalogId, key);
+    if (deleteError === undefined) return { ...secrets, deleted: [...secrets.deleted, key] };
+    return { ...secrets, failed: [...secrets.failed, key], error: secrets.error ?? deleteError };
+  } catch (err) {
+    return {
+      ...secrets,
+      failed: [...secrets.failed, key],
+      error: secrets.error ?? (err instanceof Error ? err.message : String(err)),
+    };
+  }
 }
 
 /**
@@ -2693,13 +3011,13 @@ async function handleListTools(
   scopeHint: string | undefined,
 ): Promise<ToolResult> {
   if (!serverName) return errResult("serverName is required.");
-  void scopeHint; // Stage 2: scopeHint is workspace-only and informational
-  void callerId; // unused post-Stage-2; kept for caller signature stability
+  void scopeHint; // workspace-only and informational
+  void callerId; // unused; kept for caller signature stability
   const lifecycle = ctx.runtime.getLifecycle();
 
-  // Stage 2: every connector is workspace-scoped. The caller must
+  // Every connector is workspace-scoped. The caller must
   // disambiguate the workspace (the UI selects it via the sidebar
-  // navigator — see Q1 in STAGE_2_DESIGN_DECISIONS.md).
+  // navigator).
   if (!wsId) return errResult("Workspace context required.");
   if (!lifecycle.getInstance(serverName, wsId)) {
     return errResult(`Connector "${serverName}" not installed in workspace.`);
@@ -2708,9 +3026,9 @@ async function handleListTools(
   const registry = ctx.runtime.getRegistryForWorkspace(wsId);
   const source = registry.getSource(serverName);
   if (!source) {
-    // Connector is installed but not currently running (e.g. URL connector
-    // in `not_authenticated` after disconnect, stdio connector whose
-    // respawn failed). No tools to enumerate. Return empty tools
+    // Connector is installed but not currently running (e.g. in
+    // `not_authenticated` after disconnect, or its start failed). No tools to
+    // enumerate. Return empty tools
     // instead of throwing — this is a normal state, not an error.
     // The hero already conveys the "needs auth / needs setup" prompt.
     return {
@@ -2948,6 +3266,7 @@ async function workspacePolicyAdmission(
   ctx: ManageConnectorsContext,
   wsId: string,
   serverName: string,
+  what = "set tool permissions",
 ): Promise<ToolResult | null> {
   // Reject unknown serverName up front. Permission entries for a non-existent
   // connector would sit unused (the runtime gate keys on installed-source
@@ -2961,7 +3280,7 @@ async function workspacePolicyAdmission(
   if (!ws) return errResult(`Workspace "${wsId}" not found.`);
   if (!isWorkspaceAdmin(ws, identity)) {
     return {
-      content: textContent("Workspace admin role required to set tool permissions."),
+      content: textContent(`Workspace admin role required to ${what}.`),
       structuredContent: { error: "permission_denied" },
       isError: true,
     };
@@ -3023,6 +3342,89 @@ async function handleSetPermissions(
   };
 }
 
+/**
+ * `set_record_sources` — narrow or revoke a connector's record-arguments grant
+ * in this workspace (ADR-0058). The grant itself is the operator's, from the
+ * catalog entry's `record_arguments`; this only says which connectors here may
+ * be its sources. A list names them (empty revokes), `null` removes the
+ * narrowing. Workspace admin only, like tool policy: it decides what reaches a
+ * connector on every member's calls.
+ */
+async function handleSetRecordSources(
+  ctx: ManageConnectorsContext,
+  wsId: string | null,
+  serverName: string,
+  sourcesInput: unknown,
+): Promise<ToolResult> {
+  if (!wsId) return errResult("set_record_sources acts on a workspace connector.");
+  if (!serverName) return errResult("serverName is required.");
+  const sources =
+    sourcesInput === null
+      ? null
+      : Array.isArray(sourcesInput) && sourcesInput.every((v) => typeof v === "string" && v !== "")
+        ? [...new Set(sourcesInput as string[])]
+        : undefined;
+  if (sources === undefined) {
+    return errResult("sources must be a list of connector server names, or null.");
+  }
+  const refused = await workspacePolicyAdmission(
+    ctx,
+    wsId,
+    serverName,
+    "set a connector's record sources",
+  );
+  if (refused) return refused;
+  const store = ctx.runtime.getWorkspaceStore();
+  const ws = await store.get(wsId);
+  if (!ws) return errResult(`Workspace "${wsId}" not found.`);
+  const connectors = ws.connectors.map((ref) => {
+    if (serverNameFromRef(ref) !== serverName) return ref;
+    const { recordSources: _prior, ...rest } = ref;
+    return sources === null ? rest : { ...rest, recordSources: sources };
+  });
+  await store.update(wsId, { connectors });
+  const catalogGrants = await ctx.runtime.catalogGrantsRecordArguments(wsId, serverName);
+  const installed = new Set(ws.connectors.map((ref) => serverNameFromRef(ref)));
+  const unknownSources = (sources ?? []).filter((name) => !installed.has(name));
+  return {
+    content: textContent(
+      recordSourcesSummary(serverName, sources, catalogGrants) +
+        (unknownSources.length > 0
+          ? ` Not installed in this workspace, so they serve nothing: ${unknownSources.join(", ")}.`
+          : ""),
+    ),
+    structuredContent: {
+      ok: true,
+      serverName,
+      recordSources: sources,
+      granted: catalogGrants && sources?.length !== 0,
+      ...(unknownSources.length > 0 ? { unknownSources } : {}),
+    },
+    isError: false,
+  };
+}
+
+/** What a saved `recordSources` means for `serverName`, given whether its catalog entry grants it. */
+function recordSourcesSummary(
+  serverName: string,
+  sources: string[] | null,
+  catalogGrants: boolean,
+): string {
+  if (!catalogGrants) {
+    return (
+      `Saved. "${serverName}" receives no records from other connectors in any case: ` +
+      "its catalog entry does not grant it record arguments."
+    );
+  }
+  if (sources === null) {
+    return `"${serverName}" may receive records from every connector in this workspace.`;
+  }
+  if (sources.length === 0) {
+    return `"${serverName}" may not receive records from any connector in this workspace.`;
+  }
+  return `"${serverName}" may receive records only from: ${sources.join(", ")}.`;
+}
+
 // ── personal-connector grants ─────────────────────────────────────
 //
 // A personal connector is installed on the caller's identity (their
@@ -3072,7 +3474,7 @@ async function handleListPersonalCatalog(
       e.personal === true &&
       e.install.kind === "remote-oauth" &&
       // Lockstep with handleInstallIdentity's gate — offered ⊆ acceptable.
-      identityInstallableAuth(ctx, e.install.auth) &&
+      identityInstallableAuth(ctx, e.install.auth, e.id) &&
       !installedServerNames.has(slugifyServerName(e.id)),
   );
 
@@ -3161,7 +3563,7 @@ async function handleListPersonalConnectors(
       const authed = await hasPersistedConnection(ctx, owner, ref, serverName);
       // Credential teardown deletes the identity record with the tokens, so an
       // unconnected connector reads none (and a missing key writes no audit line).
-      const identity = await readConnectorIdentity(ctx, owner, ref, serverName);
+      const identity = await readConnectorIdentity(ctx, owner, ref, serverName, catalog);
       return {
         serverName,
         displayName: cat?.name ?? serverName,
@@ -3324,27 +3726,27 @@ async function handleDisconnectIdentity(
 }
 
 /**
- * Configure (or rotate) the OAuth app credentials a workspace will use
+ * Configure (or rotate) the OAuth client credentials a workspace will use
  * to authenticate against a static-auth catalog connector. Two stores
  * write together so the next install of this connector finds both
  * pieces:
  *
- *   - workspace.json#oauthOperatorApps[catalogId] gets the public
+ *   - workspace.json#oauthClients[catalogId] gets the public
  *     `client_id` plus an audit trail (who configured it, when).
  *   - The credential store gets the `client_secret` under the catalog
  *     entry's declared `clientSecretKey`.
  *
  * Upsert semantics — calling this on an already-configured catalog
  * entry rotates both credentials. The clientId can change (e.g.,
- * operator rebuilt the OAuth app); the secret always rotates whenever
+ * admin rebuilt the OAuth client); the secret always rotates whenever
  * the modal is submitted (the modal pre-fills the clientId for ease,
  * but never the secret — security posture: don't echo secrets).
  *
  * Gated to workspace-admin and above. Workspace admins are the right
- * principal because OAuth app config is workspace-level (each
- * workspace creates its own OAuth app at the vendor's portal).
+ * principal because OAuth client config is workspace-level (each
+ * workspace creates its own OAuth client at the vendor's portal).
  */
-async function handleSetupOperator(
+async function handleSetOAuthClient(
   ctx: ManageConnectorsContext,
   wsId: string | null,
   identity: UserIdentity | null,
@@ -3363,7 +3765,7 @@ async function handleSetupOperator(
   if (!ws) return errResult(`Workspace "${wsId}" not found.`);
   if (!isWorkspaceAdmin(ws, identity)) {
     return {
-      content: textContent("Workspace admin role required to configure OAuth apps."),
+      content: textContent("Workspace admin role required to configure OAuth clients."),
       structuredContent: { error: "permission_denied" },
       isError: true,
     };
@@ -3372,12 +3774,13 @@ async function handleSetupOperator(
   const entry = await ctx.runtime.getConnectorCatalog().catalogById(catalogId);
   if (!entry) return errResult(`Catalog entry "${catalogId}" not found.`);
   if (entry.auth !== "static") {
-    return errResult(`"${entry.name}" is a DCR connector — operator setup not required.`);
+    return errResult(`"${entry.name}" is a DCR connector — OAuth client setup not required.`);
   }
-  const clientSecretKey = entry.operatorSetup?.clientSecretKey;
+  if (instanceOAuthClient(catalogId)) return errResult(instanceClientOwnsSetupMessage(entry.name));
+  const clientSecretKey = entry.oauthClientSetup?.clientSecretKey;
   if (!clientSecretKey) {
     return errResult(
-      `Catalog entry "${catalogId}" is malformed: missing operatorSetup.clientSecretKey.`,
+      `Catalog entry "${catalogId}" is malformed: missing oauthClientSetup.clientSecretKey.`,
     );
   }
 
@@ -3389,44 +3792,94 @@ async function handleSetupOperator(
   const credStore = ctx.runtime.getCredentialStore();
   const hadPriorSecret =
     (await credStore.get({ kind: "workspace", wsId }, clientSecretKey, {
-      caller: "connector-tools:setup_operator",
+      caller: "connector-tools:set_oauth_client",
       purpose: "decide whether a failed workspace.json write may roll the secret back",
     })) !== null;
   await credStore.put({ kind: "workspace", wsId }, clientSecretKey, clientSecret.trim());
 
   // Stamp the public clientId + audit trail into workspace.json.
-  const apps: NonNullable<Workspace["oauthOperatorApps"]> = { ...(ws.oauthOperatorApps ?? {}) };
+  const apps: NonNullable<Workspace["oauthClients"]> = { ...(ws.oauthClients ?? {}) };
   apps[catalogId] = {
     clientId: clientId.trim(),
     configuredAt: new Date().toISOString(),
     configuredBy: identity.id,
   };
-  await persistOperatorApp(ctx, wsId, apps, credStore, clientSecretKey, hadPriorSecret);
+  const rotated = rotateInstalledOAuthClients(ws.connectors, entry.url, clientId.trim());
+  await persistWorkspaceOAuthClient(
+    ctx,
+    wsId,
+    {
+      oauthClients: apps,
+      ...(rotated.refs.length > 0 ? { connectors: rotated.connectors } : {}),
+    },
+    credStore,
+    clientSecretKey,
+    hadPriorSecret,
+  );
+  // The install copied the client id onto its ref, and every connection reads
+  // its client from there. A new client invalidates whatever the old one signed
+  // in, so each rotated connection drops its OAuth records and asks for sign-in.
+  for (const ref of rotated.refs) {
+    await ctx.runtime.getLifecycle().replaceOAuthClient(ref.serverName, wsId, ref);
+  }
 
   return {
-    content: textContent(`Configured OAuth app for "${entry.name}".`),
+    content: textContent(`Configured OAuth client for "${entry.name}".`),
     structuredContent: { ok: true, catalogId, clientId: apps[catalogId]?.clientId },
     isError: false,
   };
 }
 
 /**
- * Write the operator OAuth app record to workspace.json. On failure, roll back
+ * The installed connectors of a static-auth catalog entry whose pre-registered
+ * client is not `clientId`, rewritten to it.
+ *
+ * Install copies the OAuth client's client id onto the connector's ref, because
+ * the ref is what boot and `startAuth` build the connection from, and neither
+ * reaches the workspace record. Setup is the only writer of the OAuth client, so
+ * it rewrites the copies in the same write: the copy and its source never
+ * disagree. The secret needs no rewrite; the ref holds a reference to it.
+ */
+export function rotateInstalledOAuthClients(
+  connectors: readonly ConnectorRef[],
+  url: string,
+  clientId: string,
+): { connectors: ConnectorRef[]; refs: ConnectorRef[] } {
+  const refs: ConnectorRef[] = [];
+  const next = connectors.map((ref) => {
+    // An instance-client ref names the operator's client, which this setup does not own.
+    if (
+      ref.url !== url ||
+      !ref.oauthClient ||
+      isInstanceOAuthClientRef(ref.oauthClient) ||
+      ref.oauthClient.clientId === clientId
+    ) {
+      return ref;
+    }
+    const rotated: ConnectorRef = { ...ref, oauthClient: { ...ref.oauthClient, clientId } };
+    refs.push(rotated);
+    return rotated;
+  });
+  return { connectors: next, refs };
+}
+
+/**
+ * Write the OAuth client record to workspace.json. On failure, roll back
  * the just-written client_secret so the two stores stay in lockstep — but only
  * when there was no prior secret for this key (clobbering a working credential
  * on a workspace.json hiccup is worse than leaving a stale-but-valid one).
  * Best-effort rollback: if it fails, the original write error still wins.
  */
-async function persistOperatorApp(
+async function persistWorkspaceOAuthClient(
   ctx: ManageConnectorsContext,
   wsId: string,
-  apps: NonNullable<Workspace["oauthOperatorApps"]>,
+  patch: Pick<Workspace, "oauthClients"> & Partial<Pick<Workspace, "connectors">>,
   credStore: CredentialStore,
   clientSecretKey: string,
   hadPriorSecret: boolean,
 ): Promise<void> {
   try {
-    await ctx.runtime.getWorkspaceStore().update(wsId, { oauthOperatorApps: apps });
+    await ctx.runtime.getWorkspaceStore().update(wsId, patch);
   } catch (err) {
     if (!hadPriorSecret) {
       try {
@@ -3440,17 +3893,17 @@ async function persistOperatorApp(
 }
 
 /**
- * Drop a workspace's operator OAuth app config. Both halves removed in
+ * Drop a workspace's OAuth client config. Both halves removed in
  * lockstep — workspace.json entry deleted and the credential store's
  * client_secret cleared.
  *
  * Refuses to run while the connector is currently installed. The right
- * mental model: operator setup is a *prerequisite* for install, not a
+ * mental model: OAuth client setup is a *prerequisite* for install, not a
  * peer of it. Removing setup while the connector is live would orphan the
  * ConnectorRef's credential pointer — the next OAuth round-trip would 404
  * mid-flow. Caller uninstalls first, then removes setup.
  */
-async function handleRemoveOperatorSetup(
+async function handleRemoveOAuthClient(
   ctx: ManageConnectorsContext,
   wsId: string | null,
   identity: UserIdentity | null,
@@ -3464,7 +3917,7 @@ async function handleRemoveOperatorSetup(
   if (!ws) return errResult(`Workspace "${wsId}" not found.`);
   if (!isWorkspaceAdmin(ws, identity)) {
     return {
-      content: textContent("Workspace admin role required to remove OAuth app config."),
+      content: textContent("Workspace admin role required to remove OAuth client config."),
       structuredContent: { error: "permission_denied" },
       isError: true,
     };
@@ -3474,34 +3927,59 @@ async function handleRemoveOperatorSetup(
   if (!entry) return errResult(`Catalog entry "${catalogId}" not found.`);
 
   // Guard: refuse if the connector is currently installed. Removing
-  // operator config out from under a live connector leaves a dangling
-  // credential reference; force the operator through the explicit
+  // OAuth client config out from under a live connector leaves a dangling
+  // credential reference; force the admin through the explicit
   // uninstall path first.
-  const installed = ws.connectors.some((b) => "url" in b && b.url === entry.url);
+  const installed = ws.connectors.some((b) => b.url === entry.url);
   if (installed) {
     return errResult(
-      `"${entry.name}" is installed — uninstall it first, then remove the OAuth app config.`,
+      `"${entry.name}" is installed — uninstall it first, then remove the OAuth client config.`,
     );
   }
 
-  const apps = { ...(ws.oauthOperatorApps ?? {}) };
-  if (!apps[catalogId]) {
-    return errResult(`No operator setup configured for "${entry.name}".`);
+  if (!ws.oauthClients?.[catalogId]) {
+    return errResult(`No OAuth client setup configured for "${entry.name}".`);
   }
-  delete apps[catalogId];
-  await ctx.runtime.getWorkspaceStore().update(wsId, { oauthOperatorApps: apps });
-
-  const clientSecretKey = entry.operatorSetup?.clientSecretKey;
-  if (clientSecretKey) {
-    const credStore = ctx.runtime.getCredentialStore();
-    await credStore.delete({ kind: "workspace", wsId }, clientSecretKey).catch(() => {});
-  }
+  await removeWorkspaceOAuthClient(ctx, wsId, catalogId, entry.oauthClientSetup?.clientSecretKey);
 
   return {
-    content: textContent(`Removed OAuth app config for "${entry.name}".`),
+    content: textContent(`Removed OAuth client config for "${entry.name}".`),
     structuredContent: { ok: true, catalogId },
     isError: false,
   };
+}
+
+/**
+ * Remove both halves of a workspace's OAuth client: the
+ * `oauthClients` record, then the client secret. The record goes first, so
+ * a failed secret delete leaves an unreferenced secret rather than a record
+ * that reads as configured. The workspace is read fresh because an uninstall
+ * calls this after its own writes to the record.
+ *
+ * Throws when the record write fails; returns the secret delete's error when it
+ * fails.
+ */
+async function removeWorkspaceOAuthClient(
+  ctx: ManageConnectorsContext,
+  wsId: string,
+  catalogId: string,
+  clientSecretKey: string | undefined,
+): Promise<{ deleteError?: string }> {
+  const store = ctx.runtime.getWorkspaceStore();
+  const ws = await store.get(wsId);
+  if (ws?.oauthClients?.[catalogId]) {
+    const apps = { ...ws.oauthClients };
+    delete apps[catalogId];
+    await store.update(wsId, { oauthClients: apps });
+  }
+  if (!clientSecretKey) return {};
+  return ctx.runtime
+    .getCredentialStore()
+    .delete({ kind: "workspace", wsId }, clientSecretKey)
+    .then(
+      () => ({}),
+      (err: unknown) => ({ deleteError: err instanceof Error ? err.message : String(err) }),
+    );
 }
 
 // ── Workspace secrets ───────────────────────────────────────────────
@@ -3617,7 +4095,7 @@ async function handleListSecretKeys(
  *
  * Delegates to the single source of truth, `canWriteWorkspaceScoped`:
  * the identity must be a workspace member with the `admin` role. There
- * is no org-admin bypass — an org admin / owner who is not a workspace
+ * is no org-admin bypass — an org admin who is not a workspace
  * admin member cannot install connectors. The helper fails closed on a
  * malformed workspace record (non-array `members`).
  */

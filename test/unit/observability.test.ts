@@ -1,8 +1,6 @@
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import type { LanguageModelV4, LanguageModelV4StreamPart } from "@ai-sdk/provider";
 import { SpanStatusCode } from "@opentelemetry/api";
-import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type { UserIdentity } from "../../src/identity/provider.ts";
 import { callModel, NO_FINISH_PART_RAW } from "../../src/model/stream.ts";
 import {
@@ -18,17 +16,11 @@ import {
   runDetached,
   runWithRequestContext,
 } from "../../src/runtime/request-context.ts";
+import { spanExporter } from "../helpers/span-exporter.ts";
 
-const exporter = new InMemorySpanExporter();
-
-beforeAll(() => {
-  // Register a provider with an in-memory exporter so withSpan() produces real,
-  // inspectable spans. No OTLP endpoint — matches the no-export default path.
-  const provider = new NodeTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(exporter)],
-  });
-  provider.register();
-});
+// The process-wide in-memory exporter, so withSpan() produces real, inspectable
+// spans. No OTLP endpoint — matches the no-export default path.
+const exporter = spanExporter;
 
 beforeEach(() => {
   exporter.reset();
@@ -283,7 +275,7 @@ describe("structured logger (JSON mode)", () => {
       );
     } finally {
       process.stderr.write = orig;
-      process.env.NB_LOG_FORMAT = undefined;
+      delete process.env.NB_LOG_FORMAT;
     }
     const rec = JSON.parse(lines.join("").trim());
     expect(rec.level).toBe("info");
@@ -327,7 +319,7 @@ describe("structured logger (JSON mode)", () => {
       });
     } finally {
       process.stderr.write = orig;
-      process.env.NB_LOG_FORMAT = undefined;
+      delete process.env.NB_LOG_FORMAT;
     }
     const rec = JSON.parse(lines.join("").trim());
     expect(rec.token).toBe("[redacted]");
@@ -367,8 +359,8 @@ describe("structured logger (JSON mode)", () => {
       log.error("should.keep.too");
     } finally {
       process.stderr.write = orig;
-      process.env.NB_LOG_LEVEL = undefined;
-      process.env.NB_LOG_FORMAT = undefined;
+      delete process.env.NB_LOG_LEVEL;
+      delete process.env.NB_LOG_FORMAT;
     }
     const out = lines.join("");
     expect(out).not.toContain("should.drop");
@@ -378,16 +370,38 @@ describe("structured logger (JSON mode)", () => {
 });
 
 describe("OTel dependency coherence", () => {
+  // The stable SDK packages must share one version, and the exporter must be
+  // the experimental 0.x release built against it. Bump them together or
+  // export serialization fails (instrumentationLibrary vs instrumentationScope).
+  // The exporter's own manifest names the stable release it was built for, so
+  // the pins are checked against it rather than against literal versions.
   it("pins the stable + experimental packages to one release train", async () => {
-    const pkg = await Bun.file(`${import.meta.dir}/../../package.json`).json();
+    const root = `${import.meta.dir}/../..`;
+    const pkg = await Bun.file(`${root}/package.json`).json();
     const d = pkg.dependencies as Record<string, string>;
-    expect(d["@opentelemetry/api"]).toBe("1.9.1");
-    expect(d["@opentelemetry/exporter-trace-otlp-http"]).toBe("0.219.0");
-    // The stable SDK packages must share one version; the exporter is the
-    // matching 0.2xx experimental line. Bump them together or export
-    // serialization fails (instrumentationLibrary vs instrumentationScope).
-    expect(d["@opentelemetry/sdk-trace-base"]).toBe("2.8.0");
-    expect(d["@opentelemetry/sdk-trace-node"]).toBe(d["@opentelemetry/sdk-trace-base"]);
-    expect(d["@opentelemetry/resources"]).toBe(d["@opentelemetry/sdk-trace-base"]);
+    const stable = d["@opentelemetry/sdk-trace-base"];
+    expect(d["@opentelemetry/sdk-trace-node"]).toBe(stable);
+    expect(d["@opentelemetry/resources"]).toBe(stable);
+
+    const exporter = await Bun.file(
+      `${root}/node_modules/@opentelemetry/exporter-trace-otlp-http/package.json`,
+    ).json();
+    expect(exporter.version).toBe(d["@opentelemetry/exporter-trace-otlp-http"]);
+    const wanted = Object.entries(exporter.dependencies as Record<string, string>).filter(
+      ([name]) => name.startsWith("@opentelemetry/"),
+    );
+    expect(wanted.length).toBeGreaterThan(0);
+    for (const [name, version] of wanted) {
+      // 0.x packages ride the exporter's experimental line; the rest are stable.
+      expect(`${name}@${version}`).toBe(
+        `${name}@${version.startsWith("0.") ? exporter.version : stable}`,
+      );
+    }
+    expect(
+      Bun.semver.satisfies(
+        d["@opentelemetry/api"],
+        exporter.peerDependencies["@opentelemetry/api"],
+      ),
+    ).toBe(true);
   });
 });

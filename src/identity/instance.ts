@@ -1,4 +1,4 @@
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveInstanceCredentialRefs } from "../tools/instance-credentials.ts";
 
@@ -19,14 +19,6 @@ export interface WorkosAuth {
   adapter: "workos";
   /** WorkOS Client ID (client_...). */
   clientId: string;
-  /**
-   * OAuth callback URL (e.g., https://app.example.com/v1/auth/callback).
-   * Optional: when omitted the provider derives `${publicOrigin()}/v1/auth/callback`
-   * from the canonical public origin. An explicit value (legacy
-   * `WORKOS_REDIRECT_URI`) still overrides — kept as a fallback during the
-   * migration off that secret.
-   */
-  redirectUri?: string;
   /** WorkOS Organization ID — scopes auth to a specific customer org. */
   organizationId?: string;
   /** WorkOS API key — can also come from WORKOS_API_KEY env var. */
@@ -43,10 +35,9 @@ export interface WorkosAuth {
    * `["admin", "owner"]`; an explicit list REPLACES the defaults and must
    * contain at least one non-empty slug. Set this when your WorkOS org's admin
    * role carries a custom slug (e.g. `org-admin`) — otherwise it silently maps
-   * to `member`. Any slug not listed maps to `member` (and is logged). Note:
-   * `owner` is an app-internal elevation assigned via `manage_users`, not a
-   * WorkOS-derived role; listing an `owner` slug here grants app `admin`, not
-   * app `owner`.
+   * to `member`. Any slug not listed maps to `member` (and is logged). The
+   * default `owner` is WorkOS's org-owner role name; it grants app `admin`,
+   * the top app role.
    */
   adminRoleSlugs?: string[];
   /**
@@ -78,7 +69,6 @@ export type AuthConfig = OidcAuth | WorkosAuth | DevAuth;
 export interface InstanceConfig {
   auth: AuthConfig;
   integrations?: Record<string, unknown>;
-  orgName?: string;
   orgId?: string;
 }
 
@@ -148,17 +138,19 @@ function buildWorkosAuth(auth: Record<string, unknown>): WorkosAuth {
     adapter: "workos",
     clientId: auth.clientId as string,
   };
-  // redirectUri is optional — the provider derives it from publicOrigin()
-  // when absent. Validate only if present.
-  const redirectUri = optionalString(
-    auth.redirectUri,
-    "instance.json: workos auth 'redirectUri' must be a string",
-  );
-  if (redirectUri !== undefined) workos.redirectUri = redirectUri;
   const organizationId = optionalString(
     auth.organizationId,
     "instance.json: workos auth 'organizationId' must be a string",
   );
+  // The provider reads a falsy organizationId as "no organization scope", so a
+  // blank value would boot without the org gate. A config renderer that
+  // interpolates an unset variable produces exactly that, so refuse it here and
+  // keep "no organization" expressible only by omitting the field.
+  if (organizationId !== undefined && organizationId.trim() === "")
+    throw new Error(
+      "instance.json: workos auth 'organizationId' must not be empty " +
+        "(omit the field to run without an organization)",
+    );
   if (organizationId !== undefined) workos.organizationId = organizationId;
   const apiKey = optionalString(
     auth.apiKey,
@@ -211,10 +203,6 @@ function validateInstanceConfig(raw: unknown): InstanceConfig {
     }
     config.integrations = obj.integrations as Record<string, unknown>;
   }
-  if (obj.orgName !== undefined) {
-    if (typeof obj.orgName !== "string") throw new Error("instance.json: orgName must be a string");
-    config.orgName = obj.orgName as string;
-  }
   if (obj.orgId !== undefined) {
     if (typeof obj.orgId !== "string") throw new Error("instance.json: orgId must be a string");
     config.orgId = obj.orgId as string;
@@ -223,12 +211,7 @@ function validateInstanceConfig(raw: unknown): InstanceConfig {
   return config;
 }
 
-// ── Load / Save ─────────────────────────────────────────────────────
-
-let tmpCounter = 0;
-function uniqueTmpSuffix(): string {
-  return `${Date.now()}.${++tmpCounter}`;
-}
+// ── Load ─────────────────────────────────────────────────────
 
 /**
  * Load instance config from `workDir/instance.json`.
@@ -277,15 +260,4 @@ export function missingInstanceConfigError(workDir: string): Error {
       `    or {"auth":{"adapter":"workos","clientId":"<client id>"}}\n` +
       `  See https://docs.nimblebrain.ai/config/instance-json/`,
   );
-}
-
-/**
- * Atomically save instance config to `workDir/instance.json`.
- * Uses write-temp-then-rename to prevent partial writes.
- */
-export async function saveInstanceConfig(workDir: string, config: InstanceConfig): Promise<void> {
-  const filePath = join(workDir, INSTANCE_FILE);
-  const tmpPath = `${filePath}.tmp.${uniqueTmpSuffix()}`;
-  await writeFile(tmpPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
-  await rename(tmpPath, filePath);
 }

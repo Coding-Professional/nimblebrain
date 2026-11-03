@@ -5,6 +5,7 @@ import { isMintedFleetSource } from "../oauth/minted-credential-provider.ts";
 import { getCredentialProvider } from "./credential-provider.ts";
 import { type CredentialValue, isCredentialRef } from "./credential-ref.ts";
 import { type CredentialScope, resolveCredentialValue } from "./credential-store.ts";
+import { createInBandAuthRejectionFetch } from "./in-band-auth-rejection-fetch.ts";
 import { createOAuthRefreshFetch } from "./oauth-refresh-fetch.ts";
 import { createSsrfGuardedFetch } from "./ssrf-guarded-fetch.ts";
 
@@ -162,7 +163,7 @@ function applyProviderAuth(
  * static headers plus, for `provider` auth, the fetch wrapper that mints and
  * re-mints a token per request.
  *
- * Exported because the MCP transport is no longer the only thing that calls a
+ * Exported because the MCP transport is not the only thing that calls a
  * connector's server. The hooks door forwards an inbound vendor delivery to a
  * route the SAME connector declared, and it must present the SAME credential —
  * resolving it a second way is how the two drift into disagreeing about how a
@@ -183,12 +184,15 @@ export async function resolveTransportCredential(
   return fetch ? { headers, fetch } : { headers };
 }
 
-/** OAuth provider applies only when no static auth is configured — static auth is the explicit contract. */
+/**
+ * OAuth provider applies only when no `auth` is configured — any declared auth,
+ * `none` included, is the explicit contract.
+ */
 function selectAuthProvider(
   config: RemoteTransportConfig | undefined,
   authProvider?: OAuthClientProvider,
 ): OAuthClientProvider | undefined {
-  return config?.auth && config.auth.type !== "none" ? undefined : authProvider;
+  return config?.auth ? undefined : authProvider;
 }
 
 /** Transport fetch: the minting fetch, else an OAuth-refresh fetch for an OAuth connector, else none. */
@@ -256,6 +260,10 @@ export async function createRemoteTransport(
      *  guard so http://localhost endpoints still work under local development.
      *  Defaults to false (production posture). */
     allowInsecure?: boolean;
+    /** The catalog entry's in-band token-rejection text. An OAuth connection
+     *  that declares it reads a matching `tools/call` answer as a 401
+     *  (`createInBandAuthRejectionFetch`). */
+    inBandAuthErrors?: readonly string[];
   },
 ): Promise<Transport> {
   // The last source for a name wins, compared case-insensitively as header names
@@ -297,10 +305,17 @@ export async function createRemoteTransport(
   });
   // No header, no wrapper. A connection carrying only literals still reads
   // nothing from the store on any request: `perRequest` is empty.
-  const requestFetch =
+  const headerFetch =
     Object.keys(fixed).length > 0 || perRequest.length > 0
       ? createConnectorHeaderFetch(guardedFetch, fixed, perRequest, url, opts?.workspaceId)
       : guardedFetch;
+  // Only a token the SDK can renew is worth a 401: a static-auth or minting
+  // remote has no refresh, and its in-band rejection surfaces as the server sent it.
+  const inBandAuthErrors = opts?.inBandAuthErrors ?? [];
+  const requestFetch =
+    effectiveAuthProvider && !mintingFetch && inBandAuthErrors.length > 0
+      ? createInBandAuthRejectionFetch(headerFetch, inBandAuthErrors)
+      : headerFetch;
 
   if (config?.type === "sse") {
     return new SSEClientTransport(url, {

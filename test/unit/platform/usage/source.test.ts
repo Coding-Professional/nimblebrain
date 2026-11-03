@@ -7,8 +7,8 @@
  *     usage aggregates regardless of which workspace the spend happened in.
  *   - `scope: "user"` (default) is gated to the caller's own spend via the
  *     aggregator's ownerFilter — a member can't see peers' usage.
- *   - `scope: "org"` requires org admin/owner; a member is denied.
- *   - The dev user is an org owner: it reads the org scope on its role, and
+ *   - `scope: "org"` requires org admin; a member is denied.
+ *   - The dev user is an org admin: it reads the org scope on its role, and
  *     its user scope is its own spend.
  *   - The response echoes the resolved `scope`.
  */
@@ -20,15 +20,19 @@ import { join } from "node:path";
 import { NoopEventSink } from "../../../../src/adapters/noop-events.ts";
 import type { UsageReportOutput } from "../../../../src/platform/schemas/usage.ts";
 import { createUsageSource } from "../../../../src/platform/usage/source.ts";
+import type { Runtime } from "../../../../src/runtime/runtime.ts";
 import type { McpSource } from "../../../../src/tools/mcp-source.ts";
+import { MAX_BREAKDOWN_ROWS } from "../../../../src/usage/aggregate.ts";
 import { usageMonthDir, usageMonthOf } from "../../../../src/usage/paths.ts";
 import type { UsageLedgerEntry } from "../../../../src/usage/types.ts";
+import { makeIdentity } from "../../../helpers/identity.ts";
+import { stub } from "../../../helpers/stub.ts";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
 interface FakeIdentity {
   id: string;
-  orgRole: "owner" | "admin" | "member";
+  orgRole: "admin" | "member";
 }
 
 class FakeRuntime {
@@ -41,7 +45,7 @@ class FakeRuntime {
     return this.workDir;
   }
   getCurrentIdentity() {
-    return this.identity;
+    return this.identity && makeIdentity(this.identity);
   }
 }
 
@@ -50,9 +54,7 @@ const AT = "2026-04-10T12:00:00Z";
 /**
  * Seed one user's spend into the ledger.
  *
- * The tool used to walk every workspace's conversation files to find a user's
- * usage across workspaces; the ledger carries `userId` and `workspaceId` on the
- * line, so there is nothing to walk and the owner scoping is a field predicate.
+ * The ledger carries `userId` and `workspaceId` on the line, so there is nothing to walk and the owner scoping is a field predicate.
  * The `workspaceId` is kept on the fixture because the calls really did happen
  * in different workspaces — that a cross-workspace read still aggregates by
  * owner is the property these tests exist for.
@@ -61,7 +63,7 @@ async function seedSpend(
   workDir: string,
   wsId: string,
   ownerId: string,
-  sessionId: string,
+  conversationId: string,
   input: number,
   output: number,
 ): Promise<void> {
@@ -76,7 +78,7 @@ async function seedSpend(
     llmMs: 100,
     userId: ownerId,
     workspaceId: wsId,
-    sessionId,
+    conversationId,
   };
   await appendFile(join(dir, "test.jsonl"), `${JSON.stringify(entry)}\n`);
 }
@@ -103,8 +105,11 @@ afterEach(async () => {
 });
 
 async function buildSource(): Promise<McpSource> {
-  source = createUsageSource(runtime as unknown as never, new NoopEventSink());
+  source = createUsageSource(stub<Runtime>(runtime), new NoopEventSink());
   await source.start();
+  // List first, as the engine does: the SDK client validates a result against
+  // its tool's output schema only once it holds the `tools/list` that declares it.
+  await source.tools();
   return source;
 }
 
@@ -211,9 +216,9 @@ describe("usage source — scope: org", () => {
 });
 
 describe("usage source — the dev user", () => {
-  const DEV_USER: FakeIdentity = { id: "usr_default", orgRole: "owner" };
+  const DEV_USER: FakeIdentity = { id: "usr_default", orgRole: "admin" };
 
-  test("reads the org scope as an org owner", async () => {
+  test("reads the org scope as an org admin", async () => {
     const src = await buildSource();
     runtime.identity = DEV_USER;
 
@@ -330,5 +335,60 @@ describe("usage source — filters", () => {
       arguments: { scope: "org", period: "all", origin: "batch" },
     });
     expect(result.isError).toBe(true);
+  });
+});
+
+describe("usage source — the report's optional fields", () => {
+  test("task runs, unpriced calls, a stacked day split, and a capped breakdown match the output schema", async () => {
+    // A task-run line on a model no catalog knows (`runs`, `unpricedCalls`),
+    // and enough conversations to cap that breakdown (`truncatedBreakdowns`).
+    const dir = usageMonthDir(workDir, usageMonthOf(AT));
+    const task: UsageLedgerEntry = {
+      ts: AT,
+      source: "main",
+      origin: "task",
+      model: "unknown",
+      usage: { inputTokens: 10, outputTokens: 5 },
+      llmMs: 0,
+      userId: "usr_alice",
+      workspaceId: "ws_0021762e0e7b3844",
+      taskRunId: "run_0000000000000001",
+    };
+    const chats = Array.from({ length: MAX_BREAKDOWN_ROWS }, (_, i) => ({
+      ts: AT,
+      source: "main",
+      origin: "chat",
+      model: "claude-sonnet-4-5-20250929",
+      usage: { inputTokens: 1, outputTokens: 1 },
+      llmMs: 1,
+      userId: "usr_alice",
+      workspaceId: "ws_0021762e0e7b3844",
+      conversationId: `conv_${String(i).padStart(16, "0")}`,
+    }));
+    await appendFile(
+      join(dir, "test.jsonl"),
+      [task, ...chats].map((e) => `${JSON.stringify(e)}\n`).join(""),
+    );
+
+    const src = await buildSource();
+    runtime.identity = { id: "usr_admin", orgRole: "admin" };
+    const result = await src.getClient()!.callTool({
+      name: "report",
+      arguments: {
+        scope: "org",
+        period: "all",
+        groupBy: ["day", "conversation"],
+        stackBy: "model",
+      },
+    });
+
+    // A success that failed its output schema would come back as an error.
+    expect(result.isError).toBeFalsy();
+    const report = result.structuredContent as UsageReportOutput;
+    expect(report).toEqual(parse(result as { content?: Array<{ type: string; text?: string }> }));
+    expect(report.totals.runs).toBe(1);
+    expect(report.totals.unpricedCalls).toBeGreaterThanOrEqual(1);
+    expect(report.breakdowns.day?.[0]?.stack).toBeDefined();
+    expect(report.truncatedBreakdowns?.conversation?.returned).toBe(MAX_BREAKDOWN_ROWS);
   });
 });

@@ -43,6 +43,7 @@
     "includes": [
       "src/**",
       "web/src/**",
+      "web/test/**",
       "instrument/**",
       "scripts/**",
       "test/**/*.ts",
@@ -54,7 +55,204 @@
   },
   "overrides": [
     {
-      "includes": ["test/**"],
+      "includes": ["scripts/**", "src/**", "web/src/**", "test/**", "web/test/**"],
+      "plugins": ["./biome-plugins/double-cast.grit"]
+    },
+    {
+      "includes": [
+        "scripts/**",
+        "src/**",
+        "web/src/**",
+        "web/test/**",
+        "test/**"
+      ],
+      "plugins": ["./biome-plugins/never-cast.grit"]
+    },
+    {
+      "includes": ["src/**/*.ts", "!src/api/app.ts"],
+      "plugins": ["./biome-plugins/router-use.grit"]
+    },
+    {
+      "includes": ["src/**/*.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["@sentry/**"],
+                    "message": "The kernel stays vendor-neutral OpenTelemetry. A Sentry SDK belongs in web/."
+                  },
+                  {
+                    "group": ["nimblebrain-agent", "nimblebrain-agent/**"],
+                    "message": "src/ never imports nimblebrain-agent: it is a test-only dev dependency, reached as an ACP peer from test/helpers/acp/ (ADR-0056, src/execution/AGENTS.md)."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "src/runtime/**/*.ts",
+        "!src/runtime/runtime.ts",
+        "!src/runtime/workspace-runtime.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["@sentry/**"],
+                    "message": "The kernel stays vendor-neutral OpenTelemetry. A Sentry SDK belongs in web/."
+                  },
+                  {
+                    "group": ["nimblebrain-agent", "nimblebrain-agent/**"],
+                    "message": "src/ never imports nimblebrain-agent: it is a test-only dev dependency, reached as an ACP peer from test/helpers/acp/ (ADR-0056, src/execution/AGENTS.md)."
+                  },
+                  {
+                    "group": [
+                      "{../,../../,../../../}tools/**",
+                      "{../,../../,../../../}platform/**"
+                    ],
+                    "message": "runtime/ must not import tools/ or platform/; only runtime.ts and workspace-runtime.ts compose them (AGENTS.md, Layering)."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/config/**/*.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["@sentry/**"],
+                    "message": "The kernel stays vendor-neutral OpenTelemetry. A Sentry SDK belongs in web/."
+                  },
+                  {
+                    "group": ["nimblebrain-agent", "nimblebrain-agent/**"],
+                    "message": "src/ never imports nimblebrain-agent: it is a test-only dev dependency, reached as an ACP peer from test/helpers/acp/ (ADR-0056, src/execution/AGENTS.md)."
+                  },
+                  {
+                    "group": [
+                      "{../,../../,../../../}runtime/**",
+                      "{../,../../,../../../}tools/**",
+                      "{../,../../,../../../}platform/**"
+                    ],
+                    "message": "config/ must not import runtime/, tools/, or platform/ (AGENTS.md, Layering)."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/engine/**/*.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["@sentry/**"],
+                    "message": "The kernel stays vendor-neutral OpenTelemetry. A Sentry SDK belongs in web/."
+                  },
+                  {
+                    "group": ["nimblebrain-agent", "nimblebrain-agent/**"],
+                    "message": "src/ never imports nimblebrain-agent: it is a test-only dev dependency, reached as an ACP peer from test/helpers/acp/ (ADR-0056, src/execution/AGENTS.md)."
+                  },
+                  {
+                    "group": ["{../,../../,../../../}runtime/**"],
+                    "message": "engine/ must not import runtime/; put a helper both need in util/ (AGENTS.md, Layering)."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/execution/**/*.ts"],
+      "plugins": ["./biome-plugins/no-agent-process.grit"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["@sentry/**"],
+                    "message": "The kernel stays vendor-neutral OpenTelemetry. A Sentry SDK belongs in web/."
+                  },
+                  {
+                    "group": ["nimblebrain-agent", "nimblebrain-agent/**"],
+                    "message": "src/ never imports nimblebrain-agent: it is a test-only dev dependency, reached as an ACP peer from test/helpers/acp/ (ADR-0056, src/execution/AGENTS.md)."
+                  },
+                  {
+                    "group": ["node:child_process", "child_process"],
+                    "message": "An agent runtime never spawns a process (ADR-0056, src/execution/AGENTS.md)."
+                  },
+                  {
+                    "group": [
+                      "{../,../../,../../../}runtime/**",
+                      "{../,../../,../../../}tools/**",
+                      "{../,../../,../../../}platform/**"
+                    ],
+                    "message": "execution/ must not import runtime/, tools/, or platform/: a runtime reaches the platform only through the RunIO the door hands it (src/execution/AGENTS.md)."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "src/**/*.ts",
+        "!src/observability/log.ts",
+        "!src/adapters/console-events.ts",
+        "!src/adapters/debug-events.ts",
+        "!src/model/sync-models.ts",
+        "!src/model/sync-nebius.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": { "noConsole": "error" }
+        }
+      }
+    },
+    {
+      "includes": ["scripts/**", "src/**"],
+      "plugins": [
+        "./biome-plugins/inline-type-import.grit",
+        "./biome-plugins/containment-tag.grit",
+        "./biome-plugins/control-byte.grit"
+      ]
+    },
+    {
+      "includes": ["test/**", "web/test/**"],
       "linter": {
         "rules": {
           "complexity": { "noExcessiveCognitiveComplexity": "off" },

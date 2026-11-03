@@ -8,10 +8,45 @@ export class RunInProgressError extends Error {
 }
 
 /**
+ * Thrown at the door when the run would execute on an agent runtime that
+ * cannot hold it to its terms: a run that names spend accounts or caps its
+ * input tokens, on a runtime with no spend gate. Refused before the run
+ * touches anything, so a task run records it as a failure rather than
+ * spending without a check.
+ */
+export class RuntimeCannotHoldRunError extends Error {
+  readonly code = "runtime_cannot_hold_run";
+  constructor(
+    public readonly runtime: string,
+    reason: string,
+  ) {
+    super(`Agent runtime ${runtime} cannot run this run: ${reason}`);
+    this.name = "RuntimeCannotHoldRunError";
+  }
+}
+
+/**
+ * The reason a run the door held to a time limit ends with: a run on a runtime
+ * that takes a per-run model credential, with no limit of its own, is held to
+ * the installation's longest run, because its credential lasts no longer.
+ */
+export class RunDeadlineExceededError extends Error {
+  readonly code = "run_deadline_exceeded";
+  constructor(
+    public readonly runtime: string,
+    public readonly limitMs: number,
+  ) {
+    super(
+      `The run on agent runtime ${runtime} reached its ${Math.round(limitMs / 1000)}s limit (tasks.maxRunDurationMs) and was stopped`,
+    );
+    this.name = "RunDeadlineExceededError";
+  }
+}
+
+/**
  * Thrown when a caller attempts to read or write a conversation they
- * don't own. Stage 1 is single-owner: the conversation's `ownerId`
- * must match the requesting identity. Stage 4 will widen this with
- * policy-gated sharing.
+ * don't own. Conversations are single-owner: the conversation's
+ * `ownerId` must match the requesting identity.
  *
  * The HTTP handler maps this to `403 conversation_access_denied`.
  * Returning a `404` would be a defensible alternative (don't leak
@@ -120,15 +155,31 @@ export class DeclaredToolsUnavailableError extends Error {
 }
 
 /**
- * Thrown when a conversation file on disk fails the Stage 1 invariant
- * check at load time — specifically, a pre-migration file that lacks
- * `ownerId`. The store can't synthesize an owner safely and the chat
- * runtime can't authorize access on it.
+ * Thrown before an unattended run's first model call when a skill it declares
+ * (`TaskRequest.skills`) is not one its workspace offers: unknown, disabled, or
+ * published by a connector that is gone. Left to run, it would do its job
+ * without the guidance the owner named for it.
+ */
+export class DeclaredSkillsUnavailableError extends Error {
+  readonly code = "declared_skills_unavailable";
+  constructor(public readonly skills: readonly string[]) {
+    super(
+      `Declared skill${skills.length === 1 ? "" : "s"} unavailable: ${skills.join(", ")}. ` +
+        `The task's workspace offers no skill by ${skills.length === 1 ? "that name" : "those names"}, ` +
+        `so the run did not start.`,
+    );
+    this.name = "DeclaredSkillsUnavailableError";
+  }
+}
+
+/**
+ * Thrown when a conversation file on disk fails the ownership invariant
+ * check at load time — a file that lacks `ownerId` (or a model). The store
+ * can't synthesize an owner safely and the chat runtime can't authorize access
+ * on it.
  *
- * Operator action is manual: an ownerless file has no derivable owner, so no
- * migration could recover it — such files predate the ownership invariant and
- * were skipped by the one-time workspace migration rather than guessed at.
- * Recovery is to stamp an `ownerId` on the file's
+ * Operator action is manual: an ownerless file has no derivable owner, so
+ * nothing can recover it automatically. Recovery is to stamp an `ownerId` on the file's
  * line-1 metadata (when the owner is known) or remove the file. Without this
  * typed error, the unwrapped `Error("missing ownerId in ...")` from
  * `event-sourced-store` bubbles to `handleChatStart` as a 500; with it, the HTTP
@@ -138,12 +189,16 @@ export class ConversationCorruptedError extends Error {
   readonly code = "conversation_corrupted";
   constructor(
     public readonly conversationId: string,
-    public readonly reason: "missing_owner",
+    public readonly reason: "missing_owner" | "missing_model",
   ) {
     super(
-      `Conversation ${conversationId} is corrupted (${reason}): the file predates the ` +
-        `ownership invariant and has no ownerId. No migration stamps these — add an ownerId ` +
-        `to its line-1 metadata or remove the file.`,
+      reason === "missing_owner"
+        ? `Conversation ${conversationId} is corrupted (${reason}): the file predates the ` +
+            `ownership invariant and has no ownerId. No migration stamps these — add an ownerId ` +
+            `to its line-1 metadata or remove the file.`
+        : `Conversation ${conversationId} is corrupted (${reason}): the file predates the ` +
+            `model binding and has no model. Add a provider-qualified model to its line-1 ` +
+            `metadata or remove the file.`,
     );
     this.name = "ConversationCorruptedError";
   }

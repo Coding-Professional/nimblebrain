@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const ReactDOMClient = await import("react-dom/client");
 const { act } = await import("react");
@@ -40,6 +40,17 @@ async function mount(savePreference?: (pref: ThemePreference) => Promise<void>) 
   container = document.createElement("div");
   document.body.appendChild(container);
   root = ReactDOMClient.createRoot(container);
+  await act(async () => {
+    root?.render(
+      <ThemeProvider savePreference={savePreference}>
+        <Probe />
+      </ThemeProvider>,
+    );
+  });
+}
+
+/** Re-render with a different save function: signing in (a save) or out (none). */
+async function rerender(savePreference?: (pref: ThemePreference) => Promise<void>) {
   await act(async () => {
     root?.render(
       <ThemeProvider savePreference={savePreference}>
@@ -107,5 +118,62 @@ describe("ThemeProvider toggle", () => {
     await act(async () => theme.toggle());
 
     expect(isDark()).toBe(true);
+  });
+});
+
+// The provider sits above the auth gate and outlives sign-in and sign-out, so
+// its save state belongs to one session and is dropped when the save changes.
+describe("ThemeProvider across sessions", () => {
+  test("a save left in flight at sign-out does not hold back the next account's preference", async () => {
+    const first = heldSaves();
+    await mount(first.save);
+    await act(async () => theme.toggle());
+    expect(isDark()).toBe(true);
+
+    await rerender(undefined);
+    await rerender(heldSaves().save);
+    await act(async () => theme.applyPreference("light"));
+
+    expect(isDark()).toBe(false);
+  });
+
+  test("the next session's saves do not queue behind a save left in flight", async () => {
+    const first = heldSaves();
+    await mount(first.save);
+    await act(async () => theme.toggle());
+
+    const second = heldSaves();
+    await rerender(undefined);
+    await rerender(second.save);
+    await act(async () => theme.toggle());
+
+    expect(second.calls.map((c) => c.pref)).toEqual(["light"]);
+  });
+
+  test("an old session's save finishing does not release the new session's guard", async () => {
+    const first = heldSaves();
+    await mount(first.save);
+    await act(async () => theme.toggle());
+
+    const second = heldSaves();
+    await rerender(second.save);
+    await act(async () => theme.toggle());
+    expect(isDark()).toBe(false);
+
+    await act(async () => first.calls[0]?.finish());
+    // The new session's own save is still in flight, so an older read stays out.
+    await act(async () => theme.applyPreference("dark"));
+    expect(isDark()).toBe(false);
+  });
+
+  test("a toggle made signed out gives way to the account's preference at sign-in", async () => {
+    await mount();
+    await act(async () => theme.toggle());
+    expect(isDark()).toBe(true);
+
+    await rerender(heldSaves().save);
+    await act(async () => theme.applyPreference("light"));
+
+    expect(isDark()).toBe(false);
   });
 });

@@ -5,12 +5,10 @@
 // choose between. Anyone else sees their workspaces here, each with its unread
 // dot. Which workspace to open is never remembered or defaulted (ADR-0044).
 //
-// Stage 2 follow-up: with chat, conversations, tasks, and files now
-// identity-bound, the root URL is no longer "workspace home" — it's the
-// user's cross-workspace landing. v1 is intentionally minimal: greeting +
-// a tiled grid of the user's workspaces (each tile links to its overview
-// at `/w/<slug>/`). Recent conversations / files / tasks layer in
-// when their data sources are ready, without changing the page shape.
+// With chat, conversations, tasks, and files identity-bound, the root URL is
+// the user's cross-workspace landing, not a workspace home. It is
+// intentionally minimal: greeting + a tiled grid of the user's workspaces
+// (each tile links to its overview at `/w/<slug>/`).
 // ---------------------------------------------------------------------------
 
 import { Pin, Plus } from "lucide-react";
@@ -47,7 +45,7 @@ export function GlobalHomePage() {
 
   return (
     <div className="h-full overflow-y-auto" data-testid="global-home-page">
-      <div className="max-w-5xl mx-auto px-8 py-12">
+      <div className="max-w-5xl mx-auto px-(--page-gutter) py-12">
         <header className="mb-10">
           <h1 className="text-4xl font-heading font-medium text-foreground">
             {greeting}
@@ -60,7 +58,7 @@ export function GlobalHomePage() {
           <h2 className="text-2xs font-bold tracking-[0.08em] uppercase text-muted-foreground mb-3">
             Your workspaces
           </h2>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 @2xl/main:grid-cols-2 @3xl/main:grid-cols-3 gap-3">
             {ordered.map((ws) => (
               <WorkspaceTile
                 key={ws.id}

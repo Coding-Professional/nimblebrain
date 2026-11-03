@@ -27,8 +27,20 @@
  */
 export type FlowOwner = { kind: "workspace"; wsId: string } | { kind: "user"; userId: string };
 
+/**
+ * What the authorization server sent back on the redirect. `iss` is RFC 9207's
+ * issuer identifier: the MCP SDK checks it against the issuer it discovered
+ * before redeeming the code, and refuses a server that advertises
+ * `authorization_response_iss_parameter_supported` when it is missing — so it
+ * travels with the code all the way to `finishAuth`.
+ */
+export interface AuthorizationResponse {
+  code: string;
+  iss?: string;
+}
+
 interface PendingFlow {
-  resolve: (code: string) => void;
+  resolve: (response: AuthorizationResponse) => void;
   reject: (err: Error) => void;
   owner: FlowOwner;
   serverName: string;
@@ -79,6 +91,42 @@ export class OAuthFlowExpiredError extends Error {
   }
 }
 
+/**
+ * The authorization server answered a pending flow with an `error` instead of
+ * a code — the person declined consent, or the server refused the request.
+ *
+ * {@link userMessage} is chosen from the standard code and never carries the
+ * server's own text: it lands in the connection's `lastError`, which the
+ * connector card renders and `manage_connectors` hands to the agent, and the
+ * authorization server of a remote connector is not a trusted author.
+ */
+export class OAuthFlowRefusedError extends Error {
+  readonly userMessage: string;
+
+  constructor(flowId: string, providerError: string) {
+    // Truncated: the code is the server's, and this message is logged.
+    super(`[oauth-flow-registry] flow ${flowId}… refused: ${providerError.slice(0, 64)}`);
+    this.name = "OAuthFlowRefusedError";
+    this.userMessage =
+      providerError === "access_denied"
+        ? "Sign-in was declined, so nothing was connected. Connect again to retry."
+        : "The service refused the sign-in, so nothing was connected. Connect again to retry.";
+  }
+}
+
+/**
+ * The source that began a pending flow was stopped before the flow finished —
+ * the connector was disconnected or removed while its sign-in was open. Not a
+ * failure of the connection: whoever stopped the source records what the
+ * connection is now.
+ */
+export class OAuthFlowAbandonedError extends Error {
+  constructor(flowId: string) {
+    super(`[oauth-flow-registry] flow ${flowId}… abandoned: its source was stopped`);
+    this.name = "OAuthFlowAbandonedError";
+  }
+}
+
 const flows = new Map<string, PendingFlow>();
 
 /**
@@ -93,8 +141,8 @@ export function register(
   serverName: string,
   ttlMs: number = DEFAULT_FLOW_TTL_MS,
   scopeFallback?: ScopeFallback,
-): Promise<string> {
-  const promise = new Promise<string>((resolve, reject) => {
+): Promise<AuthorizationResponse> {
+  const promise = new Promise<AuthorizationResponse>((resolve, reject) => {
     const timeout = setTimeout(() => {
       // Only reject if we haven't already been resolved/rejected by the
       // callback. `flows.delete` before `reject` prevents the reject
@@ -156,13 +204,13 @@ export function takeScopeFallback(state: string): string | null {
   return fallback.url;
 }
 
-/** Resolve a pending flow by state. Returns true if found. */
-export function resolveWithCode(state: string, code: string): boolean {
+/** Resolve a pending flow by state with the callback's `code` and `iss`. Returns true if found. */
+export function resolveWithCode(state: string, code: string, iss?: string): boolean {
   const flow = flows.get(state);
   if (!flow) return false;
   flows.delete(state);
   clearTimeout(flow.timeout);
-  flow.resolve(code);
+  flow.resolve(iss === undefined ? { code } : { code, iss });
   return true;
 }
 
@@ -174,6 +222,20 @@ export function rejectFlow(state: string, err: Error): boolean {
   clearTimeout(flow.timeout);
   flow.reject(err);
   return true;
+}
+
+/**
+ * End a pending flow the authorization server answered with `providerError`.
+ * Returns true if found. The callback route calls this only for the session
+ * that began the flow, as it does before resolving one.
+ */
+export function refuseFlow(state: string, providerError: string): boolean {
+  return rejectFlow(state, new OAuthFlowRefusedError(state.slice(0, FLOW_ID_CHARS), providerError));
+}
+
+/** End a pending flow whose source was stopped. Returns true if found. */
+export function abandonFlow(state: string): boolean {
+  return rejectFlow(state, new OAuthFlowAbandonedError(state.slice(0, FLOW_ID_CHARS)));
 }
 
 /** For tests: drop all pending flows. */

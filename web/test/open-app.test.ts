@@ -2,7 +2,7 @@
 // Opening an app at a view (lib/open-app): the shell side of `openApp` and the
 // agent's `nb__open_app`.
 //
-// Pins: the open-app tool is recognized however its name is namespaced; a
+// Pins: the open-app tool is recognized by its wire name; a
 // route's state yields its target only when it carries one; and an app name
 // resolves the way the server's `findOpenableApp` does, with identity views
 // at their own path under the workspace rather than under `app/`.
@@ -22,7 +22,12 @@ const placement = (over: Partial<PlacementEntry>): PlacementEntry => ({
 
 const PLACEMENTS = [
   placement({ serverName: "people", label: "People", route: "people" }),
-  placement({ serverName: "conversations", slot: "sidebar", label: "Conversations", route: "conversations" }),
+  placement({
+    serverName: "conversations",
+    slot: "sidebar",
+    label: "Conversations",
+    route: "conversations",
+  }),
   placement({ serverName: "widget", label: "Widget" }),
 ];
 

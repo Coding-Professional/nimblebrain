@@ -24,13 +24,15 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
 import { textContent } from "../../src/engine/content-helpers.ts";
-import type { EngineEvent, EventSink } from "../../src/engine/types.ts";
+import type { EngineEvent, EventSink, ThinkingEffort } from "../../src/engine/types.ts";
 import { getRequestContext } from "../../src/runtime/request-context.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import { defineInProcessApp, type InProcessTool } from "../../src/tools/in-process-app.ts";
 import { devProvider } from "../helpers/dev-provider.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
+import { firstPayloadOf } from "../helpers/engine-events.ts";
 import { makeIdentity } from "../helpers/identity.ts";
 import { seedWorkspace } from "../helpers/test-workspace.ts";
 
@@ -163,6 +165,62 @@ describe("runtime.executeTask", () => {
 
     expect(result.stopReason).toBe("max_input_tokens");
     expect(result.usage.inputTokens).toBe(0);
+  });
+
+  describe("a task's thinkingEffort", () => {
+    // Sonnet 5 is effort-shaped: the tier reaches the wire as
+    // `providerOptions.anthropic.effort`, so the call options show which depth won.
+    const MODEL = "anthropic:claude-sonnet-5";
+
+    async function effortSent(
+      config: { thinking?: "off" | "adaptive" | "enabled"; thinkingEffort?: ThinkingEffort },
+      taskEffort: ThinkingEffort | undefined,
+    ): Promise<unknown> {
+      const sent: Array<LanguageModelV4CallOptions["providerOptions"]> = [];
+      const echo = createEchoModel({ responses: [{ text: "done" }] });
+      const languageModel: LanguageModelV4 = {
+        ...echo,
+        doStream: (options) => {
+          sent.push(options.providerOptions);
+          return echo.doStream(options);
+        },
+      };
+      workDir = mkdtempSync(join(tmpdir(), "nb-exec-task-"));
+      runtime = await Runtime.start({
+        identityProvider: devProvider,
+        languageModel,
+        logging: { disabled: true },
+        workDir,
+        ...config,
+      });
+      const { defaultWsId } = await provisionWorkspaces(runtime);
+      await runtime.executeTask({
+        workspaceId: defaultWsId,
+        prompt: "score the items",
+        identity: makeIdentity({ id: TEST_USER_ID, displayName: TEST_USER_DISPLAY }),
+        model: MODEL,
+        ...(taskEffort ? { thinkingEffort: taskEffort } : {}),
+      });
+      expect(sent.length).toBeGreaterThan(0);
+      const anthropic = sent[0]?.anthropic as { effort?: unknown } | undefined;
+      return anthropic?.effort;
+    }
+
+    it("is the depth the run reasons at, over the operator's", async () => {
+      expect(await effortSent({ thinkingEffort: "high" }, "low")).toBe("low");
+    });
+
+    it("leaves the operator's depth in place when unset", async () => {
+      expect(await effortSent({ thinkingEffort: "high" }, undefined)).toBe("high");
+    });
+
+    it("does not reach past an operator's thinking off", async () => {
+      expect(await effortSent({ thinking: "off" }, "low")).toBeUndefined();
+    });
+
+    it("does not reach past an operator's thinking adaptive", async () => {
+      expect(await effortSent({ thinking: "adaptive" }, "low")).toBeUndefined();
+    });
   });
 
   it("ends the run with spend_limit, naming the account, before a call that would overrun it", async () => {
@@ -399,7 +457,7 @@ describe("runtime.executeTask", () => {
     // and a name addressing ANOTHER workspace does not
     // resolve — not because reach is denied, but because the `ws_<id>-` form is
     // retired and rejected at parse. A task reaches exactly one workspace plus
-    // identity tools, and there is no longer a name that can say otherwise. The
+    // identity tools, and there is no name that can say otherwise. The
     // echo model is scripted to emit the retired cross-workspace form directly.
     const namespacedPing = `${SHARED_WS_ID}-probe__ping`;
     runtime = await bootRuntime({
@@ -508,22 +566,22 @@ describe("runtime.executeTask", () => {
     // schema validation.
     const validSchedule = { type: "interval", intervalMs: 60_000 };
     const forbiddenCalls: Array<{ tool: string; input: unknown }> = [
-      { tool: "tasks__update", input: { name: "target" } },
+      { tool: "tasks__update", input: { taskId: "target" } },
       {
         tool: "tasks__create",
         input: { manifest: { name: "evil", schedule: validSchedule }, body: "x" },
       },
-      { tool: "tasks__delete", input: { name: "target" } },
-      { tool: "tasks__run", input: { name: "target" } },
+      { tool: "tasks__delete", input: { taskId: "target" } },
+      { tool: "tasks__run", input: { taskId: "target" } },
     ];
     for (const { tool, input } of forbiddenCalls) {
+      // `task-authoring` binds `tasks__*`, so the first call may be held for it;
+      // the re-issue is the call the source refuses.
+      const call = { toolName: tool, input: JSON.stringify(input) };
       runtime = await bootRuntime({
         responses: [
-          {
-            toolCalls: [
-              { toolCallId: `call_${tool}`, toolName: tool, input: JSON.stringify(input) },
-            ],
-          },
+          { toolCalls: [{ toolCallId: `call_${tool}`, ...call }] },
+          { toolCalls: [{ toolCallId: `call_${tool}_again`, ...call }] },
           { text: "done" },
         ],
       });
@@ -535,9 +593,10 @@ describe("runtime.executeTask", () => {
         identity: makeIdentity({ id: TEST_USER_ID, displayName: TEST_USER_DISPLAY }),
       });
 
-      expect(result.toolCalls[0]?.name).toBe(tool);
-      expect(result.toolCalls[0]?.ok).toBe(false);
-      expect(result.toolCalls[0]?.output).toMatch(/unattended task run/i);
+      const refused = result.toolCalls.at(-1);
+      expect(refused?.name).toBe(tool);
+      expect(refused?.ok).toBe(false);
+      expect(refused?.output).toMatch(/unattended task run/i);
 
       await runtime.shutdown();
       runtime = null;
@@ -591,7 +650,7 @@ describe("runtime.executeTask", () => {
     expect(convo).toBeNull();
   });
 
-  it("loads the focused workspace's `always` skill into Layer 3 (parity with chat path)", async () => {
+  it("loads the focused workspace's `always` skill (parity with chat path)", async () => {
     // Regression guard for the executeTask analog of the chat-path bug
     // PR #315 fixed in `_chatInner`. Before this fix,
     // `loadConversationSkills(sessionWsId, ...)` at runtime.ts:1703
@@ -613,9 +672,7 @@ describe("runtime.executeTask", () => {
     mkdirSync(sharedSkillsDir, { recursive: true });
     writeFileSync(
       join(sharedSkillsDir, `${SKILL_NAME}.md`),
-      // dynamic + tool-affinity (nb__* is always surfaced) → Layer 3, where this
-      // asserts task/chat parity for focused-workspace skill loading.
-      `---\nname: ${SKILL_NAME}\ndescription: workflow for the shared workspace\nmetadata:\n  nimblebrain:\n    loading-strategy: dynamic\n    tool-affinity: ["nb__*"]\n    priority: 30\n---\n\nAlways answer in plain English.\n`,
+      `---\nname: ${SKILL_NAME}\ndescription: workflow for the shared workspace\nmetadata:\n  nimblebrain:\n    loading-strategy: always\n    priority: 30\n---\n\nAlways answer in plain English.\n`,
     );
 
     // A task writes no conversation, so the `skills.loaded` telemetry is
@@ -637,16 +694,13 @@ describe("runtime.executeTask", () => {
       captureSink,
     );
 
-    const skillsLoaded = captured.find((e) => e.type === "skills.loaded");
-    expect(skillsLoaded).toBeDefined();
+    const payload = firstPayloadOf(captured, "skills.loaded");
+    expect(payload).toBeDefined();
 
-    const payload = skillsLoaded!.data as unknown as {
-      skills: Array<{ id: string; scope: string; loadedBy: string }>;
-    };
     const expectedPath = join(sharedSkillsDir, `${SKILL_NAME}.md`);
     const entry = payload.skills.find((s) => s.id === expectedPath);
     expect(entry).toBeDefined();
     expect(entry?.scope).toBe("workspace");
-    expect(entry?.loadedBy).toBe("tool_affinity");
+    expect(entry?.loadedBy).toBe("always");
   });
 });

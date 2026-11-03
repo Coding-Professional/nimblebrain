@@ -6,12 +6,15 @@ import { WORKSPACE_PRINCIPAL_ID } from "../../src/connectors/runtime/connection.
 import { ConnectorLifecycleManager } from "../../src/connectors/runtime/lifecycle.ts";
 import type { ConnectorInstance, ConnectorRef } from "../../src/connectors/runtime/types.ts";
 import type { EngineEvent, EventSink } from "../../src/engine/types.ts";
+import { HealthMonitor } from "../../src/tools/health-monitor.ts";
 import {
   _clearAll,
   OAuthFlowExpiredError,
+  refuseFlow,
   rejectFlow,
   resolveWithCode,
 } from "../../src/tools/oauth-flow-registry.ts";
+import { ToolRegistry } from "../../src/tools/registry.ts";
 import {
   installTestCredentialStore,
   resetTestCredentialStore,
@@ -122,8 +125,10 @@ describe("lifecycle.startAuth — interactive-flow failure is surfaced, not swal
   let mock: MockAS;
   let lifecycle: ConnectorLifecycleManager;
   let sink: CapturingSink;
+  let registry: ToolRegistry;
 
   beforeEach(() => {
+    registry = new ToolRegistry();
     workDir = mkdtempSync(join(tmpdir(), "nb-startauth-interactive-"));
     seedWorkspaceRoot(workDir, "ws_0076759dbbe19fcc");
     // The OAuth provider's records are keys in the installed credential store,
@@ -189,6 +194,114 @@ describe("lifecycle.startAuth — interactive-flow failure is surfaced, not swal
     expect(conn()?.state).toBe("dead");
     expect(conn()?.lastError).toBe("invalid_grant");
   }, 20_000);
+
+  it("a sign-in the server refused → Connection 'dead' at once, with the sentence for the person (#1433)", async () => {
+    const { authorizationUrl } = await lifecycle.startAuth(SERVER, WS, WORKSPACE_PRINCIPAL_ID, {
+      workDir,
+      callbackUrl: `${mock.base}/callback`,
+      allowInsecureRemotes: true,
+    });
+    const conn = () => lifecycle.getInstance(SERVER, WS)?.connections?.get(WORKSPACE_PRINCIPAL_ID);
+    expect(conn()?.state).toBe("pending_auth");
+
+    // What the callback route does when the browser returns with `?error=`.
+    const state = new URL(authorizationUrl as string).searchParams.get("state") as string;
+    expect(refuseFlow(state, "access_denied")).toBe(true);
+
+    const deadline = Date.now() + 8000;
+    while (conn()?.state !== "dead" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    expect(conn()?.state).toBe("dead");
+    expect(conn()?.lastError).toBe(
+      "Sign-in was declined, so nothing was connected. Connect again to retry.",
+    );
+  }, 20_000);
+
+  it("a disconnect mid-sign-in ends the flow and rests the connection — never 'dead' (#1433)", async () => {
+    // A disconnect stops the source through the workspace's registry, as it
+    // does under `Runtime.start`.
+    lifecycle.bindWorkspaceRegistries(() => new Map([[WS, registry]]));
+    const { authorizationUrl } = await lifecycle.startAuth(SERVER, WS, WORKSPACE_PRINCIPAL_ID, {
+      workDir,
+      callbackUrl: `${mock.base}/callback`,
+      allowInsecureRemotes: true,
+    });
+    const conn = () => lifecycle.getInstance(SERVER, WS)?.connections?.get(WORKSPACE_PRINCIPAL_ID);
+    expect(conn()?.state).toBe("pending_auth");
+    const state = new URL(authorizationUrl as string).searchParams.get("state") as string;
+
+    expect(registry.hasSource(SERVER)).toBe(true);
+
+    await lifecycle.disconnect(SERVER, WS, WORKSPACE_PRINCIPAL_ID, {
+      workDir,
+      allowInsecureRemotes: true,
+    });
+    expect(registry.hasSource(SERVER)).toBe(false);
+
+    // The flow went with its source, so a late callback finishes nothing.
+    expect(resolveWithCode(state, "late-code")).toBe(false);
+
+    // Give the abandoned start time to settle: it must not record a failure
+    // over the state the disconnect wrote.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(conn()?.state).toBe("not_authenticated");
+    expect(conn()?.lastError).toBeUndefined();
+    const states = sink.events
+      .filter((e) => e.type === "connection.state_changed")
+      .map((e) => (e.data as { state: string }).state);
+    expect(states).not.toContain("dead");
+  }, 20_000);
+
+  for (const ending of ["refused", "expired"] as const) {
+    it(`a sign-in that ${ending} leaves nothing to restart — the health monitor lets the source rest (#337)`, async () => {
+      lifecycle.bindWorkspaceRegistries(() => new Map([[WS, registry]]));
+      const { authorizationUrl } = await lifecycle.startAuth(SERVER, WS, WORKSPACE_PRINCIPAL_ID, {
+        workDir,
+        callbackUrl: `${mock.base}/callback`,
+        allowInsecureRemotes: true,
+      });
+      const conn = () =>
+        lifecycle.getInstance(SERVER, WS)?.connections?.get(WORKSPACE_PRINCIPAL_ID);
+      const state = new URL(authorizationUrl as string).searchParams.get("state") as string;
+      if (ending === "refused") refuseFlow(state, "access_denied");
+      else rejectFlow(state, new OAuthFlowExpiredError(state.slice(0, 8), 900_000));
+
+      const deadline = Date.now() + 8000;
+      while (conn()?.state !== "dead" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(conn()?.state).toBe("dead");
+
+      // The source stays registered, so a tool call still gets a structured
+      // answer, but no restart can sign anyone in: only a person can, and
+      // Reconnect builds a fresh source for that.
+      const source = lifecycle.connectionSource(SERVER, WS);
+      expect(source).not.toBeNull();
+      const monitorSink = new CapturingSink();
+      const monitor = new HealthMonitor(() => (source ? [source] : []), monitorSink, {
+        checkIntervalMs: 60_000,
+        baseDelayMs: 1,
+      });
+      await monitor.check();
+      await monitor.check();
+
+      // No `crashed` / `restarting` / `cooldown`: the monitor has nothing to do.
+      expect(monitorSink.events.map((e) => (e.data as { event: string }).event)).toEqual([]);
+      expect(conn()?.state).toBe("dead");
+
+      // Reconnect is the way back, on a fresh source and a fresh flow.
+      const again = await lifecycle.startAuth(SERVER, WS, WORKSPACE_PRINCIPAL_ID, {
+        workDir,
+        callbackUrl: `${mock.base}/callback`,
+        allowInsecureRemotes: true,
+      });
+      expect(new URL(again.authorizationUrl as string).searchParams.get("state")).not.toBe(state);
+      expect(conn()?.state).toBe("pending_auth");
+      expect(lifecycle.connectionSource(SERVER, WS)).not.toBe(source);
+    }, 20_000);
+  }
 
   it("a flow that expires before the user signs in → lastError is the user sentence, not the registry's timer", async () => {
     const { authorizationUrl } = await lifecycle.startAuth(SERVER, WS, WORKSPACE_PRINCIPAL_ID, {

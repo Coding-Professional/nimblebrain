@@ -1,45 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { LanguageModelV4, SharedV4ProviderOptions } from "@ai-sdk/provider";
-import { buildModelResolver, buildRegistry, resolveModelString } from "../../src/model/registry.ts";
-
-describe("resolveModelString", () => {
-  it("looks up bare anthropic model id in the catalog", () => {
-    expect(resolveModelString("claude-sonnet-4-6")).toBe("anthropic:claude-sonnet-4-6");
-  });
-
-  it("looks up bare google model id in the catalog (fixes UI sending bare gemini ids to anthropic)", () => {
-    // Regression: the settings UI used to write `gemini-3.1-pro-preview`
-    // as the saved value (no `google:` prefix). Without the catalog
-    // fallback, that id defaulted to `anthropic:` and 404'd against
-    // the Anthropic API.
-    expect(resolveModelString("gemini-3.1-pro-preview")).toBe("google:gemini-3.1-pro-preview");
-  });
-
-  it("looks up bare openai model id in the catalog", () => {
-    expect(resolveModelString("gpt-4o")).toBe("openai:gpt-4o");
-  });
-
-  it("falls back to anthropic for bare ids not in the catalog (backward compat)", () => {
-    // Bespoke / pinned model ids that pre-date the catalog still default
-    // to anthropic — preserves the historical behavior for tenants who
-    // configured custom model strings.
-    expect(resolveModelString("custom-fine-tune-not-in-catalog")).toBe(
-      "anthropic:custom-fine-tune-not-in-catalog",
-    );
-  });
-
-  it("leaves already-qualified openai string unchanged", () => {
-    expect(resolveModelString("openai:gpt-4o")).toBe("openai:gpt-4o");
-  });
-
-  it("leaves already-qualified google string unchanged", () => {
-    expect(resolveModelString("google:gemini-2.5-flash")).toBe("google:gemini-2.5-flash");
-  });
-
-  it("keeps strings with multiple colons unchanged", () => {
-    expect(resolveModelString("openai:ft:gpt-4o:my-org")).toBe("openai:ft:gpt-4o:my-org");
-  });
-});
+import { ModelNotQualifiedError } from "../../src/model/model-id.ts";
+import { buildModelResolver, buildRegistry } from "../../src/model/registry.ts";
+import { fakeFetch } from "../helpers/fake-fetch.ts";
 
 describe("buildRegistry", () => {
   it("creates a provider that resolves anthropic models with correct spec version", () => {
@@ -63,6 +26,26 @@ describe("buildRegistry", () => {
   it("throws for unregistered provider prefix", () => {
     const registry = buildRegistry({ providers: { anthropic: {} } });
     expect(() => registry.languageModel("fakeprovider:some-model")).toThrow();
+  });
+
+  it("resolves greenpt models through the OpenAI-compatible Chat Completions API", () => {
+    const registry = buildRegistry({ providers: { greenpt: { apiKey: "greenpt-test-key" } } });
+    const model = registry.languageModel("greenpt:glm-5.2") as LanguageModelV4;
+    expect(model).toBeDefined();
+    expect(model.specificationVersion).toBe("v4");
+    expect(model.provider).toBe("greenpt.chat");
+    expect(model.modelId).toBe("glm-5.2");
+  });
+
+  it("fails closed when greenpt is configured without a key", () => {
+    const prev = process.env.GREENPT_API_KEY;
+    process.env.GREENPT_API_KEY = "";
+    try {
+      expect(() => buildRegistry({ providers: { greenpt: {} } })).toThrow(/greenpt.*no API key/i);
+    } finally {
+      if (prev === undefined) delete process.env.GREENPT_API_KEY;
+      else process.env.GREENPT_API_KEY = prev;
+    }
   });
 
   it("resolves nebius models through the OpenAI-compatible Chat Completions API", () => {
@@ -127,11 +110,10 @@ describe("buildModelResolver", () => {
     expect(typeof resolver).toBe("function");
   });
 
-  it("resolves bare strings with anthropic prefix", () => {
+  it("refuses a bare id, naming the qualified form", () => {
     const resolver = buildModelResolver({ providers: { anthropic: {} } });
-    const model = resolver("claude-sonnet-4-6");
-    expect(model).toBeDefined();
-    expect(model.provider).toContain("anthropic");
+    expect(() => resolver("claude-sonnet-4-6")).toThrow(ModelNotQualifiedError);
+    expect(() => resolver("claude-sonnet-4-6")).toThrow('"anthropic:claude-sonnet-4-6"');
   });
 
   it("resolves qualified strings directly", () => {
@@ -140,6 +122,52 @@ describe("buildModelResolver", () => {
     expect(model).toBeDefined();
     expect(model.provider).toContain("anthropic");
     expect(model.modelId).toContain("claude-sonnet-4-6");
+  });
+});
+
+describe("greenpt request shape", () => {
+  async function captureGreenptRequest(reasoningEffort?: string): Promise<{
+    body: Record<string, unknown>;
+    url: string;
+    authorization: string | null;
+  }> {
+    const realFetch = globalThis.fetch;
+    let body: Record<string, unknown> = {};
+    let url = "";
+    let authorization: string | null = null;
+    globalThis.fetch = fakeFetch(async (input, init) => {
+      url = String(input);
+      authorization = new Headers(init?.headers).get("authorization");
+      body = JSON.parse(String(init?.body));
+      return new Response(
+        'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    try {
+      await buildModelResolver({
+        providers: { greenpt: { apiKey: "greenpt-test-key" } },
+      })("greenpt:kimi-k3").doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "x" }] }],
+        ...(reasoningEffort ? { providerOptions: { greenpt: { reasoningEffort } } } : {}),
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    return { body, url, authorization };
+  }
+
+  it("uses GreenPT's endpoint, bearer key, exact model id, and streaming usage", async () => {
+    const request = await captureGreenptRequest();
+    expect(request.url).toBe("https://api.greenpt.ai/v1/chat/completions");
+    expect(request.authorization).toBe("Bearer greenpt-test-key");
+    expect(request.body.model).toBe("kimi-k3");
+    expect(request.body.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("routes GreenPT reasoning effort onto the wire", async () => {
+    const request = await captureGreenptRequest("high");
+    expect(request.body.reasoning_effort).toBe("high");
   });
 });
 
@@ -160,13 +188,13 @@ describe("nebius request shape", () => {
   ): Promise<Record<string, unknown>> {
     const realFetch = globalThis.fetch;
     let body: Record<string, unknown> = {};
-    globalThis.fetch = (async (_url: unknown, init: { body?: string }) => {
+    globalThis.fetch = fakeFetch(async (_url, init) => {
       body = JSON.parse(String(init?.body));
       return new Response(
         'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
         { status: 200, headers: { "content-type": "text/event-stream" } },
       );
-    }) as unknown as typeof fetch;
+    });
     try {
       await call(buildModelResolver({ providers: { nebius: { apiKey: "nb-test-key" } } }));
     } finally {
@@ -222,13 +250,13 @@ describe("anthropic request shape", () => {
   ): Promise<Record<string, unknown>> {
     const realFetch = globalThis.fetch;
     let body: Record<string, unknown> = {};
-    globalThis.fetch = (async (_url: unknown, init: { body?: string }) => {
+    globalThis.fetch = fakeFetch(async (_url, init) => {
       body = JSON.parse(String(init?.body));
       return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
         status: 200,
         headers: { "content-type": "text/event-stream" },
       });
-    }) as unknown as typeof fetch;
+    });
     try {
       await buildModelResolver({ providers: { anthropic: { apiKey: "sk-test" } } })(
         "anthropic:claude-sonnet-4-6",
@@ -268,5 +296,85 @@ describe("anthropic request shape", () => {
     expect(
       (body.tools as Array<Record<string, unknown>>)[0]?.eager_input_streaming,
     ).toBeUndefined();
+  });
+});
+
+describe("providers through the model gateway", () => {
+  const GATEWAY = "http://model-gateway.test";
+
+  /** Resolve `model` with the installation's gateway and no provider config, and return where its call went. */
+  async function gatewayCall(
+    id: "anthropic" | "openai" | "google" | "xai" | "nebius" | "greenpt",
+    model: string,
+  ): Promise<{ url: string; usedGatewayFetch: boolean }> {
+    let url = "";
+    let usedGatewayFetch = false;
+    const gatewayFetch = fakeFetch(async (input) => {
+      usedGatewayFetch = true;
+      url = String(input instanceof Request ? input.url : input);
+      return new Response("{}", { status: 500 });
+    });
+    const resolve = buildModelResolver({}, { url: `${GATEWAY}/`, fetch: gatewayFetch });
+    try {
+      await resolve(`${id}:${model}`).doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "x" }] }],
+      });
+    } catch {
+      // The stand-in answers 500; only the request it was sent matters here.
+    }
+    return { url, usedGatewayFetch };
+  }
+
+  it("calls each provider at its own path on the gateway, through the gateway's fetch", async () => {
+    const cases = [
+      ["anthropic", "claude-sonnet-4-6", `${GATEWAY}/anthropic/v1/messages`],
+      ["openai", "gpt-5", `${GATEWAY}/openai/v1/responses`],
+      [
+        "google",
+        "gemini-3-pro",
+        `${GATEWAY}/google/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse`,
+      ],
+      ["xai", "grok-4", `${GATEWAY}/xai/v1/chat/completions`],
+      ["nebius", "Qwen/Qwen3-235B-A22B-Instruct-2507", `${GATEWAY}/nebius/v1/chat/completions`],
+      ["greenpt", "gpt-oss-120b", `${GATEWAY}/greenpt/v1/chat/completions`],
+    ] as const;
+    for (const [id, model, expected] of cases) {
+      const call = await gatewayCall(id, model);
+      expect(call.usedGatewayFetch).toBe(true);
+      expect(call.url).toBe(expected);
+    }
+  });
+
+  it("refuses a key, a base URL or a model allowlist beside the gateway, naming where each belongs", () => {
+    const via = { url: GATEWAY, fetch: fakeFetch(async () => new Response()) };
+    expect(() => buildRegistry({ providers: { xai: { apiKey: "xai-key" } } }, via)).toThrow(
+      /providers.xai.apiKey is set, but execution.modelGateway reaches every provider: the gateway holds the provider's key/,
+    );
+    expect(() =>
+      buildRegistry({ providers: { nebius: { baseURL: "https://example.invalid/v1" } } }, via),
+    ).toThrow(/providers.nebius.baseURL is set/);
+    expect(() => buildRegistry({ providers: { openai: { models: ["gpt-5"] } } }, via)).toThrow(
+      /providers.openai.models is set.*modelPolicy.allowed/,
+    );
+  });
+
+  it("builds providers the config does not name", async () => {
+    let url = "";
+    const via = {
+      url: GATEWAY,
+      fetch: fakeFetch(async (input) => {
+        url = String(input instanceof Request ? input.url : input);
+        return new Response("{}", { status: 500 });
+      }),
+    };
+    const resolve = buildModelResolver({ providers: { anthropic: {} } }, via);
+    try {
+      await resolve("xai:grok-4").doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "x" }] }],
+      });
+    } catch {
+      // The stand-in answers 500; only where the call went matters.
+    }
+    expect(url).toBe(`${GATEWAY}/xai/v1/chat/completions`);
   });
 });

@@ -24,6 +24,7 @@ import {
 
 /** A `HostManifestMeta` carrying whatever the caller wants under `notifications`. */
 function metaWith(notifications: unknown): HostManifestMeta {
+  // biome-ignore lint/plugin/double-cast: an unvalidated manifest block whose `notifications` is any JSON, claimed as HostManifestMeta as the catalog's unchecked read claims it
   return { host_version: "1.3", notifications } as unknown as HostManifestMeta;
 }
 
@@ -124,13 +125,14 @@ describe("isOutboxResource", () => {
 
 describe("the catalog carries the declaration to the install path", () => {
   /** A `ServerDetail` with the host extension the operator published. */
-  function detail(hostMeta: Record<string, unknown>): ServerDetail {
+  function detail(hostMeta: HostManifestMeta): ServerDetail {
     return {
       name: "test.acme/mcp",
       description: "Acme",
+      version: "1.0.0",
       remotes: [{ type: "streamable-http", url: "https://acme.test/mcp" }],
       _meta: { "ai.nimblebrain/host": hostMeta },
-    } as unknown as ServerDetail;
+    };
   }
 
   test("a declared outbox lands on the catalog entry", () => {
@@ -170,9 +172,8 @@ describe("the schema and the parser state the same rule", () => {
   const resource = schema.$defs.NotificationsDeclaration.properties.resource;
 
   test("the reserved-scheme constraint names exactly the schemes the runtime resolves", () => {
-    // Derived, not eyeballed: the schema carries a copy of a set that grows —
-    // it went from five to six when `app://` was added — so the copy is pinned
-    // to the constant rather than trusted to be re-read.
+    // Derived, not eyeballed: the schema carries a copy of a set that changes,
+    // so the copy is pinned to the constant rather than trusted to be re-read.
     const spelled = resource.not.pattern
       .replace(/^\^\(\?:/, "")
       .replace(/\):$/, "")

@@ -20,6 +20,22 @@ import {
 export const TEST_WORKSPACE_ID = "ws_0076759dbbe19fcc";
 
 /**
+ * A complete `Workspace` record for a test, from the fields the test cares
+ * about. The defaults are an empty workspace: named after its id, with no
+ * members, no connectors, and empty timestamps.
+ */
+export function makeWorkspace(fields: Partial<Workspace> & { id: string }): Workspace {
+  return {
+    name: fields.id,
+    members: [],
+    connectors: [],
+    createdAt: "",
+    updatedAt: "",
+    ...fields,
+  };
+}
+
+/**
  * Construct a `WorkspaceContext` for unit tests that don't have a full
  * `Runtime` available. Produces the same `WorkspaceContext` instance
  * type as `Runtime.getWorkspaceContext(wsId)`, but the signature
@@ -28,9 +44,8 @@ export const TEST_WORKSPACE_ID = "ws_0076759dbbe19fcc";
  * so tests can point at a `mkdtempSync(...)` directory without
  * bootstrapping the whole platform.
  *
- * Use this anywhere a test fixture previously passed `(wsId, workDir)`
- * pairs to free functions — the resulting context is the same
- * production code uses today.
+ * Use this anywhere a test fixture needs a `(wsId, workDir)` context —
+ * the resulting context is the same one production code uses.
  */
 export function makeTestWorkspaceContext(
   workDir: string,

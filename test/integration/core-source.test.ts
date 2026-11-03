@@ -22,6 +22,7 @@ import {
 import { asDevUser, devProvider } from "../helpers/dev-provider.ts";
 import { createEchoModel } from "../helpers/echo-model.ts";
 import { facetEntry, startFacetsSource } from "../helpers/facets-server.ts";
+import { makeIdentity } from "../helpers/identity.ts";
 import { makeInProcessSource } from "../helpers/in-process-source.ts";
 import { provisionTestWorkspace, TEST_WORKSPACE_ID } from "../helpers/test-workspace.ts";
 
@@ -165,7 +166,7 @@ describe("Core Source", () => {
       const source = await makeInProcessSource("nb", createCoreToolDefs(runtime));
       const result = await asDevUser(() =>
         source.execute("set_model_config", {
-          models: { default: "claude-haiku-4-5-20251001" },
+          models: { default: "anthropic:claude-haiku-4-5-20251001" },
         }),
       );
       expect(result.isError).toBe(false);
@@ -176,7 +177,7 @@ describe("Core Source", () => {
       const raw = JSON.parse(
         require("node:fs").readFileSync(deriveOverridePath(configPath), "utf-8"),
       );
-      expect(raw.models).toEqual({ default: "claude-haiku-4-5-20251001" });
+      expect(raw.models).toEqual({ default: "anthropic:claude-haiku-4-5-20251001" });
     } finally {
       await runtime.shutdown();
     }
@@ -198,7 +199,7 @@ describe("Core Source", () => {
     try {
       const source = await makeInProcessSource("nb", createCoreToolDefs(runtime));
       const result = await source.execute("set_model_config", {
-        models: { default: "claude-haiku-4-5-20251001" },
+        models: { default: "anthropic:claude-haiku-4-5-20251001" },
       });
       expect(result.isError).toBe(true);
       expect(extractText(result.content)).toContain("requires an authenticated identity");
@@ -299,9 +300,9 @@ describe("Core Source", () => {
   });
 
   it("nb__set_model_config accepts thinking='enabled' without a budget", async () => {
-    // A budget used to be mandatory here, because `enabled` with nothing to
-    // size it fell through to the SDK's 1,024-token floor. It now resolves
-    // to the default effort tier, which is well-defined on every provider —
+    // A budget is not mandatory: `enabled` with nothing to size it
+    // resolves to the default effort tier rather than the SDK's 1,024-token
+    // floor, and that tier is well-defined on every provider —
     // so requiring a token count would be demanding a number the operator
     // has no reason to have.
     const workDir = join(testDir, `work-thinking-nobudget-${Date.now()}`);
@@ -518,11 +519,11 @@ describe("Core Source", () => {
   });
 
   it("nb__set_model_config allows dropping a budget while keeping thinking='enabled'", async () => {
-    // This combination used to be rejected: clearing the budget left
-    // enabled with nothing to size it, and the SDK silently downgraded to
-    // its 1,024-token floor. Now it falls back to the default effort tier,
-    // which is the honest way to say "reason, at a normal depth" — so
-    // dropping a token cap is a legitimate operation rather than a trap.
+    // Clearing the budget leaves enabled with nothing to size it, so it
+    // falls back to the default effort tier rather than the SDK's silent
+    // 1,024-token floor. That is the honest way to say "reason, at a normal
+    // depth" — so dropping a token cap is a legitimate operation rather
+    // than a trap.
     const workDir = join(testDir, `work-thinking-clearbudget-${Date.now()}`);
     mkdirSync(workDir, { recursive: true });
     const configPath = join(workDir, "nimblebrain.json");
@@ -588,9 +589,8 @@ describe("Core Source", () => {
       expect(result.isError).toBe(false);
       const raw = JSON.parse(require("node:fs").readFileSync(overridePath, "utf-8"));
       expect(raw.thinking).toBeUndefined();
-      // The budget survives on purpose. It used to be deleted alongside the
-      // mode on the grounds that it meant nothing without one; the resolver's
-      // no-mode path now honors a bare budget, so cascading the delete would
+      // The budget survives on purpose. The resolver's no-mode path honors a
+      // bare budget, so cascading the delete would
       // silently discard a setting that is still in force. Clearing it is a
       // separate instruction (`thinkingBudgetTokens: null`).
       expect(raw.thinkingBudgetTokens).toBe(8192);
@@ -1063,9 +1063,9 @@ describe("Core Source", () => {
       expect(stranded).toEqual([]);
     });
 
-    it("accepts a bare model id that policy allows in qualified form", async () => {
-      // Bare ids are legal input; the policy check is an exact match, so it
-      // has to compare resolved forms.
+    it("refuses a bare model id even when policy allows its qualified form", async () => {
+      // The provider is part of the id, so a bare one is refused before policy
+      // is consulted, with the form to write instead.
       const { runtime, source } = await startWithPolicy("bare-id", [
         "anthropic:claude-sonnet-5",
         "anthropic:claude-haiku-4-5-20251001",
@@ -1077,7 +1077,7 @@ describe("Core Source", () => {
           }),
         );
         expect(`isError: ${res.isError} — ${extractText(res.content)}`).toBe(
-          "isError: false — Configuration updated: models.",
+          'isError: true — models.fast "claude-haiku-4-5-20251001" has no provider. Write it as provider:model, e.g. "anthropic:claude-haiku-4-5-20251001".',
         );
       } finally {
         await runtime.shutdown();
@@ -1287,7 +1287,7 @@ describe("Core Source", () => {
       configPath,
       JSON.stringify({
         version: "1",
-        models: { default: "claude-opus-4-7" },
+        models: { default: "anthropic:claude-opus-4-7" },
         maxIterations: 10,
       }),
     );
@@ -1304,7 +1304,7 @@ describe("Core Source", () => {
       const source = await makeInProcessSource("nb", createCoreToolDefs(r1));
       const result = await asDevUser(() =>
         source.execute("set_model_config", {
-          models: { default: "claude-haiku-4-5-20251001" },
+          models: { default: "anthropic:claude-haiku-4-5-20251001" },
           thinking: "off",
         }),
       );
@@ -1315,10 +1315,10 @@ describe("Core Source", () => {
 
     // Override file written, seed file untouched.
     const overrideAfterWrite = JSON.parse(require("node:fs").readFileSync(overridePath, "utf-8"));
-    expect(overrideAfterWrite.models).toEqual({ default: "claude-haiku-4-5-20251001" });
+    expect(overrideAfterWrite.models).toEqual({ default: "anthropic:claude-haiku-4-5-20251001" });
     expect(overrideAfterWrite.thinking).toBe("off");
     const seedAfterWrite = JSON.parse(require("node:fs").readFileSync(configPath, "utf-8"));
-    expect(seedAfterWrite.models).toEqual({ default: "claude-opus-4-7" }); // unchanged
+    expect(seedAfterWrite.models).toEqual({ default: "anthropic:claude-opus-4-7" }); // unchanged
     expect(seedAfterWrite.thinking).toBeUndefined();
 
     // Second runtime: load via loadConfig (the production path that
@@ -1333,13 +1333,9 @@ describe("Core Source", () => {
       logging: { disabled: true },
     });
     try {
-      // Two readers because they answer two questions. The resolved
-      // default qualifies bare ids in the catalog — the override on
-      // disk is bare (`claude-haiku-4-5-20251001`) and the runtime
-      // returns the catalog-qualified form, so downstream consumers
-      // (cost, capabilities, providerOptions shape, log lines) see a
-      // consistent shape. `thinking` is read back operator-set, exactly
-      // as written.
+      // Two readers because they answer two questions: the resolved default
+      // is the override's model, and `thinking` is read back operator-set,
+      // exactly as written.
       expect(r2.getDefaultModel()).toBe("anthropic:claude-haiku-4-5-20251001");
       expect(r2.getOperatorConfig().thinking).toBe("off");
     } finally {
@@ -1399,7 +1395,7 @@ describe("Core Source", () => {
       facetSource = await seedFacetApp(runtime);
       const source = await makeInProcessSource("nb", createCoreToolDefs(runtime));
       const ctxFor = (id: string, displayName: string) => ({
-        identity: { id, email: `${id}@example.com`, displayName } as never,
+        identity: makeIdentity({ id, email: `${id}@example.com`, displayName }),
         workspaceId: TEST_WORKSPACE_ID,
       });
 

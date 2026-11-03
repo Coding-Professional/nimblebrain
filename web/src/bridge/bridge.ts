@@ -22,8 +22,10 @@
 //     relay in hooks/useServerNotificationRelay.ts
 //
 // NimbleBrain extensions (ai.nimblebrain/ namespace — no spec equivalent):
-//   ai.nimblebrain/action, ai.nimblebrain/keydown, ai.nimblebrain/request-file,
-//   ai.nimblebrain/location (in) and ai.nimblebrain/navigate (out)
+//   ai.nimblebrain/open, ai.nimblebrain/open-connector-settings,
+//   ai.nimblebrain/notify, ai.nimblebrain/keydown, ai.nimblebrain/request-file,
+//   ai.nimblebrain/upload-files, ai.nimblebrain/location (in) and
+//   ai.nimblebrain/navigate (out)
 //   Each is served only because it is declared: see host-capabilities.ts.
 // ---------------------------------------------------------------------------
 
@@ -39,19 +41,26 @@ import {
 import type { FileEntry } from "../types";
 import { openAppChannel } from "./app-channel";
 import {
-  ACTION_METHOD,
+  HOST_STYLES_EXTENSION,
   KEYDOWN_METHOD,
   LOCATION_METHOD,
   NAVIGATE_METHOD,
   NOTIFY_METHOD,
+  OPEN_CONNECTOR_SETTINGS_METHOD,
+  OPEN_METHOD,
   REQUEST_FILE_METHOD,
   UPLOAD_FILES_APPS,
   UPLOAD_FILES_METHOD,
 } from "./extensions";
 import { buildHostCapabilities, TASKS_EXTENSION_ID } from "./host-capabilities";
 import { buildHostStyles, type UploadLimits } from "./host-extensions";
-import type { LoggingMessageNotification } from "./schemas";
-import { getHostThemeMode, getSpecThemeTokens } from "./theme";
+import { appWindowOf, onAppMessage, postToAppWindow } from "./iframe";
+import type {
+  LoggingMessageNotification,
+  UiOpenConnectorSettingsMessage,
+  UiOpenMessage,
+} from "./schemas";
+import { getHostThemeMode, getModeExtensionTokens, getSpecThemeTokens } from "./theme";
 import type {
   AppNotice,
   BridgeCallbacks,
@@ -63,7 +72,6 @@ import type {
   ResourcesReadMessage,
   SynapseRequestFileMessage,
   SynapseUploadFilesMessage,
-  UiActionMessage,
   UiMessageMessage,
   UiToolResultError,
   UiToolResultResponse,
@@ -185,7 +193,7 @@ export function createBridge(
     // work (iframe.ts TODO in createAppIframe) that gives iframes a real
     // origin. The iframe→parent direction (where the real leak lives) is
     // hardened via `hostContext.origin` in the handshake response below.
-    iframe.contentWindow?.postMessage(data, "*");
+    postToAppWindow(iframe, data);
   }
 
   // A frame that makes a held one redundant takes its place rather than
@@ -209,7 +217,7 @@ export function createBridge(
   function handleMessage(event: MessageEvent): void {
     if (destroyed) return;
     // Security: only accept messages from this iframe's window
-    if (event.source !== iframe.contentWindow) return;
+    if (event.source !== appWindowOf(iframe)) return;
 
     const msg = event.data;
     if (!msg || typeof msg !== "object") return;
@@ -364,10 +372,12 @@ export function createBridge(
         break;
 
       // -----------------------------------------------------------------
-      // Extension: ai.nimblebrain/action — semantic host actions
+      // Extension: ai.nimblebrain/open (what a URI names) and
+      // ai.nimblebrain/open-connector-settings (the sender's own)
       // -----------------------------------------------------------------
-      case ACTION_METHOD:
-        handleSynapseAction(msg.params, callbacks, appName);
+      case OPEN_METHOD:
+      case OPEN_CONNECTOR_SETTINGS_METHOD:
+        void answerOpen(msg, callbacks, appName, postToIframe);
         break;
 
       // -----------------------------------------------------------------
@@ -433,7 +443,7 @@ export function createBridge(
     }
   }
 
-  window.addEventListener("message", handleMessage);
+  const stopListening = onAppMessage(iframe, handleMessage);
 
   return {
     sendToolResult(result: ExtAppsToolResultNotification["params"]): void {
@@ -445,11 +455,11 @@ export function createBridge(
     },
 
     setHostContext(context: Record<string, unknown>): void {
-      // Filter spec-allowed theme keys centrally so every caller
-      // (SlotRenderer's theme toggle, future ones) can't bypass the
-      // ext-apps strict-Zod contract. Sending `--nb-*` or out-of-spec
-      // tokens to a strict client like Reboot tears down the connection
-      // on every host-context-changed notification.
+      // Derive the theme variables from the mode centrally, so every caller
+      // (SlotRenderer's theme toggle, future ones) sends the same split: spec
+      // keys on `styles.variables`, where a strict ext-apps client (Reboot)
+      // tears down the connection on any other key, and the mode-varying rest
+      // on the `ai.nimblebrain/styles` extension.
       const filtered = filterHostContextForSpec(context);
       const msg: ExtAppsHostContextChangedNotification = {
         jsonrpc: "2.0",
@@ -479,7 +489,7 @@ export function createBridge(
       offScreenBridges.delete(stateKey);
       screenObserver?.disconnect();
       closeChannel();
-      window.removeEventListener("message", handleMessage);
+      stopListening();
     },
   };
 }
@@ -736,10 +746,11 @@ function handleInitialize(
   if (typeof id !== "string" && typeof id !== "number") return;
 
   const extMode = getHostThemeMode();
-  // Filter to spec-valid keys only. Strict ext-apps SDK clients (Reboot's
-  // React runtime validates via Zod) reject unknown keys on this field.
-  // NB extensions and out-of-spec tokens still flow through the iframe's
-  // injected `<style>` block — they just don't cross the protocol.
+  // Spec-valid keys only on `styles.variables`. Strict ext-apps SDK clients
+  // (Reboot's React runtime validates via Zod) reject unknown keys on this
+  // field. The non-spec tokens that vary with the mode go on the
+  // `ai.nimblebrain/styles` extension below; the mode-independent rest reach
+  // the app only through the iframe's injected `<style>` block.
   const extTokens = getSpecThemeTokens(extMode);
   // Spec-standardized fields (theme, styles) take precedence over any
   // same-named keys returned by `getHostExtensions()`, so callers can
@@ -771,6 +782,7 @@ function handleInitialize(
         origin: window.location.origin,
         theme: extMode,
         styles: buildHostStyles(extTokens),
+        [HOST_STYLES_EXTENSION]: { variables: getModeExtensionTokens(extMode) },
       },
     },
   };
@@ -846,8 +858,8 @@ function handleResourcesRead(
   // the wire (`readResourceViaMcp`). The URI itself passes through verbatim;
   // SSRF safety lives in the connector.
   readResourceViaMcp(appName, params.uri)
-    .then((result) => {
-      postToIframe({ jsonrpc: "2.0", id, result });
+    .then((answer) => {
+      postToIframe(toIframe(id, answer));
     })
     .catch((err: unknown) => {
       const errorMsg = err instanceof Error ? err.message : "Resource read failed";
@@ -892,8 +904,7 @@ function handleResourceListing(
 
   sendMcpRequest(method, request)
     .then((answer) => {
-      if ("error" in answer) throw new Error(answer.error.message);
-      postToIframe({ jsonrpc: "2.0", id, result: answer.result });
+      postToIframe(toIframe(id, answer));
     })
     .catch((err: unknown) => {
       const errorMsg = err instanceof Error ? err.message : "Resource listing failed";
@@ -972,24 +983,41 @@ function handleUpdateModelContext(
 }
 
 /**
- * Handle an ai.nimblebrain/action: invoke onAction, or dispatch an `nb:action`
- * event when no callback is wired. The shell resolves the action by name.
- *
- * `serverName` is the server whose view sent the action, set here and last so
- * a param of the same name from the app cannot replace it. An action about
- * "this connector" reads it; the app never names itself.
+ * Answer an open request once the shell has acted: `{}` when the destination
+ * is on screen, or an error carrying the shell's reason. Settings are always
+ * the sender's own: the connector is `appName`, never a param. A bridge with no
+ * shell behind it refuses at once rather than leaving the app's request waiting.
  */
-function handleSynapseAction(
-  params: UiActionMessage["params"],
+async function answerOpen(
+  msg: UiOpenMessage | UiOpenConnectorSettingsMessage,
   callbacks: BridgeCallbacks | undefined,
   appName: string,
-): void {
-  const { action, ...rest } = params;
-  const actionParams = { ...rest, serverName: appName };
-  if (callbacks?.onAction) {
-    callbacks.onAction(action, actionParams);
+  postToIframe: (msg: unknown) => void,
+): Promise<void> {
+  const { id } = msg;
+  const onOpen = callbacks?.onOpen;
+  const onOpenSettings = callbacks?.onOpenConnectorSettings;
+  let run: (() => Promise<void>) | undefined;
+  if (msg.method === OPEN_METHOD) {
+    const { uri } = msg.params;
+    run = onOpen && (() => onOpen(uri));
   } else {
-    window.dispatchEvent(new CustomEvent("nb:action", { detail: { action, ...actionParams } }));
+    run = onOpenSettings && (() => onOpenSettings(appName));
+  }
+  if (!run) {
+    postToIframe({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: "Opening is not served here" },
+    });
+    return;
+  }
+  try {
+    await run();
+    postToIframe({ jsonrpc: "2.0", id, result: {} });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    postToIframe({ jsonrpc: "2.0", id, error: { code: -32602, message } });
   }
 }
 
@@ -1083,8 +1111,8 @@ function uploadError(err: unknown): { code: number; message: string; data?: Requ
 }
 
 // ---------------------------------------------------------------------------
-// MCP transport helpers — every request an app makes of its server goes to the
-// 2026-07-28 leg of `/mcp/<wsId>` through `sendMcpRequest`.
+// MCP transport helpers — every request an app makes of its server goes to
+// `/mcp/<wsId>` through `sendMcpRequest`.
 //
 // Rules:
 //   - What reaches `/mcp` is built here from the fields the method needs, plus
@@ -1204,20 +1232,18 @@ async function callToolViaMcp(
 
 /**
  * Forward a `resources/read` to `/mcp`, scoped to `server` — the calling app's
- * own. Resolves the ReadResourceResult (`{ contents }`); a JSON-RPC error from
- * `/mcp` rejects with its message.
+ * own. Resolves `/mcp`'s answer: the ReadResourceResult (`{ contents }`), or
+ * its JSON-RPC error with code and `data` intact.
  */
-async function readResourceViaMcp(server: string, uri: string): Promise<Record<string, unknown>> {
+async function readResourceViaMcp(server: string, uri: string): Promise<McpAnswer> {
   // `server` goes on the wire under `RESOURCE_SOURCE_META_KEY`, as it does for
   // listings, and `/mcp` reads from that one source. It is the only thing that
   // can: the bridge sends every iframe's requests as one client, so without it
   // a read resolves across the whole workspace and the user's files.
-  const answer = await sendMcpRequest("resources/read", {
+  return sendMcpRequest("resources/read", {
     uri,
     _meta: { [RESOURCE_SOURCE_META_KEY]: server },
   });
-  if ("error" in answer) throw new Error(answer.error.message);
-  return answer.result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,14 +1295,16 @@ async function forwardTaskRequest(
 // ---------------------------------------------------------------------------
 
 /**
- * Filter `ui/notifications/host-context-changed` params so only spec-valid
- * theme variable keys cross the wire. Strict ext-apps SDK clients (Reboot's
- * React runtime validates via Zod) reject unknown keys on
- * `hostContext.styles.variables`; sending `--nb-*` or out-of-spec tokens
- * tears down the connection. Centralized here so callers can't skip it.
+ * Derive the theme variables of `ui/notifications/host-context-changed` params
+ * from the mode they carry. Strict ext-apps SDK clients (Reboot's React runtime
+ * validates via Zod) reject unknown keys on `hostContext.styles.variables`, and
+ * sending `--nb-*` or out-of-spec tokens there tears down the connection, so
+ * that field gets the spec keys alone. The out-of-spec tokens that vary with
+ * the mode ride the `ai.nimblebrain/styles` extension beside it, so a toggle
+ * refreshes them too. Centralized here so callers can't skip it.
  *
- * Only the `styles.variables` branch is filtered — other host-context
- * fields (theme mode, future additions) pass through unchanged.
+ * Only the theme variables are touched: other host-context fields (theme mode,
+ * workspace, future additions) pass through unchanged.
  */
 function filterHostContextForSpec(ctx: Record<string, unknown>): Record<string, unknown> {
   const styles = ctx.styles as { variables?: Record<string, string> } | undefined;
@@ -1288,6 +1316,7 @@ function filterHostContextForSpec(ctx: Record<string, unknown>): Record<string, 
       ...styles,
       variables: getSpecThemeTokens(mode),
     },
+    [HOST_STYLES_EXTENSION]: { variables: getModeExtensionTokens(mode) },
   };
 }
 

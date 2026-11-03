@@ -13,11 +13,12 @@ import type { webcrypto } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadInstanceConfig, saveInstanceConfig } from "../../src/identity/instance.ts";
+import { loadInstanceConfig } from "../../src/identity/instance.ts";
 import { createIdentityProvider } from "../../src/identity/provider.ts";
 import { OidcIdentityProvider } from "../../src/identity/providers/oidc.ts";
 import { UserStore } from "../../src/identity/user.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
+import { writeInstanceConfig } from "../helpers/instance-config.ts";
 
 // ── RSA key pair (generated once per suite) ───────────────────────
 
@@ -108,6 +109,8 @@ interface TokenOptions {
   exp?: number;
   sub?: string;
   email?: string;
+  /** Defaults to `true`; pass `undefined` explicitly to omit the claim. */
+  email_verified?: unknown;
   name?: string;
   kid?: string;
 }
@@ -126,6 +129,7 @@ async function buildJwt(opts: TokenOptions = {}): Promise<string> {
     exp: opts.exp ?? nowSec + 3600,
     sub: opts.sub ?? "integ-user-sub",
     email: opts.email ?? "alice@acme.com",
+    email_verified: "email_verified" in opts ? opts.email_verified : true,
     name: opts.name,
   };
 
@@ -153,7 +157,7 @@ const ALLOWED_DOMAINS = ["acme.com"];
 describe("OIDC integration: full flow", () => {
   test("instance config → factory → adapter → JWT verify → user auto-provisioned → identity returned", async () => {
     // Write instance config with OIDC auth
-    await saveInstanceConfig(workDir, {
+    await writeInstanceConfig(workDir, {
       auth: {
         adapter: "oidc",
         issuer,
@@ -232,7 +236,7 @@ describe("OIDC integration: full flow", () => {
     // Create a default workspace first
     const ws = await wsStore.create("Default");
 
-    // OidcIdentityProvider no longer auto-adds to workspaces — that is handled
+    // OidcIdentityProvider does not auto-add to workspaces — that is handled
     // by the runtime layer. Verify the user is provisioned and can be manually added.
     const adapter = new OidcIdentityProvider(
       { adapter: "oidc", issuer, clientId: CLIENT_ID, allowedDomains: ALLOWED_DOMAINS },
@@ -273,7 +277,7 @@ describe("OIDC integration: domain rejection", () => {
   });
 
   test("factory-created adapter respects allowedDomains from instance config", async () => {
-    await saveInstanceConfig(workDir, {
+    await writeInstanceConfig(workDir, {
       auth: {
         adapter: "oidc",
         issuer,
@@ -306,7 +310,7 @@ describe("OIDC integration: domain rejection", () => {
 
 describe("OIDC integration: factory wiring", () => {
   test("loadInstanceConfig with oidc adapter → createIdentityProvider returns OidcIdentityProvider", async () => {
-    await saveInstanceConfig(workDir, {
+    await writeInstanceConfig(workDir, {
       auth: {
         adapter: "oidc",
         issuer,

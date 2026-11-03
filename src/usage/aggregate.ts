@@ -2,14 +2,13 @@
  * Usage aggregation — the ONE reader of tenant-level spend.
  *
  * Source of truth: the durable usage ledger (`src/usage/ledger.ts`), one line
- * per priced LLM call. It used to be `llm.response` events scanned out of
- * conversation JSONL files, which made usage a function of whether a
- * conversation file happened to exist — so task runs, sub-agent runs, the
- * background briefing and archived workspaces all spent money this never saw.
+ * per priced LLM call. Scanning `llm.response` events out of conversation
+ * JSONL files would make usage a function of whether a conversation file
+ * happened to exist — so task runs, sub-agent runs, the background briefing
+ * and archived workspaces would all spend money it never saw.
  *
- * **There is exactly one reader, deliberately.** The codebase previously had
- * two that disagreed, which is how the undercount survived; a third would
- * repeat it. Per-conversation display still reads `llm.response` from the
+ * **There is exactly one reader, deliberately.** Two readers can disagree,
+ * and the disagreement hides an undercount. Per-conversation display still reads `llm.response` from the
  * conversation log, because "what happened in this conversation" is a different
  * question from "what did this tenant spend" — but neither side may sum the
  * other's source.
@@ -22,6 +21,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { getProviderFromModel } from "../model/catalog.ts";
 import {
   USAGE_GROUP_BYS,
   type UsageGroupBy,
@@ -240,34 +240,24 @@ function addCost(target: CostBreakdown, cost: CostBreakdown): void {
 }
 
 /**
- * Normalize model ID by stripping any `provider:` prefix and date suffix for
- * grouping/display. The prefix match is generic (`^[a-z0-9-]+:`) so a new
- * provider like `nebius:` is handled without editing this (and the sibling
- * copies in the usage UIs). Exported for the drift-pinning test.
- */
-/**
- * The provider a qualified model string names — the segment before the first
- * colon. Unqualified strings are Anthropic, matching `getModelByString`.
- */
-export function providerOf(model: string): string {
-  const i = model.indexOf(":");
-  return i < 0 ? "anthropic" : model.slice(0, i);
-}
-
-/**
  * Whether this line's cost is a real number rather than an absence.
  *
  * True when the line carries stored rates, or when the catalog can still price
- * its model. False for a backfilled task line (`model: "unknown"`) and
- * for anything else the catalog has never known — those contribute tokens and
- * no dollars, and are counted separately so the total reads as incomplete
- * rather than as zero.
+ * its model. False for a model the catalog has never known: those lines
+ * contribute tokens and no dollars, and are counted separately so the total
+ * reads as incomplete rather than as zero.
  */
 function isPriced(record: LlmCallRecord): boolean {
   if (record.rates) return true;
   return costBreakdown(record.model, { inputTokens: 1, outputTokens: 0 }).total > 0;
 }
 
+/**
+ * Normalize model ID by stripping any `provider:` prefix and date suffix for
+ * grouping/display. The prefix match is generic (`^[a-z0-9-]+:`) so a new
+ * provider like `nebius:` is handled without editing this (and the sibling
+ * copies in the usage UIs). Exported for the drift-pinning test.
+ */
 export function normalizeModel(model: string): string {
   return model.replace(/^[a-z0-9-]+:/, "").replace(/-\d{8}$/, "");
 }
@@ -287,68 +277,40 @@ function normalizeGroupBys(groupBy: string | string[]): UsageGroupBy[] {
   return [...new Set(valid.length > 0 ? valid : fallback)];
 }
 
-// ── Legacy `sessionId` normalization ─────────────────────────────────────
-//
-// Records written before the id split carry one `sessionId` holding either a
-// conversation or a task run, told apart by `origin`. Records written
-// since carry `conversationId` / `taskRunId` under their own names. Both shapes
-// are in the retention window at once, so every read goes through these two
-// helpers rather than touching either field directly.
-//
-// These are the whole compatibility surface, and they expire: when the oldest
-// retained month postdates the split (see `retentionMonths`, default 24), no
-// record on disk has `sessionId` and both `?? legacy` arms become dead code.
-
-/** The chat conversation a record belongs to, new shape or old. */
-function conversationOf(record: LlmCallRecord): string | undefined {
-  if (record.conversationId) return record.conversationId;
-  // Legacy: `sessionId` was a conversation only when the call was not a task.
-  return record.origin === "task" ? undefined : record.sessionId;
-}
-
-/** The task run a record belongs to, new shape or old. */
-function taskRunOf(record: LlmCallRecord): string | undefined {
-  if (record.taskRunId) return record.taskRunId;
-  // Legacy: `sessionId` was a task run only when the call was a task.
-  return record.origin === "task" ? record.sessionId : undefined;
-}
-
-function groupKeyFor(record: LlmCallRecord, groupBy: UsageGroupBy, modelKey: string): string {
-  switch (groupBy) {
+/** The row a record belongs to in a dimension that describes every record. */
+function keyFor(
+  record: LlmCallRecord,
+  dimension: Exclude<UsageGroupBy, "conversation">,
+  modelKey: string,
+): string {
+  switch (dimension) {
     case "model":
       return modelKey;
-    case "conversation":
-      // A task run has no conversation, so it groups under "none" rather than
-      // contributing its run id to a conversation breakdown — which is what the
-      // undiscriminated `sessionId` read did, putting `run_…` rows in a
-      // dimension the schema calls "conversation".
-      return conversationOf(record) ?? "none";
-    case "turn":
-      // One assistant turn, which is one engine run.
-      //
-      // Legacy: a record written while a turn could spawn a sub-agent carries
-      // the spawning turn's id in `parentRunId` and the sub-agent's own in
-      // `runId`. Preferring `parentRunId` rolls those rows onto the turn that
-      // spawned them rather than billing one turn as several.
-      //
-      // The forked fast-slot calls (title, compaction) carry no
-      // engine run at all, and neither do records predating `runId`; both
-      // group under "none".
-      return record.parentRunId ?? record.runId ?? "none";
     case "user":
-      return record.userId ?? "unknown";
+      return record.userId;
     case "origin":
       return record.origin;
     case "provider":
-      return providerOf(record.model);
+      return getProviderFromModel(record.model);
     case "workspace":
-      // A call made outside any workspace (a detached background call) has no
-      // binding, and groups under "none" — the same word the id-keyed
-      // dimensions use for an absent id.
-      return record.workspaceId ?? "none";
+      return record.workspaceId;
     case "day":
       return record.ts.slice(0, 10);
   }
+}
+
+/**
+ * The row a record belongs to in one dimension, or `undefined` when the
+ * dimension does not describe it. Only `conversation` can be undefined: a task
+ * run or a background job has no conversation, so its calls are in the totals
+ * and in no conversation row, rather than in a row standing for "no conversation".
+ */
+function groupKeyFor(
+  record: LlmCallRecord,
+  groupBy: UsageGroupBy,
+  modelKey: string,
+): string | undefined {
+  return groupBy === "conversation" ? record.conversationId : keyFor(record, groupBy, modelKey);
 }
 
 function getBreakdownAccumulator(
@@ -441,9 +403,9 @@ function finalizeBreakdown(
     }))
     .sort((a, b) => a.key.localeCompare(b.key));
 
-  // Cap the rows. `conversation` and `turn` are keyed on ids the ledger mints
-  // per thread and per turn, so their cardinality grows with every turn the
-  // tenant ever takes — over the retention window that is tens of thousands of
+  // Cap the rows. `conversation` is keyed on an id the ledger mints per
+  // thread, so its cardinality grows with every conversation the tenant ever
+  // has — over the retention window that is tens of thousands of
   // rows, and the whole report is serialized twice (the text the model reads
   // and the structured copy) before anything trims it. The engine bounds what
   // reaches the MODEL at `MAX_TOOL_RESULT_CHARS`, but the full string is built
@@ -545,14 +507,7 @@ export function resolveDateRange(
 export interface AggregateUsageOptions {
   from?: string;
   to?: string;
-  /**
-   * Restrict to calls made by this user id. Omit for every user.
-   *
-   * **Fails closed.** `userId` is optional on a ledger line — a call recorded
-   * outside any request scope has none — and such a line is excluded from an
-   * owner-filtered read rather than included. The alternative leaks one user's
-   * spend into another's view on exactly the lines whose owner is unknown.
-   */
+  /** Restrict to calls made by this user id. Omit for every user. */
   ownerFilter?: string;
   /**
    * Narrow the records before aggregation, so totals, rows and models all
@@ -565,9 +520,9 @@ export interface AggregateUsageOptions {
 }
 
 export interface UsageFilters {
-  /** Only calls bound to this workspace; `"none"` selects calls bound to none. */
+  /** Only calls bound to this workspace. */
   workspaceId?: string;
-  /** Only calls made by this user. Fails closed like `ownerFilter`. */
+  /** Only calls made by this user. */
   userId?: string;
   /** Only calls to this model, matched as the qualified string or its short name. */
   model?: string;
@@ -579,14 +534,12 @@ export interface UsageFilters {
  *
  * Each filter reads the field through the same derivation its `groupBy`
  * dimension uses, so selecting a row's key as a filter returns exactly that
- * row's records: a call with no workspace is `"none"` to both, and a model
- * matches by the short name the `models` rows carry.
+ * row's records: a model matches by the short name the `models` rows carry.
  */
 function matchesFilters(record: LlmCallRecord, filters: UsageFilters): boolean {
-  if (filters.workspaceId !== undefined) {
-    if ((record.workspaceId ?? "none") !== filters.workspaceId) return false;
+  if (filters.workspaceId !== undefined && record.workspaceId !== filters.workspaceId) {
+    return false;
   }
-  // Fails closed, like `ownerFilter`: a line with no `userId` never matches.
   if (filters.userId !== undefined && record.userId !== filters.userId) return false;
   if (filters.model !== undefined) {
     if (record.model !== filters.model && normalizeModel(record.model) !== filters.model) {
@@ -615,8 +568,6 @@ function parseShard(
       continue;
     }
     if (!entry.ts || !isDateInRange(entry.ts.slice(0, 10), range)) continue;
-    // Fails closed: a line with no `userId` is excluded from a filtered read,
-    // never included. See `AggregateUsageOptions.ownerFilter`.
     if (ownerFilter !== undefined && entry.userId !== ownerFilter) continue;
     if (!matchesFilters(entry, filters)) continue;
     out.push(entry);
@@ -701,12 +652,9 @@ function accumulateRecord(record: LlmCallRecord, sink: AggregationSink): void {
   addTokens(sink.totals.tokens, tokens);
   addCost(sink.totals.cost, cost);
   sink.totals.llmMs += record.llmMs;
-  // `conversationOf` / `taskRunOf` decide which of the two a record belongs to,
-  // so a task is never counted as a conversation.
-  const conversationId = conversationOf(record);
-  const taskRunId = taskRunOf(record);
-  if (conversationId) sink.conversationIds.add(conversationId);
-  if (taskRunId) sink.runIds.add(taskRunId);
+  // Each id under its own name, so a task is never counted as a conversation.
+  if (record.conversationId) sink.conversationIds.add(record.conversationId);
+  if (record.taskRunId) sink.runIds.add(record.taskRunId);
   // Unpriced is not free. A line the catalog cannot price contributes tokens
   // and zero dollars, and this is the count that says the dollar figure is
   // incomplete rather than the spend being zero.
@@ -723,17 +671,18 @@ function accumulateRecord(record: LlmCallRecord, sink: AggregationSink): void {
   for (const dimension of sink.groupBys) {
     const map = sink.breakdownMaps.get(dimension)!;
     const key = groupKeyFor(record, dimension, modelKey);
+    if (key === undefined) continue;
     const bucket = getBreakdownAccumulator(map, key);
     addTokens(bucket.tokens, tokens);
     addCost(bucket.cost, cost);
     bucket.llmCalls++;
-    // Same split as `totals`, through the same two helpers, so a breakdown row
-    // cannot report a task as a conversation while the totals disagree.
-    if (conversationId) bucket.sids.add(conversationId);
-    if (taskRunId) bucket.runIds.add(taskRunId);
+    // Same split as `totals`, so a breakdown row cannot report a task as a
+    // conversation while the totals disagree.
+    if (record.conversationId) bucket.sids.add(record.conversationId);
+    if (record.taskRunId) bucket.runIds.add(record.taskRunId);
     if (!priced) bucket.unpricedCalls++;
     if (dimension === "day" && sink.stackBy) {
-      addToStack(bucket, groupKeyFor(record, sink.stackBy, modelKey), cost.total);
+      addToStack(bucket, keyFor(record, sink.stackBy, modelKey), cost.total);
     }
   }
 }
@@ -854,7 +803,7 @@ export function ledgerCostByTaskRun(
     const dir = usageMonthDir(workDir, month);
     for (const shard of shardsForMonth(dir)) {
       for (const record of parseShard(readShardSync(join(dir, shard)), range, undefined, filters)) {
-        const runId = taskRunOf(record);
+        const runId = record.taskRunId;
         if (runId && taskRunIds.has(runId)) {
           const cost = costBreakdown(record.model, record.usage, record.rates).total;
           costs.set(runId, (costs.get(runId) ?? 0) + cost);

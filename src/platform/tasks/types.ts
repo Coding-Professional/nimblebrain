@@ -2,6 +2,7 @@
  * Type definitions for the tasks domain.
  */
 
+import type { ThinkingEffort } from "../../engine/types.ts";
 import type { NotificationRouteMatch } from "../schemas/notifications.ts";
 
 // ---------------------------------------------------------------------------
@@ -60,8 +61,11 @@ export interface Task {
    */
   onceDone?: OnceDone;
 
-  /** Force a specific skill match (bypass trigger/keyword matching). */
-  skill?: string;
+  /**
+   * Skills every run is given in full, in its system prompt, before its first
+   * model call, by catalog name. The run is refused when one is not available.
+   */
+  skills?: string[];
 
   /** Tool allowlist (glob patterns) for this task's runs. Empty or absent: every tool. */
   allowedTools?: string[];
@@ -135,6 +139,14 @@ export interface Task {
   /** Model override for this task. Null = workspace default. */
   model?: string | null;
 
+  /**
+   * Reasoning depth for this task's runs. Null = the operator's
+   * `thinkingEffort`, else the platform default. Ranks as the operator's own
+   * tier would, so it does not reach past an operator `thinking` of `off` or
+   * `adaptive`, nor onto a model that does not reason (`resolveThinking`).
+   */
+  thinkingEffort?: ThinkingEffort | null;
+
   /** Whether this task is active. */
   enabled: boolean;
 
@@ -164,11 +176,34 @@ export interface Task {
   /** ISO timestamp of next scheduled run. */
   nextRunAt?: string;
 
+  /**
+   * The scheduled run in flight, written before the executor is called and
+   * cleared by the write that records the run and advances `nextRunAt`. Found
+   * at start, it names a run the process stopped under: the scheduler records
+   * it and moves to the next occurrence rather than running it again, since
+   * the run may already have done part of its work.
+   */
+  scheduledRunInFlight?: ScheduledRunInFlight;
+
   /** Total completed runs. */
   runCount: number;
 
   /** Consecutive failed runs (resets on success). Drives backoff. */
   consecutiveErrors: number;
+
+  /**
+   * How many of `consecutiveErrors` were transient. They back the task off but
+   * count only toward the larger auto-disable cap, so an outage leaves it on.
+   */
+  transientErrors?: number;
+
+  /**
+   * The failed run whose notice stands for the current failing stretch. Set
+   * by the first run of the stretch that left no deliverable, cleared when the
+   * streak resets, so a task failing every few minutes raises one notice, not
+   * one per run.
+   */
+  failureNoticeRunId?: string;
 
   /** ISO timestamp when auto-disabled. */
   disabledAt?: string;
@@ -392,7 +427,7 @@ export interface ScheduleSpec {
   /** Standard 5-field cron expression. Required when type is "cron". */
   expression?: string;
 
-  /** IANA timezone. Defaults to home.timezone or system timezone. */
+  /** IANA timezone. Defaults to the instance timezone (`NB_TIMEZONE`, else the system's). */
   timezone?: string;
 
   /**
@@ -448,6 +483,14 @@ export function onceRetirement(task: Pick<Task, "schedule" | "onceDone">): "ran"
   return task.onceDone?.outcome ?? null;
 }
 
+/** A scheduled run that has started and not yet been recorded ({@link Task.scheduledRunInFlight}). */
+export interface ScheduledRunInFlight {
+  runId: string;
+  startedAt: string;
+  /** The once occurrence the run is (`schedule.at` at dispatch), so settling it retires only that one. */
+  onceAt?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Task Run
 // ---------------------------------------------------------------------------
@@ -458,9 +501,10 @@ export interface TaskRun {
   startedAt: string;
   completedAt?: string;
   /**
-   * `degraded`: the run finished, but a tool call failed and no later call made
-   * it good, so part of its work did not happen (`error` names the tools). It is
-   * not a failure: it neither extends an error streak nor backs the schedule off.
+   * `degraded`: the run finished, but part of its work may not have happened:
+   * a tool call failed and no later call made it good, or a limit told it to wrap
+   * up (`error` says which). It is not a failure: it
+   * neither extends an error streak nor backs the schedule off.
    */
   /**
    * `queued` and `running` appear only on an open run's ticket (see
@@ -480,7 +524,7 @@ export interface TaskRun {
   toolCalls: number;
   iterations: number;
   error?: string;
-  /** Whether this failure was classified as transient (eligible for backoff retry). */
+  /** Whether this failure looks temporary: it backs off without counting toward the ordinary auto-disable. */
   transient?: boolean;
   /**
    * What started this run — the scheduler's timer, an operator's Run now, or a
@@ -570,6 +614,8 @@ export interface RunToolCall {
   output: string;
   ok: boolean;
   ms: number;
+  /** The call did not run: the engine held it until its tool's guidance was read. */
+  held?: true;
 }
 
 /** A reference to a file the run produced, resolvable in the workspace file store. */
@@ -581,7 +627,7 @@ export interface RunFileRef {
 /**
  * The full result of a task run — what the run *produced*, persisted
  * once per run as a sidecar to the lightweight {@link TaskRun} summary.
- * A task run is no longer a conversation: instead of a chat trace, it
+ * A task run is not a conversation: instead of a chat trace, it
  * leaves a deliverable (the final output), the activity log of what it did,
  * and references to any files it wrote (in the workspace file store).
  */
@@ -604,6 +650,27 @@ export interface TaskRunResult {
    * whether it did (`TaskRun.outputSchemaValid`).
    */
   structured?: unknown;
+  /** Why the run failed or did not start, as its record says. */
+  error?: string;
+  /**
+   * Every skill the run was given, or that missed it, in order. Absent when the
+   * run loaded none.
+   */
+  skillsDelivered?: RunSkillDelivery[];
+}
+
+/** One skill reaching (or missing) a run. See the runtime's `SkillDelivery`. */
+export interface RunSkillDelivery {
+  name: string;
+  /**
+   * `declared`: in the system prompt, because the task names it.
+   * `before_call`: delivered while the first call to its tool was held.
+   * `tool_use`: delivered on a promotion or after a call that ran.
+   * `activation`: the run loaded it from the catalog.
+   */
+  loadedBy: "declared" | "before_call" | "tool_use" | "activation";
+  /** Set when a skill bound to a called tool did not arrive, and why. */
+  status?: "fetch_failed" | "capped" | "renamed_unheld";
 }
 
 // ---------------------------------------------------------------------------
@@ -630,9 +697,12 @@ export type CreateTaskInput = Omit<
   | "updatedAt"
   | "runCount"
   | "consecutiveErrors"
+  | "transientErrors"
+  | "failureNoticeRunId"
   | "lastRunAt"
   | "lastRunStatus"
   | "nextRunAt"
+  | "scheduledRunInFlight"
   | "disabledAt"
   | "disabledReason"
   | "cumulativeInputTokens"
@@ -647,7 +717,7 @@ export type UpdateTaskInput = Partial<
     | "description"
     | "prompt"
     | "schedule"
-    | "skill"
+    | "skills"
     | "allowedTools"
     | "inputSchema"
     | "outputSchema"
@@ -659,6 +729,7 @@ export type UpdateTaskInput = Partial<
     | "maxInputTokens"
     | "maxRunDurationMs"
     | "model"
+    | "thinkingEffort"
     | "enabled"
     | "tokenBudget"
   >

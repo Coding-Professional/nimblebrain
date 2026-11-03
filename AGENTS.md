@@ -20,12 +20,13 @@ bun run dev                # API (:27247) + Web (:27246) with watch/HMR
 bun run dev:worktree       # Run from any worktree against an isolated workdir on alt ports — see "Worktree dev" below
 bun run dev:api            # API only with auto-restart
 bun run verify             # Full CI parity — runs every subscript below
-bun run verify:static      # format:check + lint + check + check:cycles
+bun run verify:static      # format:check + lint + check + the check:* scripts
 bun run verify:test-unit   # test:unit + test:web + test:platform-apps
 
 bun run test               # Unit then integration (stops at the first failing suite)
 bun run test:unit          # Unit tests only (fast, ~10s)
 bun run test:integration   # Integration tests only
+bun run test:conformance   # MCP conformance suite against /mcp/<wsId> (not in verify; see test/conformance/AGENTS.md)
 bun run lint               # Biome linter
 bun run format:check       # Biome format diff (no writes) — matches CI
 bun run check              # TypeScript strict mode
@@ -68,17 +69,20 @@ Nested `AGENTS.md` files (each with a `CLAUDE.md` symlink) hold the rules for on
 | [`src/platform/AGENTS.md`](./src/platform/AGENTS.md) | Authoring platform apps and their tools: MCP-native sources, strict input schemas, update tools as patches where `null` clears, named output types, `ui://` MIME type |
 | [`src/platform/tasks/AGENTS.md`](./src/platform/tasks/AGENTS.md) | Task storage, per-run membership gate, run results, how the scheduler uses run admission, budget, per-run caps, run assessment and the connected judge, batches (driver, budget account, stop rule, restart) |
 | [`src/runtime/AGENTS.md`](./src/runtime/AGENTS.md) | Run admission at the run-start door: slots, queue, fair share, leases; spend accounts reserved before each model call |
+| [`src/execution/AGENTS.md`](./src/execution/AGENTS.md) | The agent runtime seam behind the door: what a runtime receives and emits, capabilities the door checks, the generic ACP runtime and its drivers, the tool projection |
 | [`src/workspace/AGENTS.md`](./src/workspace/AGENTS.md) | Workspace roots and `assertWorkspaceRootExists`, write authorization, opaque ids, provisioning the first workspace |
 | [`src/orchestrator/AGENTS.md`](./src/orchestrator/AGENTS.md) | The workspace wall: tool-name shape as scope, `routeToolCall`, name parsing, skill walling |
 | [`src/tools/AGENTS.md`](./src/tools/AGENTS.md) | `CredentialStore`, credential refs, OAuth records, credential ownership; long-running (task-augmented) MCP tools |
 | [`src/conversation/AGENTS.md`](./src/conversation/AGENTS.md) | Conversation paths, workspace binding on resume, no cross-workspace listing |
 | [`src/files/AGENTS.md`](./src/files/AGENTS.md) | File store paths, bare `files://` URIs, the file locator |
-| [`src/api/AGENTS.md`](./src/api/AGENTS.md) | Three API audiences, tool actions over new routes, named response bodies, router middleware chained per route, `/mcp/<wsId>` wall and which credentials reach it, MCP sessions, what blocks running more than one replica, `clientAddressFor` |
+| [`src/api/AGENTS.md`](./src/api/AGENTS.md) | Three API audiences, tool actions over new routes, named response bodies, router middleware chained per route, `/mcp/<wsId>` wall and which credentials reach it, the browser origins `/mcp` trusts, the one protocol revision `/mcp` speaks and the connector prompts it serves, what blocks running more than one replica, `clientAddressFor` |
 | [`src/hooks/AGENTS.md`](./src/hooks/AGENTS.md) | The inbound webhook door: never parse a body, uniform 404, delivery ids, rotation, provisioning |
 | [`src/lifecycle/AGENTS.md`](./src/lifecycle/AGENTS.md) | Connector `on_ready` / `on_removing` notifications |
 | [`src/connectors/runtime/AGENTS.md`](./src/connectors/runtime/AGENTS.md) | Connector teardown and workspace delete; connection credential re-validation |
+| [`src/model/AGENTS.md`](./src/model/AGENTS.md) | Model provider workarounds: Gemini errors sent inside the stream |
 | [`src/observability/AGENTS.md`](./src/observability/AGENTS.md) | `NB_DEBUG` / `nb_debug` namespaces, structured logs, OTel spans, what may be stamped |
 | [`web/AGENTS.md`](./web/AGENTS.md) | Web shell: gating workspace writes, forms that save as they change and notices, shell rules, chat panel workspace scope, main-area views |
+| [`test/conformance/AGENTS.md`](./test/conformance/AGENTS.md) | The MCP conformance suite against `/mcp/<wsId>`: what it measures, the per-version baselines, the pin, where it runs in CI |
 | [`web/src/bridge/AGENTS.md`](./web/src/bridge/AGENTS.md) | MCP App Bridge rules: iframe scoping, handshake gate, notification relay, host capabilities |
 
 ## Conventions
@@ -88,14 +92,15 @@ Nested `AGENTS.md` files (each with a `CLAUDE.md` symlink) hold the rules for on
 - **Module system:** ESM only. All imports use `.ts` extensions.
 - **Linting:** Biome (not ESLint/Prettier). Run `bun run lint`.
 - **Type checking:** `bunx tsc --noEmit`. Strict mode enabled.
-- **Prefer typed-safe paths over `as unknown as T`.** When TS errors, find the input/output type matching runtime shape (e.g. stream-side vs prompt-side) before widening. Cast escape hatches require a comment naming the mismatch. Example: `src/model/inbound-fit.ts`.
-- **Code-style rules beyond Biome/tsc live in [CODE_STYLE.md](./CODE_STYLE.md)** and are enforced by `bun run check:code-style` (part of `verify:static`). Add a rule when you find yourself enforcing the same pattern in review twice. Each rule lands with its check and the cleanup of existing violations in the same PR — otherwise it has no teeth.
+- **Prefer typed-safe paths over `as unknown as T`.** When TS errors, find the input/output type matching runtime shape (e.g. stream-side vs prompt-side) before widening. Cast escape hatches require a `biome-ignore lint/plugin/double-cast: <reason>` naming the mismatch; the Biome plugin `biome-plugins/double-cast.grit` enforces it (CODE_STYLE.md, "A double cast names its mismatch"). Example: `src/model/inbound-fit.ts`. The same holds for `x as never`, which `biome-plugins/never-cast.grit` flags (suppression `lint/plugin/never-cast`).
+- **Code-style rules beyond Biome/tsc live in [CODE_STYLE.md](./CODE_STYLE.md)** and are enforced by a Grit plugin in `biome-plugins/` (run by `bun run lint`) where a syntax pattern can express the rule, otherwise by a `check:*` script in `verify:static`. Add a rule when you find yourself enforcing the same pattern in review twice. Each rule lands with its check and the cleanup of existing violations in the same PR — otherwise it has no teeth.
+- **Layering:** `src/runtime/` does not import `src/tools/` or `src/platform/` (only the composition roots `runtime.ts` and `workspace-runtime.ts` do); `src/config/` imports none of `runtime/`, `tools/`, `platform/`; `src/engine/` does not import `runtime/`. Each reverse edge closes a cycle, since a platform app is a tool source that imports `Runtime`. A helper two layers need goes in `src/util/`. `noRestrictedImports` overrides in `biome.json` enforce it.
 - **HTTP framework:** Hono for routing and middleware. Typed context via `AppEnv`/`AuthEnv`.
 - **Model types:** Use Vercel AI SDK V4 types (`LanguageModelV4`, `LanguageModelV4Message`, etc.) from `@ai-sdk/provider`. The engine calls `model.doStream()` directly. File parts carry `data` as the tagged `SharedV4FileData` union (`{ type: "data", data }` for inline bytes) — a bare `Uint8Array` type-errors, and provider converters silently drop a part whose `data.type` matches no arm.
 - **No classes for data** — plain interfaces + factory functions preferred.
 - **Tool results:** Return typed data in `structuredContent`, use `content` only for human-readable summary.
 - **Errors:** Tool errors are caught per-call and returned as `isError: true` results. Engine errors surface via `run.error` event.
-- **Logs:** use `log.*` from `src/observability/log.ts`, never raw `console.*` in operational code (it bypasses JSON/identity/correlation enrichment; `check:no-raw-console` enforces). Details in `src/observability/AGENTS.md`.
+- **Logs:** use `log.*` from `src/observability/log.ts`, never raw `console.*` in operational code (it bypasses JSON/identity/correlation enrichment; Biome's `noConsole` enforces). Details in `src/observability/AGENTS.md`.
 - **Documentation:** User- and operator-facing docs live in [`docs/`](./docs) (Astro + Starlight) and deploy to [docs.nimblebrain.ai](https://docs.nimblebrain.ai) via GitHub Pages. **Update them in the same PR as any user-facing change** (CLI, config, API, behavior), so they do not drift. `docs/` is a standalone package: `cd docs && bun install`, then `bun run dev` / `bun run build` (or `bun run docs:dev` / `docs:build` from the root). The docs build runs an internal-link check and is a required CI gate on any docs change (`.github/workflows/docs-ci.yml`). `docs/` is excluded from `bun run verify` (neither biome nor tsc covers it). `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, and `AGENTS.md`/`CLAUDE.md` remain the standard top-level OSS files.
 - **Per-directory agent docs:** any `AGENTS.md` is the real file; `CLAUDE.md` is a symlink to it (`ln -s AGENTS.md CLAUDE.md`). Edit `AGENTS.md`. New per-directory docs follow the same pattern. Don't invert it (real `CLAUDE.md` + symlinked `AGENTS.md`) — it confuses tools that prefer one or the other. A rule tied to one area's code goes in that folder's guide, not here, and gets a line in [Guides](#guides); this file loads in every session and Codex reads only the first 32 KiB of instructions.
 - **A data migration is a one-off: write and run it from a work branch against each deployment (dry-run, then apply with the runtime stopped), then delete it; the repo does not carry it.** A migration kept in the repo has no reader once its data has moved, yet it pins exported internals and tests to a shape the runtime no longer writes. A reconcile the runtime must run at boot (one that finishes a move whether or not an operator acts) is runtime code, not a migration script, and stays beside the code that owns the storage.
@@ -129,6 +134,7 @@ Shared test helpers live in `test/helpers/` (imported by both unit and integrati
 src/
 ├── engine/        Agentic loop (model → tool → repeat). Start here.
 ├── runtime/       High-level orchestration (Runtime.start → runtime.chat)
+├── execution/     Agent runtimes a run executes on: native engine, ACP agents
 ├── api/           HTTP API (Hono). Routes in api/routes/.
 ├── connectors/    Everything a connector is, split by the question each part answers:
 │   ├── runtime/   a live connection's life — install/uninstall/start/stop, auth, probes
@@ -170,7 +176,7 @@ web/               Vite + React + TypeScript SPA (separate package.json)
 | Setting | Value |
 |---------|-------|
 | `models.default` | `anthropic:claude-sonnet-4-6` |
-| `models.fast` | `anthropic:claude-haiku-4-5-20251001` |
+| `models.fast` | `anthropic:claude-sonnet-4-6` |
 | Max iterations | 25 (hard cap: 50) |
 | Max input tokens | 500,000 |
 | Max output tokens | the model's catalog output limit (16,384 for a model the catalog lacks) |
@@ -184,7 +190,7 @@ web/               Vite + React + TypeScript SPA (separate package.json)
 The workspace is the tenancy boundary. These rules apply anywhere code touches workspace data; the detail is in the guides.
 
 - **All tool handlers that access data must be workspace-scoped.** Use `runtime.requireWorkspaceId()` (never `getCurrentWorkspaceId()`). It throws when no workspace is in scope, under every identity provider — no special-case logic needed.
-- **Hard-error on a missing `wsId`, don't silently default**, in any code path that touches workspace-scoped credentials or identity. A `?? "ws_default"` fallback would pool credentials across tenants. `startConnectorSource`'s named-connector and URL-connector (OAuth-provider) branches both throw; match them.
+- **Hard-error on a missing `wsId`, don't silently default**, in any code path that touches workspace-scoped credentials or identity. A `?? "ws_default"` fallback would pool credentials across tenants. Starting a URL connector that opens an OAuth flow throws when no workspace context is threaded (a personal connector binds to its user instead); match it.
 - **Every recursive mkdir on a workspace-scoped path passes `assertWorkspaceRootExists`** (via `ensureWorkspaceDir` or directly), and a `WorkspaceRootMissingError` is never fixed by creating the root, because only `WorkspaceStore.create` makes one. See `src/workspace/AGENTS.md`.
 - **Every secret goes through `CredentialStore`**; never construct a `FileCredentialStore`, which bypasses the configured backend. See `src/tools/AGENTS.md`.
 - **A session reaches exactly one workspace plus the caller's identity tools**, never a cross-workspace union, and a tool name's shape is its scope. See `src/orchestrator/AGENTS.md`.
@@ -196,9 +202,9 @@ External MCP clients and iframe apps use `POST /mcp/<wsId>`; the first-party web
 
 ## Prompt Security
 
-`sanitizeLineField()` and XML containment tags in `compose.ts` are prompt injection mitigations. Do not remove without reviewing `test/unit/prompt-injection.test.ts`.
+`sanitizeLineField()` and the XML containment tags in `src/prompt/containment.ts` are prompt injection mitigations. Do not remove without reviewing `test/unit/prompt-injection.test.ts`.
 
-**Connector trust is an install decision, not a per-prompt one.** Do not add a numeric trust gate on any path that injects server-authored content into the prompt (skills, app guides, app state, custom instructions). Once a connector is active in the workspace its tools are already callable, so suppressing the workflow guidance that teaches the model how to use them safely makes the model less safe, not more — and tool descriptions, tool outputs, and `app://instructions` flow through ungated already. The defense is XML containment with `</tag>` escape in the body, the pattern used by `<app-state>`, `<app-guide>`, `<app-instructions>`, `<app-custom-instructions>`, and `<layer3-skill>`. Any new server-authored containment tag must escape its own closing form in the body the same way.
+**Connector trust is an install decision, not a per-prompt one.** Do not add a numeric trust gate on any path that injects server-authored content into the prompt (skills, app guides, app state, app instructions). Once a connector is active in the workspace its tools are already callable, so suppressing the workflow guidance that teaches the model how to use them safely makes the model less safe, not more — and tool descriptions and tool outputs flow through ungated already. The defense is XML containment with `</tag>` escape in the body, the pattern used by `<app-state>`, `<app-guide>`, `<app-instructions>`, and `<layer3-skill>`. Any new server-authored containment tag must escape its own closing form in the body the same way.
 
 ## Auto-Generated Files
 
@@ -218,7 +224,7 @@ Do not edit these manually:
 
 ## Releasing
 
-See [RELEASING.md](./RELEASING.md) for the prescriptive release runbook. When the user asks to cut a release, follow that document literally — it covers tagging conventions (semver with `v` prefix, hyphen = pre-release), the step-by-step procedure, the verification checklist, and rollback. Releases are cut by pushing an annotated git tag matching `v*`; `.github/workflows/release.yml` does the rest. Do not bump `package.json` per release.
+See [RELEASING.md](./RELEASING.md) for the prescriptive release runbook. When the user asks to cut a release, follow that document literally — it covers tagging conventions (semver with `v` prefix, hyphen = pre-release), the step-by-step procedure, the verification checklist, rollback, and hotfixing a released version for one deployment (§8: the fix lands on `main` first, then a `-hotfix.N` pre-release off the release tag). Releases are cut by pushing an annotated git tag matching `v*`; `.github/workflows/release.yml` does the rest. Do not bump `package.json` per release.
 
 ## Full Architecture
 

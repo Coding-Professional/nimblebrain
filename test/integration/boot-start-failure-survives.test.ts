@@ -4,9 +4,9 @@
  *
  * A fleet service rolling at the same moment as the runtime loses this race
  * routinely: the runtime POSTs to it seconds before its pod is ready, the start
- * throws, and the connector used to be dropped from the inventory entirely — which
- * cost it its lifecycle instance and its placements, so the app disappeared from
- * the shell and stayed gone until the pod restarted.
+ * throws. Dropping the connector from the inventory would cost it its lifecycle
+ * instance and its placements, so the app would disappear from the shell and stay
+ * gone until the pod restarted.
  *
  * `startWorkspaceConnectors` reaches the network, so this is integration-tier.
  * Port 1 is reserved and closed, giving a fast, deterministic connection
@@ -18,11 +18,13 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NoopEventSink } from "../../src/adapters/noop-events.ts";
+import { NO_CATALOG } from "../../src/connectors/catalog/binding.ts";
 import { startConnectorSource } from "../../src/connectors/runtime/startup.ts";
 import type { ConnectorRef } from "../../src/connectors/runtime/types.ts";
 import { log } from "../../src/observability/log.ts";
 import { Runtime } from "../../src/runtime/runtime.ts";
 import { startWorkspaceConnectors } from "../../src/runtime/workspace-runtime.ts";
+import { McpSource } from "../../src/tools/mcp-source.ts";
 import type { ToolRegistry } from "../../src/tools/registry.ts";
 import { WorkspaceContext } from "../../src/workspace/context.ts";
 import { WorkspaceStore } from "../../src/workspace/workspace-store.ts";
@@ -45,10 +47,9 @@ function unreachableConnector(serverName: string): ConnectorRef {
     transport: { type: "streamable-http", auth: { type: "bearer", token: "test-token" } },
     oauthScope: "workspace",
     ui: {
-      name: "Unreachable",
       placements: [{ slot: "sidebar.apps", resourceUri: "ui://unreachable/main", route: "u" }],
     },
-  } as unknown as ConnectorRef;
+  };
 }
 
 beforeEach(() => {
@@ -62,11 +63,11 @@ afterEach(() => {
 
 /**
  * `hasLiveSource` is private — reached deliberately to document the contrast that
- * justifies `hasEstablishedSource`. `tsconfig` does not cover `test/`, so a bare
- * call would compile by omission rather than by intent.
+ * justifies `hasEstablishedSource`.
  */
 function liveness(registry: ToolRegistry, name: string): boolean {
-  return (registry as unknown as { hasLiveSource: (n: string) => boolean }).hasLiveSource(name);
+  // biome-ignore lint/complexity/useLiteralKeys: hasLiveSource is private; bracket access is TypeScript's typed path to it
+  return registry["hasLiveSource"](name);
 }
 
 describe("startWorkspaceConnectors — unreachable URL connector at boot", () => {
@@ -76,6 +77,7 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
     await store.update(ws.id, { connectors: [unreachableConnector("unreachable")] });
 
     const { entries } = await startWorkspaceConnectors(store, [], null, new NoopEventSink(), {
+      readCatalog: NO_CATALOG,
       workDir,
       allowInsecureRemotes: true,
     });
@@ -148,7 +150,7 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
           serverName: "no-tokens",
           transport: { type: "streamable-http" },
           oauthScope: "workspace",
-        } as unknown as ConnectorRef,
+        },
       ],
     });
 
@@ -197,6 +199,7 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
     log.info = (msg: string) => lines.push(msg);
     try {
       await startWorkspaceConnectors(store, [], null, new NoopEventSink(), {
+        readCatalog: NO_CATALOG,
         workDir,
         allowInsecureRemotes: true,
       });
@@ -214,15 +217,16 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
 
   test("failedUrlConnector_isRegisteredButNotLive", async () => {
     // The boot loop keeps the source REGISTERED so the connector stays visible to
-    // every registry-enumerating surface and HealthMonitor can heal it. What
-    // used to make that unsafe was the self-heal gating on membership; those
-    // gates now test whether a source was ever ESTABLISHED, so a retained-but-down source
-    // still reads "unavailable" to callers and still gets recovered.
+    // every registry-enumerating surface and HealthMonitor can heal it. That is
+    // safe because the self-heal gates test whether a source was ever
+    // ESTABLISHED, not membership, so a retained-but-down source still reads
+    // "unavailable" to callers and still gets recovered.
     const store = new WorkspaceStore(workDir);
     const ws = await store.create("Fleet");
     await store.update(ws.id, { connectors: [unreachableConnector("unreachable")] });
 
     const { registries } = await startWorkspaceConnectors(store, [], null, new NoopEventSink(), {
+      readCatalog: NO_CATALOG,
       workDir,
       allowInsecureRemotes: true,
     });
@@ -247,6 +251,7 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
     await store.update(ws.id, { connectors: [unreachableConnector("still-down")] });
 
     const { registries } = await startWorkspaceConnectors(store, [], null, new NoopEventSink(), {
+      readCatalog: NO_CATALOG,
       workDir,
       allowInsecureRemotes: true,
     });
@@ -262,6 +267,7 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
         registry as ToolRegistry,
         new NoopEventSink(),
         {
+          readCatalog: NO_CATALOG,
           allowInsecureRemotes: true,
           workspaceContext: new WorkspaceContext({ wsId: ws.id, workDir }),
           keepRegisteredOnStartFailure: true,
@@ -272,6 +278,8 @@ describe("startWorkspaceConnectors — unreachable URL connector at boot", () =>
     // Same object, still registered, still not deliberately stopped.
     expect(registry?.getSource("still-down")).toBe(retained);
     expect(registry?.hasSource("still-down")).toBe(true);
-    expect((retained as unknown as { isStopped: () => boolean }).isStopped()).toBe(false);
+    if (!(retained instanceof McpSource))
+      throw new Error("the retained source is not an McpSource");
+    expect(retained.isStopped()).toBe(false);
   }, 30_000);
 });

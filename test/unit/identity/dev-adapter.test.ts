@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DevIdentityProvider } from "../../../src/identity/providers/dev.ts";
@@ -49,7 +49,7 @@ describe("DevIdentityProvider", () => {
       expect(identity!.id).toBe("usr_default");
       expect(identity!.email).toBe("dev@localhost");
       expect(identity!.displayName).toBe("Developer");
-      expect(identity!.orgRole).toBe("owner");
+      expect(identity!.orgRole).toBe("admin");
     });
 
     test("returns same identity for requests without auth headers", async () => {
@@ -72,10 +72,48 @@ describe("DevIdentityProvider", () => {
       expect(identity!.id).toBe("usr_default");
     });
 
-    test("default user has orgRole owner (can do everything)", async () => {
+    test("default user has orgRole admin (can do everything)", async () => {
       const adapter = new DevIdentityProvider(workDir, userStore);
       const identity = await adapter.verifyRequest(dummyRequest());
-      expect(identity!.orgRole).toBe("owner");
+      expect(identity!.orgRole).toBe("admin");
+    });
+
+    test("carries the stored display name and preferences", async () => {
+      const adapter = new DevIdentityProvider(workDir, userStore);
+      await adapter.verifyRequest(dummyRequest());
+
+      await userStore.update("usr_default", {
+        displayName: "Pat",
+        preferences: { timezone: "Pacific/Honolulu", models: { default: "anthropic:test" } },
+      });
+
+      const identity = await adapter.verifyRequest(dummyRequest());
+      expect(identity!.displayName).toBe("Pat");
+      expect(identity!.preferences.timezone).toBe("Pacific/Honolulu");
+      expect(identity!.preferences.models?.default).toBe("anthropic:test");
+    });
+
+    test("keeps id, email, and admin role whatever the stored record says", async () => {
+      const adapter = new DevIdentityProvider(workDir, userStore);
+      await adapter.verifyRequest(dummyRequest());
+
+      await userStore.update("usr_default", { email: "other@example.com", orgRole: "member" });
+
+      const identity = await adapter.verifyRequest(dummyRequest());
+      expect(identity!.id).toBe("usr_default");
+      expect(identity!.email).toBe("dev@localhost");
+      expect(identity!.orgRole).toBe("admin");
+    });
+
+    test("falls back to the defaults when the stored profile is unreadable", async () => {
+      const adapter = new DevIdentityProvider(workDir, userStore);
+      await adapter.verifyRequest(dummyRequest());
+
+      await writeFile(join(workDir, "users", "usr_default", "profile.json"), "{not json", "utf-8");
+
+      const identity = await adapter.verifyRequest(dummyRequest());
+      expect(identity!.displayName).toBe("Developer");
+      expect(identity!.preferences).toEqual({});
     });
   });
 
@@ -95,7 +133,7 @@ describe("DevIdentityProvider", () => {
       expect(after!.id).toBe("usr_default");
       expect(after!.email).toBe("dev@localhost");
       expect(after!.displayName).toBe("Developer");
-      expect(after!.orgRole).toBe("owner");
+      expect(after!.orgRole).toBe("admin");
     });
 
     test("does not recreate user if usr_default already exists", async () => {

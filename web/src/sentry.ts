@@ -1,5 +1,6 @@
 import type * as Sentry from "@sentry/react";
 import { getConfig } from "./config";
+import { withoutQuery } from "./lib/url-scrub";
 
 /**
  * Sentry client-error tracking for the web app.
@@ -77,10 +78,8 @@ export function initSentry(sentry: typeof import("@sentry/react")): void {
     // Strip query strings from transaction names so workspace/conversation ids
     // don't become span names. Inlined for the SDK's contextual typing.
     beforeSendTransaction: (event) => {
-      if (event.transaction) {
-        const q = event.transaction.indexOf("?");
-        if (q >= 0) event.transaction = event.transaction.slice(0, q);
-      }
+      if (event.transaction) event.transaction = withoutQuery(event.transaction);
+      if (event.request?.url) event.request.url = withoutQuery(event.request.url);
       return event;
     },
   });
@@ -95,7 +94,10 @@ export function beforeSend(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
   if (event.request) {
     event.request.cookies = undefined;
     event.request.headers = undefined;
+    // The page URL's query names what the person is looking at (`?chat=`, an app's record).
+    if (event.request.url) event.request.url = withoutQuery(event.request.url);
   }
+  if (event.transaction) event.transaction = withoutQuery(event.transaction);
   // Keep only the opaque id; never email / username / ip.
   if (event.user) {
     event.user = event.user.id ? { id: event.user.id } : {};
@@ -107,13 +109,16 @@ export function beforeSend(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
 export function beforeBreadcrumb(crumb: Sentry.Breadcrumb): Sentry.Breadcrumb | null {
   // App logs can carry prompts / PII — never breadcrumb them.
   if (crumb.category === "console") return null;
-  // Strip query strings from fetch/xhr/nav URLs. (Opaque ids in the URL *path*
-  // — e.g. /w/<wsId> — are within the trust boundary: they're tagged anyway and
-  // aren't the content the rule forbids, so we don't rewrite path segments.)
-  const url = crumb.data?.url;
-  if (typeof url === "string") {
-    const q = url.indexOf("?");
-    if (q >= 0 && crumb.data) crumb.data.url = url.slice(0, q);
+  // Strip query strings and fragments from fetch/xhr URLs (`url`) and navigation
+  // breadcrumbs (`from`, `to`). (Opaque ids in the URL *path* — e.g. /w/<wsId> —
+  // are within the trust boundary: they're tagged anyway and aren't the content
+  // the rule forbids, so we don't rewrite path segments.)
+  const data = crumb.data;
+  if (data) {
+    for (const key of ["url", "from", "to"] as const) {
+      const value = data[key];
+      if (typeof value === "string") data[key] = withoutQuery(value);
+    }
   }
   return crumb;
 }
@@ -180,4 +185,66 @@ export function isReportableLogout(reason: string): boolean {
 export function captureLogout(reason: string): void {
   if (!sdk || !isReportableLogout(reason) || !consumeLogoutOnce()) return;
   sdk.captureMessage(`involuntary logout: ${reason}`, "warning");
+}
+
+/**
+ * What the MCP bridge client records when a request's timer fires late (the
+ * page was suspended) or a request times out (see `mcp-bridge-client.ts`).
+ * Numbers, a method name and page visibility only: never the request's params,
+ * a tool name or its result.
+ */
+export interface McpTimeoutReport {
+  /** The JSON-RPC method, e.g. `resources/read`. */
+  method: string;
+  /** How far past its deadline the timer that fired ran, in ms. */
+  latenessMs: number;
+  /** The suspension observed across the whole request, in ms (0 when none). */
+  suspendedMs: number;
+  /** `document.visibilityState` when the timer was armed, and when it fired. */
+  visibilityAtArm: string;
+  visibilityAtFire: string;
+  /** Whether the request was sent again after a late timer. */
+  resent: boolean;
+  /** `resent`: a read sent again after a suspension; `timed_out`: answered `-32001`. */
+  outcome: "resent" | "timed_out";
+}
+
+/**
+ * At most one `-32001` event per this window. A tab resumed from a long sleep
+ * can time out every request it had in flight at once; one event carries the
+ * trail, and the rest stay breadcrumbs.
+ */
+export const MCP_TIMEOUT_EVENT_INTERVAL_MS = 5 * 60_000;
+let lastMcpTimeoutEventAt = Number.NEGATIVE_INFINITY;
+
+/**
+ * Whether a `-32001` at `now` gets an event, consuming the window when it does.
+ * Exported as a test seam (cf. consumeLogoutOnce).
+ */
+export function consumeMcpTimeoutEvent(now: number): boolean {
+  if (now - lastMcpTimeoutEventAt < MCP_TIMEOUT_EVENT_INTERVAL_MS) return false;
+  lastMcpTimeoutEventAt = now;
+  return true;
+}
+
+/** Re-open the `-32001` event window. Exported for tests. */
+export function resetMcpTimeoutEventWindow(): void {
+  lastMcpTimeoutEventAt = Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Record a bridge request's resend or timeout: a breadcrumb every time, and for
+ * a `-32001` an event, rate-limited by {@link consumeMcpTimeoutEvent}, so the
+ * next timeout says whether the page slept or the server was slow.
+ */
+export function reportMcpTimeout(report: McpTimeoutReport): void {
+  if (!sdk) return;
+  const { outcome, ...data } = report;
+  sdk.addBreadcrumb({ category: "mcp", message: `mcp:${outcome}`, level: "info", data });
+  if (outcome === "timed_out" && consumeMcpTimeoutEvent(Date.now())) {
+    sdk.captureMessage(`mcp request timed out: ${report.method}`, {
+      level: "warning",
+      extra: { ...data },
+    });
+  }
 }

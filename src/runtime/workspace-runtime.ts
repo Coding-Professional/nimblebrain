@@ -7,6 +7,7 @@
  */
 
 import { join } from "node:path";
+import type { CatalogEntriesReader } from "../connectors/catalog/binding.ts";
 import {
   type ManagedConnectorRegistry,
   managedConnectorRegistryOf,
@@ -15,7 +16,11 @@ import {
   brokeredConnectionPresent,
   connectorHasStaticAuth,
 } from "../connectors/runtime/connector-auth.ts";
-import { resolveConnectorDataDirForRef, serverNameFromRef } from "../connectors/runtime/paths.ts";
+import {
+  isUsableConnectorRef,
+  resolveConnectorDataDirForRef,
+  serverNameFromRef,
+} from "../connectors/runtime/paths.ts";
 import { setPendingAuth } from "../connectors/runtime/pending-auth-buffer.ts";
 import type { ConnectorMcpDeps } from "../connectors/runtime/startup.ts";
 import { startConnectorSource } from "../connectors/runtime/startup.ts";
@@ -95,7 +100,7 @@ export function buildProcessInventory(
       // per-entry break ("that entry no longer starts") true, and the warn
       // names the row so it can be fixed.
       const serverName = serverNameFromRef(connector);
-      if (serverName === null || !isHttpUrl(connector.url)) {
+      if (serverName === null || !isUsableConnectorRef(connector)) {
         log.warn(
           `[connectors] ${ws.id}: skipping a connector entry it cannot start — ` +
             `${describeUnusableRef(connector)}. ` +
@@ -242,7 +247,7 @@ export async function startWorkspaceConnectors(
   // can emit `tool.task_status` and a source its `connector.health`.
   // Pass `new NoopEventSink()` only if intentionally discarding events.
   eventSink: EventSink,
-  opts?: {
+  opts: {
     allowInsecureRemotes?: boolean;
     workDir?: string;
     /**
@@ -254,6 +259,13 @@ export async function startWorkspaceConnectors(
      * through here.
      */
     getConnectorMcpDeps?: (wsId: string) => ConnectorMcpDeps | undefined;
+    /**
+     * The operator catalog, which a minted fleet connector needs to start: its
+     * credential settings come from its catalog entry (`resolveRefTransport`).
+     * One the catalog no longer offers fails to start and is kept as an
+     * unstarted entry carrying the reason.
+     */
+    readCatalog: CatalogEntriesReader;
     /**
      * Fired when a boot-started URL connector's connection later loses its
      * authorization mid-session (a tool call hit `UnauthorizedError`). Unlike
@@ -321,12 +333,12 @@ export async function startWorkspaceConnectors(
     if (!wsRegistry) return; // unreachable: registries is keyed by every wsId in byWorkspace
 
     // URL connectors without persisted tokens skip auto-start at boot —
-    // there's nothing to connect with. The Connection sits in
-    // `not_authenticated` until the user clicks Connect (which triggers
-    // `lifecycle.startAuth`). This is what keeps a fresh install silent
-    // — no surprise OAuth banner on a connector the user added but hasn't
-    // authenticated yet. `seedInstance` consults the same token check to
-    // set state.
+    // there's nothing to connect with. Their Connection state is the seed's
+    // to derive (`seedInstance`): `not_authenticated` until the user clicks
+    // Connect (which triggers `lifecycle.startAuth`), or `reauth_required`
+    // when the tokens were deleted because the credential was rejected
+    // (`auth_lost`). This is what keeps a fresh install silent — no surprise
+    // OAuth banner on a connector the user added but hasn't authenticated yet.
     //
     // A brokered connector's readiness is its provider's answer, not a token file
     // — mirrors the discriminator in `lifecycle.seedUrlConnectionState`, which
@@ -344,7 +356,7 @@ export async function startWorkspaceConnectors(
       ))
     ) {
       log.info(
-        `[connectors] Skipping boot start for URL connector "${entry.serverName}" — no tokens yet (state: not_authenticated)`,
+        `[connectors] Skipping boot start for URL connector "${entry.serverName}" — no tokens are stored`,
       );
       resultEntries[idx] = unstartedUrlConnectorEntry(entry, entry.connector);
       return;
@@ -375,6 +387,7 @@ export async function startWorkspaceConnectors(
         // installed with host-resources support don't silently lose the
         // capability across platform restarts.
         connectorMcp: opts?.getConnectorMcpDeps?.(entry.wsId),
+        readCatalog: opts.readCatalog,
         // Boot is the one caller that wants a failed URL start to stay in the
         // registry. Nobody is watching this start, the dependency being
         // unreachable for the few seconds the loop runs says nothing about
@@ -400,18 +413,7 @@ export async function startWorkspaceConnectors(
       // seeder still reads `startError` and records the connection `dead`, not
       // `running` — the connector is registered, but its connection is honestly down
       // until a reconnect succeeds.
-      //
-      // Named/path connectors stay dropped, for two reasons. The decisive one:
-      // only a URL ref reaches `seedUrlConnectionState`, and
-      // `buildSeededInstance` hardcodes `state: "running"` — so a surviving
-      // named entry would seed a permanently *running* instance for a dead
-      // connector, which is worse than absence, not better. Second, re-spawning
-      // one needs the credential-resolving `startConnectorSource` path that
-      // `tryRecoverSource` declines, so the entry would promise a recovery that
-      // never comes.
-      if ("url" in entry.connector) {
-        resultEntries[idx] = unstartedUrlConnectorEntry(entry, entry.connector, msg);
-      }
+      resultEntries[idx] = unstartedUrlConnectorEntry(entry, entry.connector, msg);
     }
   });
 
@@ -440,7 +442,7 @@ export async function startWorkspaceConnectors(
  * Max connectors to start in parallel during `startWorkspaceConnectors`. Override with
  * `NB_CONNECTOR_START_CONCURRENCY`. Default 4 keeps peak memory/CPU bounded on a
  * 2-CPU/4Gi pod while capturing most of the serial→parallel win. Set to 1 for
- * legacy sequential behavior.
+ * sequential starts.
  */
 export function resolveConnectorStartConcurrency(): number {
   const raw = process.env.NB_CONNECTOR_START_CONCURRENCY;

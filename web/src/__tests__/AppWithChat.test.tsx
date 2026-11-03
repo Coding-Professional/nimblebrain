@@ -14,19 +14,13 @@
 // ---------------------------------------------------------------------------
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { loadAppFrame } from "../../test/app-frame";
+import { defineHappyDomErrorClasses, setHappyDomViewport } from "../../test/happy-dom";
 import { realClient } from "../../test/setup";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-// happy-dom's Window stub doesn't expose SyntaxError/TypeError; querySelector's
-// selector parser constructs one and trips on the gap.
-{
-  const win = (globalThis as unknown as { window?: Record<string, unknown> }).window;
-  if (win) {
-    win.SyntaxError ??= SyntaxError;
-    win.TypeError ??= TypeError;
-  }
-}
+defineHappyDomErrorClasses();
 
 mock.module("../api/client", () => ({
   ...realClient,
@@ -77,21 +71,15 @@ const WS_A: WorkspaceInfo = {
 };
 
 const APP = "app-with-chat-test";
-const PLACEMENT = {
+const PLACEMENT: PlacementEntry = {
   serverName: APP,
   slot: "sidebar.apps",
   resourceUri: `ui://${APP}/main`,
   route: "notes",
   priority: 0,
-} as unknown as PlacementEntry;
-
-const happyWindow = window as unknown as {
-  innerWidth: number;
-  innerHeight: number;
-  happyDOM: { setViewport(v: { width: number; height: number }): void };
-  MessageEvent: typeof MessageEvent;
 };
-const DESKTOP = { width: happyWindow.innerWidth, height: happyWindow.innerHeight };
+
+const DESKTOP = { width: window.innerWidth, height: window.innerHeight };
 
 let container: HTMLDivElement;
 let root: ReturnType<typeof ReactDOMClient.createRoot>;
@@ -158,29 +146,37 @@ function iframe(): HTMLIFrameElement | null {
   return container.querySelector("iframe");
 }
 
+const loadedApps = new WeakMap<HTMLIFrameElement, ReturnType<typeof loadAppFrame>>();
+
+/** The app inside `frame`, standing in once per frame. */
+function appIn(frame: HTMLIFrameElement): ReturnType<typeof loadAppFrame> {
+  let app = loadedApps.get(frame);
+  if (!app) {
+    app = loadAppFrame(frame, { postMessage: () => {} });
+    loadedApps.set(frame, app);
+  }
+  return app;
+}
+
 /** Deliver a `ui/update-model-context` from the view, as the app inside the iframe would. */
 function push(frame: HTMLIFrameElement, state: Record<string, unknown>): void {
-  const event = new happyWindow.MessageEvent("message", {
-    data: {
-      jsonrpc: "2.0",
-      method: "ui/update-model-context",
-      params: { structuredContent: state },
-    },
+  appIn(frame).post({
+    jsonrpc: "2.0",
+    method: "ui/update-model-context",
+    params: { structuredContent: state },
   });
-  Object.defineProperty(event, "source", { configurable: true, get: () => frame.contentWindow });
-  window.dispatchEvent(event);
 }
 
 beforeEach(() => {
   localStorage.clear();
   created.length = 0;
-  happyWindow.happyDOM.setViewport({ width: 375, height: 812 });
+  setHappyDomViewport({ width: 375, height: 812 });
 });
 
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
-  happyWindow.happyDOM.setViewport(DESKTOP);
+  setHappyDomViewport(DESKTOP);
 });
 
 describe("AppWithChat — the mobile sidebar covers the app without unmounting it", () => {
@@ -230,7 +226,7 @@ describe("AppWithChat — the mobile sidebar covers the app without unmounting i
   });
 
   test("on desktop the sidebar sits beside the app, which stays interactive", async () => {
-    happyWindow.happyDOM.setViewport(DESKTOP);
+    setHappyDomViewport(DESKTOP);
     await mountApp();
 
     await setPanel("open");
@@ -243,12 +239,12 @@ describe("AppWithChat — the mobile sidebar covers the app without unmounting i
 describe("AppWithChat — the top bar's trail belongs to the app on screen", () => {
   // Sibling app routes render this same element, so React Router keeps one
   // instance and hands it the next placement. This renders it the same way.
-  const PLACEMENT_B = {
+  const PLACEMENT_B: PlacementEntry = {
     ...PLACEMENT,
     serverName: `${APP}-b`,
     resourceUri: `ui://${APP}-b/main`,
     route: "tasks",
-  } as unknown as PlacementEntry;
+  };
 
   let location: ReturnType<typeof useAppLocation>;
   function LocationProbe() {
@@ -300,8 +296,8 @@ describe("AppWithChat — the top bar's trail belongs to the app on screen", () 
 
     const frame = iframe();
     if (!frame) throw new Error("no iframe");
-    const event = new happyWindow.MessageEvent("message", {
-      data: {
+    await act(async () =>
+      appIn(frame).post({
         jsonrpc: "2.0",
         method: LOCATION_METHOD,
         params: {
@@ -310,10 +306,8 @@ describe("AppWithChat — the top bar's trail belongs to the app on screen", () 
             { id: "notes/1", label: "Note one" },
           ],
         },
-      },
-    });
-    Object.defineProperty(event, "source", { configurable: true, get: () => frame.contentWindow });
-    await act(async () => window.dispatchEvent(event));
+      }),
+    );
     expect(location.appLocation?.trail.map((e) => e.label)).toEqual(["Notes", "Note one"]);
 
     await act(async () => root.render(withNotices(tree(PLACEMENT_B))));

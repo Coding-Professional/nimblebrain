@@ -37,13 +37,9 @@ export function validateConversationId(id: string, dir: string): void {
 /**
  * Access context for filtering conversations by user identity.
  *
- * Stage 1: single-owner only. A conversation is accessible iff the
- * caller's `userId` matches the conversation's `ownerId`.
- *
- * Stage 4 reintroduces sharing primitives with policy gating and will
- * extend this context (workspace-admin override, sharing claims, etc.).
- * Defining them now would be a no-op slot — the type tracks what
- * Stage 1 actually uses.
+ * Conversations are single-owner. A conversation is accessible iff the
+ * caller's `userId` matches the conversation's `ownerId`, so the context
+ * carries only the caller's id.
  */
 export interface ConversationAccessContext {
   userId: string;
@@ -84,7 +80,7 @@ export interface CreateConversationOptions {
   ownerId: string;
   /** The model to bind the conversation to. Must already be resolved and
    *  provider-qualified — see `Conversation.model`. */
-  model?: string;
+  model: string;
   metadata?: Record<string, unknown>;
   /** Create with a specific id instead of a generated one. Used by the
    *  detached-turn path so the conversation id is known to the caller before
@@ -114,8 +110,8 @@ export interface ConversationSummary {
   totalOutputTokens: number;
   totalCostUsd: number;
   /**
-   * Owner of the conversation. Required: Stage 1 invariant says every
-   * conversation has an owner. Files lacking `ownerId` are excluded
+   * Owner of the conversation. Required: every conversation has
+   * an owner. Files lacking `ownerId` are excluded
    * from the index entirely (see `parseFileHeader`), and direct
    * `load()` calls on such files throw.
    */
@@ -169,10 +165,8 @@ export interface ConversationStore {
 /**
  * Conversation metadata — stored as line 1 of the JSONL file.
  *
- * Single-owner. The conversation belongs to exactly one user (`ownerId`) and
- * is private by default (`visibility`). Sharing (multi-participant /
- * workspace-visible) is deferred with the sharing mechanism; v1 is
- * private-only — `visibility` is written but never read (fail-closed groundwork).
+ * Single-owner. The conversation belongs to exactly one user (`ownerId`), and
+ * the `<ownerId>` path partition is the privacy boundary.
  *
  * No token totals or cost — those are derived from events at read time
  * (see deriveUsageMetrics in event-reconstructor.ts and the index cache).
@@ -195,44 +189,30 @@ export interface Conversation {
    *  - **Resolved, never an alias.** `alias:fast` is a legal model string; a
    *    pin holding one would be retargeted by a slot change, which is exactly
    *    what this binding prevents.
-   *  - **Provider-qualified** (`provider:model-id`), never bare. A bare id
-   *    falls back to `anthropic:<id>`, and the pin is immutable, so a bare
-   *    pin cannot be repaired.
+   *  - **Provider-qualified** (`provider:model-id`), never bare. The pin is
+   *    immutable, so a pin that named no provider could never be repaired.
    *
    * `resolveRequestModelString` satisfies both, and is the only writer.
    *
    * Distinct from `lastModel`, which is derived from `llm.response` events and
    * describes what the last turn *did* run on. This field is the decision;
    * that one is the observation.
-   *
-   * Optional only for legacy records predating the binding — absent means
-   * "unpinned", and those resolve from current config exactly as before.
    */
-  model?: string;
+  model: string;
   lastModel: string | null;
   /** User who owns this conversation. The single authorization principal. */
   ownerId: string;
   /**
    * The workspace this conversation lives in — the binding. Set at create from the
    * first-message workspace and never mutated (no mid-chat workspace switching). The
-   * conversation is stored under `workspaces/<workspaceId>/conversations/`, so
-   * the path is authoritative and this field is the denormalised convenience.
+   * conversation is stored under `workspaces/<workspaceId>/conversations/`, and a
+   * loaded conversation takes this field from that directory, never from line 1.
    * The session is walled to this one workspace plus the owner's identity tools.
-   * Optional only for legacy records predating the workspace-owned layout.
+   * Absent only in the in-memory store when it is created without one.
    */
   workspaceId?: string;
-  /**
-   * Who can see this conversation. `private` (owner-only, default) |
-   * `shared` (the workspace's members). **Reserved forward-compat field — not
-   * yet written or read in v1**; the `<ownerId>` path partition is the live
-   * boundary, and absent reads as `private` (fail-closed). Visibility never
-   * crosses the workspace wall.
-   */
-  visibility?: "private" | "shared";
   /** Arbitrary caller-provided metadata. Stored in JSONL first line, never validated. */
   metadata?: Record<string, unknown>;
-  /** File format marker the event-sourced store writes on line 1. */
-  format?: "events";
 }
 
 /**
@@ -262,12 +242,17 @@ interface StoredMessageMetadata {
   skill?: string | null;
   /**
    * Marks a message the reconstructor synthesized rather than one the model
-   * or user produced. `"connector_skill_injected"` is the surface-once
-   * connector-overlay message (paired with `skill`, the overlay name) — the
-   * engine inspects this on replay to dedup re-injection. See
-   * `event-reconstructor.ts`.
+   * or user produced, paired with `skill`. `"connector_skill_injected"` is a
+   * connector overlay that had no tool result to ride (see `connectorSkills`);
+   * `"skill_activated"` is an `nb__use_skill` result. The runtime and engine
+   * read both to dedup re-delivery. See `event-reconstructor.ts`.
    */
   synthetic?: string;
+  /**
+   * Connector overlays whose bodies this tool result carries after its own
+   * output, by skill name. Read beside `synthetic` to dedup re-delivery.
+   */
+  connectorSkills?: string[];
   toolCalls?: Array<{
     id: string;
     name: string;
@@ -334,10 +319,12 @@ export type ConversationEventType =
   | "tool.progress"
   | "run.done"
   | "run.error"
+  | "execution.bound"
   | "skills.loaded"
   | "context.assembled"
   | "connector.skill.injected"
   | "skill.activated"
+  | "skill.not_delivered"
   | "metadata.title"
   | "history.compacted"
   | "aux.usage";
@@ -388,12 +375,8 @@ export interface LlmResponseEvent {
   /** Token usage for this single LLM call (canonical AI SDK V4 shape). */
   usage: TokenUsage;
   llmMs: number;
-  /**
-   * Per-call finish reason from the provider (AI SDK V4 unified value).
-   * Optional for backward-compat with conversations recorded before this
-   * field existed.
-   */
-  finishReason?: "stop" | "length" | "content-filter" | "tool-calls" | "error" | "other";
+  /** Per-call finish reason from the provider (AI SDK V4 unified value). */
+  finishReason: "stop" | "length" | "content-filter" | "tool-calls" | "error" | "other";
   /**
    * The provider's own stop reason for this call (AI SDK V4
    * `finishReason.raw`, e.g. Anthropic `end_turn`), or `NO_FINISH_PART_RAW`
@@ -426,7 +409,7 @@ export interface ToolDoneEvent {
    * Full tool output text (audience-filtered). Always persisted — it drives
    * the UI/display and the conversation record.
    */
-  output?: string;
+  output: string;
   /**
    * Bounded text the MODEL saw on the live turn, present only when it differs
    * from `output` (i.e. the result exceeded the model-context bound). History
@@ -445,6 +428,11 @@ export interface ToolDoneEvent {
    */
   resourceUri?: string;
   resourceLinks?: ResourceLinkInfo[];
+  /**
+   * The call did not run: the engine held it until the guidance for its tool
+   * reached the model. Its `output` is the held notice the model read.
+   */
+  held?: true;
 }
 
 export interface ToolProgressEvent {
@@ -475,6 +463,15 @@ export interface TitleChangeEvent {
   ts: string;
   type: "metadata.title";
   title: string | null;
+}
+
+/** The agent runtime a run executed on. See `ExecutionBoundPayload`. */
+export interface ExecutionBoundEvent {
+  ts: string;
+  type: "execution.bound";
+  runId: string;
+  runtime: string;
+  runtimeSessionId?: string;
 }
 
 export interface SkillsLoadedEvent {
@@ -519,12 +516,11 @@ export interface HistoryCompactedEvent {
 /**
  * A curated connector-skill overlay surfaced into the conversation for the
  * first time, triggered by a matching connector tool call during a run.
- * The reconstructor turns this event into a synthetic message whose
- * body is the overlay wrapped in `<connector-skill>` containment, carrying
- * `metadata.synthetic = "connector_skill_injected"` + `metadata.skill` so the
- * guidance rides the append-only history AND so the
- * engine can detect it on replay to never re-inject. Emitted at most once per
- * (conversation, skill).
+ * The reconstructor appends the overlay, wrapped in `<connector-skill>`
+ * containment, to a tool result of the iteration it was delivered in, and
+ * lists it in that message's `metadata.connectorSkills`, so the guidance rides
+ * the append-only history AND the runtime can detect it on replay to never
+ * re-inject. Emitted at most once per (conversation, skill).
  */
 export interface ConnectorSkillInjectedEvent {
   ts: string;
@@ -535,8 +531,29 @@ export interface ConnectorSkillInjectedEvent {
   skillName: string;
   /** The overlay body (markdown), surfaced verbatim into history. */
   skillBody: string;
-  /** Scope label for containment / telemetry. Always `"connector"` in v1. */
+  /** Storage tier, or `connector` for a curated overlay. */
   scope: string;
+  /**
+   * The call held until this body arrived. Absent on a body delivered after a
+   * call that ran, or on a promotion. Replay reads it for the block's
+   * provenance line, and the load ledger for `before_call`.
+   */
+  heldToolCallId?: string;
+}
+
+/**
+ * A skill bound to a called tool did not reach the model on that call: its
+ * body could not be fetched, one delivery's size limit left it out, or a
+ * `beforeToolCall` hook renamed the call past the hold. Reconstruction ignores
+ * it; the load ledger shows it, so a gap is visible rather than silent.
+ */
+export interface SkillNotDeliveredEvent {
+  ts: string;
+  type: "skill.not_delivered";
+  runId: string;
+  toolName: string;
+  skillName: string;
+  reason: "fetch_failed" | "capped" | "renamed_unheld";
 }
 
 /**
@@ -618,10 +635,12 @@ export type ConversationEvent =
   | ToolProgressEvent
   | RunDoneEvent
   | RunErrorEvent
+  | ExecutionBoundEvent
   | SkillsLoadedEvent
   | ContextAssembledEvent
   | ConnectorSkillInjectedEvent
   | SkillActivatedEvent
+  | SkillNotDeliveredEvent
   | SkillSuppressionEvent
   | TitleChangeEvent
   | HistoryCompactedEvent

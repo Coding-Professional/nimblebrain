@@ -128,8 +128,7 @@ function makeTestIframe(): TestIframe {
     // happy-dom `window` global. We then override the `source` getter
     // so the bridge's `event.source === iframe.contentWindow` security
     // check matches our stub.
-    const WindowMessageEvent = (window as unknown as { MessageEvent: typeof MessageEvent })
-      .MessageEvent;
+    const WindowMessageEvent = window.MessageEvent;
     const event = new WindowMessageEvent("message", { data });
     Object.defineProperty(event, "source", {
       configurable: true,
@@ -474,9 +473,9 @@ describe("resources/read — MCP transport", () => {
     });
   });
 
-  test("a refused read forwards as JSON-RPC -32000", async () => {
+  test("a refused read forwards its JSON-RPC error with code and data", async () => {
     mcpBehavior.readResource = async () => ({
-      error: { code: -32002, message: "resource not found" },
+      error: { code: -32001, message: "Request timed out", data: { suspendedMs: 90_000 } },
     });
     const frame = mount("research");
 
@@ -488,10 +487,13 @@ describe("resources/read — MCP transport", () => {
     });
 
     const reply = (await frame.waitFor((m) => (m as { id?: string })?.id === "r-err")) as {
-      error?: { code: number; message: string };
+      error?: unknown;
     };
-    expect(reply.error?.code).toBe(-32000);
-    expect(reply.error?.message).toContain("resource not found");
+    expect(reply.error).toEqual({
+      code: -32001,
+      message: "Request timed out",
+      data: { suspendedMs: 90_000 },
+    });
   });
 });
 

@@ -1,5 +1,5 @@
 /**
- * Phase 2 — `skills.loaded` and `context.assembled` event tests.
+ * `skills.loaded` and `context.assembled` event tests.
  *
  * Two scopes:
  *   1. Engine-level: when `EngineConfig.runMetadata` carries skills/context
@@ -37,6 +37,7 @@ import type {
   ToolResult,
 } from "../../../src/engine/types.ts";
 import { createEchoModel } from "../../helpers/echo-model.ts";
+import { firstPayloadOf } from "../../helpers/engine-events.ts";
 
 class CollectingSink implements EventSink {
   events: EngineEvent[] = [];
@@ -62,6 +63,7 @@ function makeConfigWithMetadata(): EngineConfig {
         skills: [
           {
             id: "/work/skills/voice-rules.md",
+            name: "voice-rules",
             layer: 3,
             scope: "org",
             version: "2026-04-27T00:00:00.000Z",
@@ -72,6 +74,7 @@ function makeConfigWithMetadata(): EngineConfig {
           },
           {
             id: "/work/workspaces/ws_002afe1142297ff4/skills/proposal-followup.md",
+            name: "proposal-followup",
             layer: 3,
             scope: "workspace",
             version: "2026-04-26T00:00:00.000Z",
@@ -168,8 +171,7 @@ describe("engine.runMetadata — skills.loaded + context.assembled emission", ()
       [],
     );
 
-    const event = sink.events.find((e) => e.type === "skills.loaded")!;
-    const payload = event.data as unknown as SkillsLoadedEvent;
+    const payload = firstPayloadOf(sink.events, "skills.loaded")!;
     expect(payload.skills).toHaveLength(2);
     expect(payload.skills[0]!.loadedBy).toBe("always");
     expect(payload.skills[0]!.scope).toBe("org");
@@ -188,8 +190,7 @@ describe("engine.runMetadata — skills.loaded + context.assembled emission", ()
       [],
     );
 
-    const event = sink.events.find((e) => e.type === "context.assembled")!;
-    const payload = event.data as unknown as ContextAssembledEvent;
+    const payload = firstPayloadOf(sink.events, "context.assembled")!;
     const skillsSource = payload.sources.find((s) => s.kind === "skills");
     expect(skillsSource).toBeDefined();
     expect(skillsSource!.count).toBe(2);
@@ -237,8 +238,7 @@ describe("engine.runMetadata — skills.loaded + context.assembled emission", ()
       [],
     );
 
-    const ev = sink.events.find((e) => e.type === "skills.loaded")!;
-    const payload = ev.data as unknown as SkillsLoadedEvent;
+    const payload = firstPayloadOf(sink.events, "skills.loaded")!;
     expect(payload.skills).toEqual([]);
     expect(payload.totalTokens).toBe(0);
   });
@@ -272,7 +272,7 @@ async function readEvents(id: string): Promise<ConversationEvent[]> {
 
 describe("EventSourcedConversationStore — persistence", () => {
   test("skills.loaded emit is mapped to a ConversationEvent in the conv jsonl", async () => {
-    const conv = await store.create({ ownerId: "user_test" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "user_test" });
     store.setActiveConversation(conv.id);
 
     store.emit({
@@ -282,6 +282,7 @@ describe("EventSourcedConversationStore — persistence", () => {
         skills: [
           {
             id: "/skills/x.md",
+            name: "x",
             layer: 3,
             scope: "org",
             version: "2026-01-01T00:00:00.000Z",
@@ -307,7 +308,7 @@ describe("EventSourcedConversationStore — persistence", () => {
   });
 
   test("context.assembled persists with sources + total intact", async () => {
-    const conv = await store.create({ ownerId: "user_test" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "user_test" });
     store.setActiveConversation(conv.id);
 
     store.emit({
@@ -334,7 +335,7 @@ describe("EventSourcedConversationStore — persistence", () => {
   });
 
   test("end-to-end: engine emit → store persist preserves shape", async () => {
-    const conv = await store.create({ ownerId: "user_test" });
+    const conv = await store.create({ model: "anthropic:claude-sonnet-4-6", ownerId: "user_test" });
     store.setActiveConversation(conv.id);
 
     const sink: EventSink = {

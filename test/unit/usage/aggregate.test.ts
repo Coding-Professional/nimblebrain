@@ -60,8 +60,11 @@ function writeCalls(
       model: ev.model,
       usage: ev.usage,
       llmMs: ev.llmMs ?? 0,
-      sessionId: meta.id,
-      ...(meta.ownerId !== undefined ? { userId: meta.ownerId } : {}),
+      ...((meta.origin ?? "chat") === "task"
+        ? { taskRunId: meta.id }
+        : { conversationId: meta.id }),
+      userId: meta.ownerId ?? "usr_test",
+      workspaceId: "ws_0076759dbbe19fcc",
       ...(rates ? { rates } : {}),
     };
     const month = usageMonthOf(entry.ts);
@@ -91,7 +94,7 @@ function llmEvent(
   return {
     type: "llm.response",
     ts: overrides.ts ?? "2026-04-10T12:00:00Z",
-    model: overrides.model ?? "claude-sonnet-4-5-20250929",
+    model: overrides.model ?? "anthropic:claude-sonnet-4-5-20250929",
     usage: {
       inputTokens: overrides.inputTokens ?? 1000,
       outputTokens: overrides.outputTokens ?? 500,
@@ -131,14 +134,14 @@ describe("aggregateUsage", () => {
       {
         ts: "2026-04-10T12:05:00Z",
         source: "compaction",
-        model: "claude-haiku-4-5-20251001",
+        model: "anthropic:claude-haiku-4-5-20251001",
         usage: { inputTokens: 400, outputTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0 },
         llmMs: 120,
       },
       {
         ts: "2026-04-10T12:06:00Z",
         source: "title",
-        model: "claude-haiku-4-5-20251001",
+        model: "anthropic:claude-haiku-4-5-20251001",
         usage: { inputTokens: 50, outputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0 },
         llmMs: 40,
       },
@@ -200,7 +203,7 @@ describe("aggregateUsage", () => {
     // So 2_000_000 total = 500K noCache + 500K cacheRead + 1M cacheWrite.
     writeCalls(dir, { id: "cost-conv" }, [
       llmEvent({
-        model: "claude-sonnet-4-5-20250929",
+        model: "anthropic:claude-sonnet-4-5-20250929",
         inputTokens: 2_000_000,
         outputTokens: 1_000_000,
         cacheReadTokens: 500_000,
@@ -336,12 +339,12 @@ describe("aggregateUsage", () => {
     };
     writeCalls(dir, { id: "drift" }, [
       llmEvent({
-        model: "claude-sonnet-4-5-20250929",
+        model: "anthropic:claude-sonnet-4-5-20250929",
         ...usage,
       }),
     ]);
     const report = await aggregateUsage(dir, "all", "day");
-    const expectedTotal = estimateCost("claude-sonnet-4-5-20250929", usage);
+    const expectedTotal = estimateCost("anthropic:claude-sonnet-4-5-20250929", usage);
     expect(report.totals.cost.total).toBeCloseTo(expectedTotal, 8);
   });
 
@@ -355,7 +358,7 @@ describe("aggregateUsage", () => {
     const dir = makeTmpDir();
     writeCalls(dir, { id: "shape" }, [
       llmEvent({
-        model: "claude-sonnet-4-5-20250929",
+        model: "anthropic:claude-sonnet-4-5-20250929",
         inputTokens: 1000,
         outputTokens: 500,
         cacheReadTokens: 100,
@@ -423,7 +426,7 @@ describe("aggregateUsage", () => {
     // hit rate = 700 / (100 + 700 + 200) = 0.7
     writeCalls(dir, { id: "hit" }, [
       llmEvent({
-        model: "claude-sonnet-4-5-20250929",
+        model: "anthropic:claude-sonnet-4-5-20250929",
         inputTokens: 1000,
         outputTokens: 10,
         cacheReadTokens: 700,
@@ -508,20 +511,6 @@ describe("aggregateUsage — by user", () => {
     expect(report.totals.conversations).toBe(0);
     expect(report.totals.llmCalls).toBe(0);
     expect(report.breakdown).toHaveLength(0);
-  });
-
-  it("conversations missing ownerId bucket under 'unknown' for groupBy:user", async () => {
-    const dir = makeTmpDir();
-    // No ownerId on line 1 (legacy/corrupt) — still counted, bucketed as unknown.
-    writeCalls(dir, { id: "legacy" }, [
-      llmEvent({ ts: "2026-04-10T10:00:00Z", inputTokens: 100, outputTokens: 50 }),
-    ]);
-
-    const report = await aggregateUsage(dir, "all", "user");
-
-    expect(report.breakdown).toHaveLength(1);
-    expect(report.breakdown[0]!.key).toBe("unknown");
-    expect(report.breakdown[0]!.tokens.input).toBe(100);
   });
 });
 
@@ -624,7 +613,7 @@ describe("breakdown rows make the same split as totals", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The id split: new-shape records, legacy records, and the two mixed
+// The id split: a conversation and a task run, each under its own name
 // ---------------------------------------------------------------------------
 
 /** Write one record in whichever shape the caller spells out. */
@@ -633,22 +622,19 @@ function writeRecord(dir: string, fields: Partial<UsageLedgerEntry>): void {
     ts: "2026-04-10T12:00:00Z",
     source: "main",
     origin: "chat",
-    model: "claude-sonnet-4-5-20250929",
+    model: "anthropic:claude-sonnet-4-5-20250929",
     usage: { inputTokens: 1000, outputTokens: 500 },
     llmMs: 200,
+    userId: "usr_test",
+    workspaceId: "ws_0076759dbbe19fcc",
     ...fields,
-  } as UsageLedgerEntry;
+  };
   const monthDir = usageMonthDir(dir, usageMonthOf(entry.ts));
   mkdirSync(monthDir, { recursive: true });
   appendFileSync(join(monthDir, "test.jsonl"), `${JSON.stringify(entry)}\n`);
 }
 
 describe("the ledger's id split", () => {
-  // Every OTHER test in this file writes the legacy `sessionId` shape, so the
-  // back-compat read is already under test by the whole suite above. These
-  // cover the new shape, and the mixture that a retention window spanning the
-  // split actually contains.
-
   it("counts a new-shape chat record as a conversation", async () => {
     const dir = makeTmpDir();
     writeRecord(dir, { conversationId: "conv_new", runId: "turn-1" });
@@ -667,92 +653,17 @@ describe("the ledger's id split", () => {
     expect(report.totals.conversations).toBe(0);
   });
 
-  it("does not double-count one conversation written in both shapes", async () => {
-    // The mixture inside one retention window: the same conversation before
-    // and after the split. Both spellings must resolve to one id, or every
-    // conversation straddling the change reads as two.
-    const dir = makeTmpDir();
-    writeRecord(dir, { sessionId: "conv_same" });
-    writeRecord(dir, { conversationId: "conv_same", runId: "turn-2" });
-
-    const report = await aggregateUsage(dir, "all", "day");
-    expect(report.totals.conversations).toBe(1);
-  });
-
-  it("counts legacy and new task records as one run", async () => {
-    const dir = makeTmpDir();
-    writeRecord(dir, { origin: "task", sessionId: "run_same" });
-    writeRecord(dir, { origin: "task", taskRunId: "run_same", runId: "turn-2" });
-
-    const report = await aggregateUsage(dir, "all", "day");
-    expect(report.totals.runs).toBe(1);
-  });
-
-  it("keeps a task out of the conversation breakdown", async () => {
-    // The defect the undiscriminated read had: a task's run id keyed a row in
-    // a dimension the schema calls "conversation", so a usage report listed
-    // `run_…` among its conversations.
+  it("leaves calls with no conversation out of the conversation rows, and in the totals", async () => {
+    // A task run and a background job have no conversation. They are neither
+    // listed as one under their own id nor gathered into a row standing for none.
     const dir = makeTmpDir();
     writeRecord(dir, { origin: "task", taskRunId: "run_x", runId: "turn-1" });
+    writeRecord(dir, { origin: "system" });
     writeRecord(dir, { conversationId: "conv_x", runId: "turn-2" });
 
     const report = await aggregateUsage(dir, "all", "conversation");
-    const keys = (report.breakdowns.conversation ?? []).map((r) => r.key);
-    expect(keys).toContain("conv_x");
-    expect(keys).not.toContain("run_x");
-  });
-
-  it("groups by turn — the grain the single field could not express", async () => {
-    // Two turns of ONE conversation. Grouped by conversation this is a single
-    // row and the per-turn split is unrecoverable; that is the whole reason
-    // the engine's run id is now recorded.
-    const dir = makeTmpDir();
-    writeRecord(dir, { conversationId: "conv_multi", runId: "turn-a" });
-    writeRecord(dir, { conversationId: "conv_multi", runId: "turn-b" });
-
-    const report = await aggregateUsage(dir, "all", "turn");
-    const rows = report.breakdowns.turn ?? [];
-    expect(rows.map((r) => r.key).sort()).toEqual(["turn-a", "turn-b"]);
-    expect(report.totals.conversations).toBe(1);
-  });
-
-  it("bills a legacy sub-agent record to the turn that spawned it", async () => {
-    // Records retained from when a turn could spawn a sub-agent carry the
-    // sub-agent's own `runId` and the spawning turn's `parentRunId`. Keying the
-    // dimension on `runId` alone would split one turn into a row per agent —
-    // the parent understating what the turn cost, and children sitting beside
-    // top-level turns with nothing to tell them apart.
-    const dir = makeTmpDir();
-    writeRecord(dir, { conversationId: "conv_d", runId: "turn-top" });
-    writeRecord(dir, {
-      conversationId: "conv_d",
-      runId: "child-1",
-      parentRunId: "turn-top",
-      delegated: true,
-    });
-    writeRecord(dir, {
-      conversationId: "conv_d",
-      runId: "grandchild-1",
-      parentRunId: "turn-top",
-      delegated: true,
-    });
-
-    const report = await aggregateUsage(dir, "all", "turn");
-    const rows = report.breakdowns.turn ?? [];
-    expect(rows.map((r) => r.key)).toEqual(["turn-top"]);
-    // The whole turn's spend, not the top-level agent's share of it.
-    expect(rows[0]!.llmCalls).toBe(3);
-    expect(rows[0]!.cost.total).toBeCloseTo(report.totals.cost.total, 10);
-  });
-
-  it("groups a legacy record's turn under `none` rather than inventing one", async () => {
-    // Records predating the split carry no engine run id. They must be legible
-    // as "not attributable to a turn", not silently folded into another's.
-    const dir = makeTmpDir();
-    writeRecord(dir, { sessionId: "conv_old" });
-
-    const report = await aggregateUsage(dir, "all", "turn");
-    expect((report.breakdowns.turn ?? []).map((r) => r.key)).toEqual(["none"]);
+    expect((report.breakdowns.conversation ?? []).map((r) => r.key)).toStrictEqual(["conv_x"]);
+    expect(report.totals.llmCalls).toBe(3);
   });
 });
 
@@ -903,8 +814,7 @@ describe("the breakdown row cap", () => {
 
 describe("workspace grouping and filters", () => {
   /**
-   * Four calls across two users, two workspaces (plus one bound to none), two
-   * models, and both origins. Input tokens are distinct powers of ten so any
+   * Four calls across two users, two workspaces, two models, and every origin. Input tokens are distinct powers of ten so any
    * subset's total names exactly which calls it holds.
    */
   function seed(dir: string): void {
@@ -934,6 +844,8 @@ describe("workspace grouping and filters", () => {
       ts: "2026-04-11T12:00:00Z",
     });
     writeRecord(dir, {
+      userId: "usr_b",
+      workspaceId: "ws_00164434d8dd7ffb",
       origin: "system",
       model: "anthropic:claude-haiku-4-5-20251001",
       usage: { inputTokens: 1000, outputTokens: 0 },
@@ -941,26 +853,24 @@ describe("workspace grouping and filters", () => {
     });
   }
 
-  it("groupBy:workspace buckets by workspaceId, with unbound calls under none", async () => {
+  it("groupBy:workspace buckets by workspaceId", async () => {
     const dir = makeTmpDir();
     seed(dir);
     const report = await aggregateUsage(dir, "all", "workspace");
     const byKey = Object.fromEntries(report.breakdown.map((r) => [r.key, r.tokens.input]));
-    expect(byKey).toEqual({ none: 1000, ws_00164434d8dd7ffb: 101, ws_002038aa71ea4b8a: 10 });
+    expect(byKey).toEqual({ ws_00164434d8dd7ffb: 1101, ws_002038aa71ea4b8a: 10 });
   });
 
-  it("filters by workspace, and 'none' selects the unbound calls", async () => {
+  it("filters by workspace", async () => {
     const dir = makeTmpDir();
     seed(dir);
     const alpha = await aggregateUsage(dir, "all", "day", {
       filters: { workspaceId: "ws_00164434d8dd7ffb" },
     });
-    expect(alpha.totals.tokens.input).toBe(101);
-    const none = await aggregateUsage(dir, "all", "day", { filters: { workspaceId: "none" } });
-    expect(none.totals.tokens.input).toBe(1000);
+    expect(alpha.totals.tokens.input).toBe(1101);
   });
 
-  it("filters by user, excluding lines with no userId", async () => {
+  it("filters by user", async () => {
     const dir = makeTmpDir();
     seed(dir);
     const report = await aggregateUsage(dir, "all", "day", { filters: { userId: "usr_a" } });
@@ -997,7 +907,7 @@ describe("workspace grouping and filters", () => {
     const both = await aggregateUsage(dir, "all", "day", {
       filters: { workspaceId: "ws_00164434d8dd7ffb", model: "claude-haiku-4-5" },
     });
-    expect(both.totals.tokens.input).toBe(100);
+    expect(both.totals.tokens.input).toBe(1100);
     // A userId filter naming someone other than the owner cannot widen the read.
     const crossed = await aggregateUsage(dir, "all", "day", {
       ownerFilter: "usr_a",
@@ -1020,7 +930,7 @@ describe("workspace grouping and filters", () => {
       "ws_00164434d8dd7ffb",
       "ws_002038aa71ea4b8a",
     ]);
-    expect(Object.keys(days[1]?.stack ?? {}).sort()).toEqual(["none", "ws_00164434d8dd7ffb"]);
+    expect(Object.keys(days[1]?.stack ?? {})).toEqual(["ws_00164434d8dd7ffb"]);
     for (const day of days.slice(0, 2)) {
       const sum = Object.values(day.stack ?? {}).reduce((a, b) => a + b, 0);
       expect(sum).toBeCloseTo(day.cost.total, 12);
